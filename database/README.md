@@ -1,6 +1,6 @@
 # Firestore Data Model
 
-This document describes current Firestore writes and a suggested shape for club and table metadata. Buy-ins debit a member's available balance and reserve a table seat in a Firestore transaction. Completed hands are audited and apply net results to in-play balances. The backend does **not** create club/table metadata, initialize member balances, cash out seats, or persist/recover the full live PokerKit state.
+This document describes current Firestore writes and suggested metadata shapes. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are audited and apply net results to in-play balances. Union table metadata and per-hand clearing records are written by the backend; local club/table metadata, member initialization, cash-outs, and live table recovery are not implemented.
 
 ## Collection Layout
 
@@ -10,6 +10,15 @@ clubs/{club_id}
     transactions/{buy_in_id}
   tables/{table_id}
     seats/{seat_index}
+    hands/{hand_id}
+unions/{union_id}
+  admins/{user_id}
+  clubs/{club_id}
+  tables/{table_id}
+    seats/{seat_index}
+    hands/{hand_id}
+  settlements/{YYYY-MM-DD}
+    clubs/{club_id}
     hands/{hand_id}
 ```
 
@@ -193,6 +202,48 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `operations` | array of objects | Ordered PokerKit operation audit. Fields depend on operation type and may include `user_id`, `amount`, `amounts`, `cards`, and `pot_index`. |
 
 The repository checks whether the hand document already exists inside the Firestore transaction. If it exists, it skips the hand write, in-play balance deltas, and seat stack updates, preventing a retry from applying the same hand twice. Firestore security rules must deny direct client reads to `hands` documents; clients use only the authenticated replay endpoint.
+
+### Union memberships and shared table metadata
+
+Unions and their admin/member-club links must be provisioned outside this API. The backend reads these records to enforce scope:
+
+Union admin path: `unions/{union_id}/admins/{user_id}`
+
+```json
+{"role":"UNION_ADMIN","status":"active"}
+```
+
+Participating club path: `unions/{union_id}/clubs/{club_id}`
+
+```json
+{
+  "union_id": "union-1",
+  "club_id": "club-a",
+  "union_name": "Pinoy Poker Alliance",
+  "status": "active"
+}
+```
+
+`UNION_ADMIN` is a union-scoped role and is not a `ClubRole`. A club owner does not gain union administration rights unless their user ID has an active union admin record.
+
+Union table path: `unions/{union_id}/tables/{table_id}`
+
+The union-admin create endpoint writes `union_id`, `table_id`, `table_name`, `origin_club_id`, blinds, buy-in bounds, `max_seats`, and `status: "open"`. Deleting an empty table sets `status: "closed"` and `closed_at`; table history remains available. Live engine state and lobby listing are still held in process memory and are not reconstructed from this document after restart.
+
+Union seat path: `unions/{union_id}/tables/{table_id}/seats/{seat_index}`
+
+The seat reservation includes the player's `club_id`. The buy-in transaction debits that club's `members/{user_id}` record and stores its idempotency transaction under the member's existing `transactions/{buy_in_id}` collection.
+
+### Union hand settlement and clearing
+
+Union hand audits live at `unions/{union_id}/tables/{table_id}/hands/{hand_id}`. In one Firestore transaction the backend writes the restricted hand audit, updates each player's home-club `in_play_balance`, updates union seat stacks, and writes a per-hand settlement marker. A retry of the same hand does not repeat those changes.
+
+Daily aggregate paths are:
+
+- `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_id}` with integer `debt` and `credit` totals.
+- `unions/{union_id}/settlements/{YYYY-MM-DD}/hands/{hand_id}` with the per-club net deltas and debt/credit positions.
+
+For each club, `net_delta` is the sum of that club's players' hand results. Negative net delta increments `debt` by its absolute value; positive net delta increments `credit`. Current PokerKit games charge no rake, so `rake_amount` is zero and no union software fee or traffic-based rake split is performed.
 
 ## Suggested Metadata Documents
 

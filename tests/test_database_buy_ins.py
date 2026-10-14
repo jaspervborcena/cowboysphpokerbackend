@@ -29,8 +29,10 @@ class FakeDocumentReference:
     def collection(self, name: str) -> FakeCollectionReference:
         return FakeCollectionReference(self.client, self.path + (name,))
 
-    def get(self, transaction: FakeTransaction) -> FakeSnapshot:
-        return transaction.get(self)
+    def get(self, transaction: FakeTransaction | None = None) -> FakeSnapshot:
+        if transaction is not None:
+            return transaction.get(self)
+        return FakeSnapshot(self.client.documents.get(self.path))
 
 
 class FakeCollectionReference:
@@ -40,6 +42,13 @@ class FakeCollectionReference:
 
     def document(self, document_id: str) -> FakeDocumentReference:
         return FakeDocumentReference(self.client, self.path + (document_id,))
+
+    def stream(self) -> list[FakeSnapshot]:
+        return [
+            FakeSnapshot(data)
+            for path, data in self.client.documents.items()
+            if path[:-1] == self.path
+        ]
 
 
 class FakeCollectionGroupQuery:
@@ -208,3 +217,132 @@ def test_hand_history_lookup_is_scoped_to_club() -> None:
 
     assert repository.get_hand_history("club-1", "same-id") == hand_one
     assert repository.get_hand_history("club-3", "same-id") is None
+
+
+def test_union_membership_lookup_and_club_union_discovery() -> None:
+    client = FakeFirestoreClient(
+        {
+            ("unions", "union-1", "admins", "admin-1"): {
+                "status": "active",
+                "role": "UNION_ADMIN",
+            },
+            ("unions", "union-1", "clubs", "club-1"): {
+                "union_id": "union-1",
+                "club_id": "club-1",
+                "union_name": "Pinoy Poker Alliance",
+                "status": "active",
+            },
+            ("unions", "union-2", "clubs", "club-1"): {
+                "union_id": "union-2",
+                "club_id": "club-1",
+                "union_name": "Inactive Union",
+                "status": "inactive",
+            },
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    assert repository.get_union_admin("union-1", "admin-1")["role"] == "UNION_ADMIN"
+    assert repository.is_club_in_union("union-1", "club-1")
+    assert not repository.is_club_in_union("union-2", "club-1")
+    assert repository.get_unions_for_club("club-1") == [
+        {"union_id": "union-1", "name": "Pinoy Poker Alliance"}
+    ]
+
+
+def test_union_buy_ins_and_interclub_settlement_are_atomic_and_idempotent(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    member_a = ("clubs", "club-a", "members", "player-a")
+    member_b = ("clubs", "club-b", "members", "player-b")
+    client = FakeFirestoreClient(
+        {
+            member_a: {"chip_balance": 1000, "in_play_balance": 0},
+            member_b: {"chip_balance": 1000, "in_play_balance": 0},
+            ("unions", "union-1", "clubs", "club-a"): {"status": "active"},
+            ("unions", "union-1", "clubs", "club-b"): {"status": "active"},
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    for seat, club_id, user_id in ((0, "club-a", "player-a"), (1, "club-b", "player-b")):
+        result = repository.reserve_union_buy_in(
+            "union-1",
+            "table-1",
+            club_id,
+            seat,
+            user_id,
+            user_id,
+            100,
+            f"union-buy-in-{seat}",
+        )
+        assert result == BuyInStatus.RESERVED
+
+    hand_summary = {
+        "hand_id": "union-hand-1",
+        "union_id": "union-1",
+        "table_id": "table-1",
+        "timestamp": "2026-10-14T10:00:00+00:00",
+        "rake_amount": 0,
+        "players": [
+            {"seat": 0, "user_id": "player-a", "final_stack": 50, "net_delta": -50},
+            {"seat": 1, "user_id": "player-b", "final_stack": 150, "net_delta": 50},
+        ],
+    }
+    deltas = {"player-a": -50, "player-b": 50}
+    player_clubs = {"player-a": "club-a", "player-b": "club-b"}
+
+    assert repository.persist_union_hand_history_and_ledgers(
+        "union-1", "table-1", hand_summary, deltas, player_clubs
+    )
+    assert client.documents[member_a]["in_play_balance"] == 50
+    assert client.documents[member_b]["in_play_balance"] == 150
+    assert client.documents[("unions", "union-1", "settlements", "2026-10-14", "clubs", "club-a")] == {
+        "club_id": "club-a",
+        "debt": 50,
+        "credit": 0,
+    }
+    assert client.documents[("unions", "union-1", "settlements", "2026-10-14", "clubs", "club-b")] == {
+        "club_id": "club-b",
+        "debt": 0,
+        "credit": 50,
+    }
+
+    assert not repository.persist_union_hand_history_and_ledgers(
+        "union-1", "table-1", hand_summary, deltas, player_clubs
+    )
+    assert client.documents[member_a]["in_play_balance"] == 50
+    assert client.documents[member_b]["in_play_balance"] == 150
+
+
+def test_union_table_metadata_is_created_once_and_soft_closed(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    table_data = {
+        "union_id": "union-1",
+        "table_id": "table-1",
+        "table_name": "Union Main",
+        "origin_club_id": "club-a",
+        "status": "open",
+    }
+
+    assert repository.create_union_table_record("union-1", "table-1", table_data)
+    assert not repository.create_union_table_record("union-1", "table-1", table_data)
+    assert repository.close_union_table_record("union-1", "table-1")
+    assert client.documents[("unions", "union-1", "tables", "table-1")]["status"] == "closed"
+
+
+def test_union_table_with_persisted_seat_cannot_be_treated_as_empty() -> None:
+    client = FakeFirestoreClient(
+        {
+            ("unions", "union-1", "tables", "table-1", "seats", "0"): {
+                "club_id": "club-a",
+                "user_id": "player-a",
+                "stack": 500,
+            }
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    assert repository.has_union_table_seats("union-1", "table-1")
+    assert not repository.has_union_table_seats("union-1", "table-2")

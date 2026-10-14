@@ -1,6 +1,6 @@
 # API and WebSocket Contract
 
-This guide describes the endpoints and messages currently implemented for a UI client. REST routes require a Firebase ID token; table sockets require the same token in an initial authentication message. The backend verifies tokens against the configured Firebase project and checks active club membership. This is an initial authorization layer, not a complete production security review.
+This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. This is an initial authorization layer, not a complete production security review.
 
 Base URL for local development: `http://127.0.0.1:8000`  
 WebSocket base URL: `ws://127.0.0.1:8000`
@@ -11,15 +11,16 @@ FastAPI also provides interactive route documentation at `/docs` while the serve
 
 Use the signed-in Firebase user's ID token for every protected REST request and for each new table WebSocket connection. The backend derives `user_id` and role from that verified token and the active Firestore membership; do not send a user ID in the socket URL or use the UI's selected role as authorization.
 
-1. Call `GET /clubs/{club_id}/members/me` to load the server-assigned role and display name.
-2. As `OWNER` or `MANAGER`, create the table with `POST /clubs/{club_id}/tables/{table_id}`. Players do not create tables.
-3. As `PLAYER`, reserve a seat with `POST /clubs/{club_id}/tables/{table_id}/seats`. Generate one UUID for `buy_in_id`; retain and reuse it only if retrying that same request.
-4. Open `ws://{host}/ws/table/{club_id}/{table_id}` and send the Firebase ID token as the first WebSocket message. Wait for the `authenticated` acknowledgement and then render the player-specific initial snapshot.
-5. As `OWNER` or `MANAGER`, start the hand with `POST /clubs/{club_id}/tables/{table_id}/hands`. The REST response is not a private player snapshot; render each player's cards from that player's authenticated WebSocket instead.
-6. Send game actions over the WebSocket. Treat every subsequent snapshot as the complete current state, not as a patch.
-7. When a hand completes, keep its `hand_id` from the last snapshot and load its replay from `GET /clubs/{club_id}/hands/{hand_id}/replay` with the same Firebase bearer token.
+1. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name.
+2. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
+3. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
+4. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
+5. As `PLAYER`, buy in locally with `POST /clubs/{club_id}/tables/{table_id}/seats`, or into a union table with `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats`. The union seat request debits the selected home club's member balance. Generate one UUID for `buy_in_id`; retain and reuse it only when retrying that same purchase.
+6. Connect to `/ws/table/{club_id}/{table_id}` for a local table, or `/ws/union/{union_id}/{table_id}` for a shared table. Send the Firebase token first; union auth also includes the player's verified home-club selection. Wait for `authenticated` and then render the player-specific snapshot.
+7. Start local hands with the club endpoint or shared hands with the union endpoint. Send game actions over the socket and replace the UI state with each complete snapshot.
+8. Use the snapshot's `hand_id` for replay. Local hands use `/clubs/{club_id}/hands/{hand_id}/replay`; union hands use `/unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`.
 
-The frontend currently has no Firebase sign-in/provider implementation. It must obtain a real ID token from the host Firebase Auth flow and pass that token to protected API calls; the demo `player-a` ID alone cannot authenticate. The backend also does not currently configure browser CORS. Before calling it from a different origin such as `http://localhost:4200`, configure FastAPI CORS for the exact frontend origin and required methods/headers (including `Authorization`).
+The Angular client reads Firebase configuration from `window.__COWBOYS_FIREBASE_CONFIG__`; the host must provide that configuration and establish a signed-in user before protected API calls can succeed. The demo `player-a` ID alone cannot authenticate. Local CORS defaults allow `http://localhost:4200` and `http://127.0.0.1:4200`. Set `CORS_ALLOWED_ORIGINS` to a comma-separated exact-origin allowlist in each deployment.
 
 ## Club Roles and Current Membership
 
@@ -33,6 +34,8 @@ Membership roles are `OWNER` (Club owner), `MANAGER` (Manager), `AGENT` (Agent),
 | `PLAYER` | Buy in, take a seat, and connect to play. |
 
 All roles require active membership. Role assignment is not exposed by this API.
+
+`UNION_ADMIN` is a separate union-scoped authority, not a club role. It is assigned under `unions/{union_id}/admins/{user_id}` and does not grant extra privileges over the user's club. See [Union Tables and Settlement](#union-tables-and-settlement).
 
 ### Get my membership
 
@@ -87,6 +90,84 @@ The replay response contains timestamped frames with the board, pot, actor, last
   ]
 }
 ```
+
+Union hand replay uses `GET /unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`. It requires an active member of a club linked to that union and applies the same player-specific card filtering.
+
+## Union Tables and Settlement
+
+Union membership is provisioned in Firestore; there are no create-union, join-union, or invite endpoints yet. Required documents:
+
+```text
+unions/{union_id}
+  admins/{user_id}             {"role":"UNION_ADMIN","status":"active"}
+  clubs/{club_id}              {"union_id":"union-1","club_id":"club-a","union_name":"Alliance","status":"active"}
+  tables/{table_id}            Union table configuration and status
+    seats/{seat_index}         Home club, user, and current stack
+    hands/{hand_id}            Restricted complete audit and replay frames
+  settlements/{YYYY-MM-DD}
+    clubs/{club_id}            Accumulated debt and credit for that date
+    hands/{hand_id}            Idempotency record and per-club positions
+```
+
+An active admin document with role `UNION_ADMIN` is required for union table creation, starting, and deletion. A club `OWNER` or `MANAGER` does not inherit this authority. A player must have an active `PLAYER` membership in the selected club, and that club must have an active link under the union.
+
+### Discover shared tables
+
+`GET /clubs/{club_id}/unions` returns the active unions linked to the caller's active club. `GET /clubs/{club_id}/unions/{union_id}/tables` returns open in-process union tables, with the table name, origin club, blinds, buy-in bounds, seat count, and running state. Local tables are listed by `GET /clubs/{club_id}/tables`.
+
+### Create and delete a shared table
+
+`POST /unions/{union_id}/tables/{table_id}` requires `UNION_ADMIN`.
+
+```json
+{
+  "origin_club_id": "club-a",
+  "table_name": "NLH 50/100 Union Main",
+  "small_blind": 50,
+  "big_blind": 100,
+  "buy_in_min": 500,
+  "buy_in_max": 5000
+}
+```
+
+The origin club must be an active union member. The route creates metadata at `unions/{union_id}/tables/{table_id}` and starts an in-process game. `DELETE /unions/{union_id}/tables/{table_id}` is also `UNION_ADMIN`-only and only closes an empty table; it returns `409` if a hand is running or players remain seated so funds cannot be orphaned. Closed table documents are retained as audit metadata.
+
+### Seat and play
+
+`POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` requires an active `PLAYER` membership in the path club and an active union-club link. Its body is the same as the local seat request (`seat_index`, `buy_in_amount`, `buy_in_id`); it does not accept a user ID or stack. The authenticated UID and username come from Firebase/member data. The Firestore transaction debits that member's home-club `chip_balance`, increments its `in_play_balance`, and reserves the seat under the union table.
+
+`POST /unions/{union_id}/tables/{table_id}/hands` requires `UNION_ADMIN`. Shared WebSockets connect to:
+
+```text
+ws://127.0.0.1:8000/ws/union/{union_id}/{table_id}
+```
+
+Their first message includes the selected home club so the server can verify both identities:
+
+```json
+{"type":"authenticate","id_token":"<Firebase ID token>","club_id":"club-a"}
+```
+
+The table snapshot includes `is_union_table`, `union_id`, `origin_club_id`, and `table_name`; each player entry includes its verified `club_id`. Show that club tag next to each player in the shared table UI. The server still sends private cards only according to the existing player masking rules.
+
+```typescript
+const socket = new WebSocket(
+  `${wsBase}/ws/union/${encodeURIComponent(unionId)}/${encodeURIComponent(tableId)}`
+);
+socket.addEventListener('open', () => {
+  socket.send(JSON.stringify({
+    type: 'authenticate',
+    id_token: idToken,
+    club_id: homeClubId
+  }));
+});
+```
+
+### Inter-club clearing
+
+On settlement, each member's `in_play_balance` receives their own hand `net_delta`. The same Firestore transaction records a per-hand clearing entry and increments daily club positions. A club with a negative sum of player deltas accrues debt `-net_delta`; a club with a positive sum accrues credit `net_delta`. For example, if Club A's player loses 500 to Club B's player, A debt increases by 500 and B credit increases by 500. Per-hand idempotency prevents a retry from applying either member balances or clearing positions twice.
+
+The engine currently charges no rake (`rake_amount` is zero). No Union software fee or traffic-based rake split is applied; configure a rake rate and allocation policy before enabling that financial feature.
 
 For REST calls, send `Authorization: Bearer <Firebase ID token>`. In the browser, get the token for the signed-in Firebase user; never send the Firebase web API key as an access token.
 
@@ -240,6 +321,10 @@ Example snapshot sent to `player-a`:
 ```json
 {
   "table_id": "table-1",
+  "table_name": "Main Table",
+  "is_union_table": false,
+  "union_id": null,
+  "origin_club_id": "demo",
   "hand_id": "bfb74a70-1dad-4d8a-bf76-e192d23b50ee",
   "is_hand_running": true,
   "street": 0,
@@ -252,6 +337,7 @@ Example snapshot sent to `player-a`:
       "seat": 0,
       "user_id": "player-a",
       "username": "Alice",
+      "club_id": "demo",
       "stack": 450,
       "status": "sitting_in",
       "hole_cards": ["As", "Ad"],
@@ -261,6 +347,7 @@ Example snapshot sent to `player-a`:
       "seat": 1,
       "user_id": "player-b",
       "username": "Bob",
+      "club_id": "demo",
       "stack": 400,
       "status": "sitting_in",
       "hole_cards": ["??", "??"],
@@ -300,18 +387,18 @@ The error value is a human-readable string and should not be used as a stable ma
 | `401` | Missing/invalid credentials on standard protected REST routes; invalid/expired/revoked token. |
 | `403` | Inactive/non-member account, invalid role, or insufficient route permission. The replay endpoint intentionally returns `403` for missing/invalid authentication too. |
 | `404` | Unknown table, hand, or club member account. |
-| `409` | Duplicate table, unavailable seat, insufficient member balance, conflicting `buy_in_id`, or hand cannot start. |
+| `409` | Duplicate table, occupied/invalid seat, insufficient balance, conflicting `buy_in_id`, hand cannot start, or a non-empty union table cannot be deleted. |
 | `422` | Request body fails validation or table blind/buy-in configuration is invalid. |
 | `503` | Firebase token verification or Firestore is unavailable. For a possibly timed-out buy-in, retry with the same `buy_in_id`. |
 
 ## UI Integration Notes
 
-- Create a table and seat players before opening their table sockets; start a hand after at least two players are seated.
+- Create a local or union table and seat players before opening their table sockets; start a hand after at least two players are seated.
 - Treat WebSocket state as the source for rendering the live table. It is a full snapshot, not a sequence of incremental events.
 - Use `active_turn_seat` and the current user's seat to determine whether to show controls. The server remains authoritative even if the UI hides controls.
 - Use the signed-in Firebase user's ID token for REST and WebSocket authentication. The server derives the UID from the verified token; do not send a caller-selected `user_id`.
-- Open the WebSocket at `/ws/table/{club_id}/{table_id}` only, then send `{ type: 'authenticate', id_token }` immediately on `open`. The current UI's extra user-ID path segment and unauthenticated socket flow do not match this backend contract.
-- Load completed hand replays from `GET /clubs/{club_id}/hands/{hand_id}/replay`; never read raw Firestore hand documents from a client.
+- Open local sockets at `/ws/table/{club_id}/{table_id}` and union sockets at `/ws/union/{union_id}/{table_id}`; send `{ type: 'authenticate', id_token }` immediately on `open`, adding `club_id` for union sockets. Do not put a user ID or token in the URL.
+- Load completed replays through the matching club or union replay endpoint; never read raw Firestore hand documents from a client.
 - Use a new UUID `buy_in_id` for each intentional purchase and reuse it only when retrying that purchase. The server checks funds and applies the debit; the client must not submit a chip stack.
-- The API currently has no table-list/get, sit-out, leave-seat, top-up, cash-out, or explicit hand-endpoint action routes. Initial buy-in is performed by the seat endpoint; game actions are sent over WebSocket.
+- Table lists cover only tables running in the current process. There are still no sit-out, leave-seat, top-up, cash-out, union formation/invitation, or rake-splitting routes. Initial buy-in is performed by the seat endpoint; game actions are sent over WebSocket.
 - State is held in memory. A process restart or routing a socket to another Cloud Run instance can lose or split a live table; session affinity is not durable storage.

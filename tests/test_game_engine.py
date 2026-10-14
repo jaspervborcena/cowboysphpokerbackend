@@ -30,6 +30,15 @@ def test_start_hand_and_mask_opponents_hole_cards() -> None:
     assert opponent_cards == ["??", "??"]
 
 
+def test_player_home_club_is_included_in_table_snapshot() -> None:
+    game = BasePokerGame("union-table", 10, 20, 20, 1000)
+    assert game.add_player(0, "player-a", "Alice", 100, club_id="club-manila")
+
+    snapshot = game.get_masked_state_for_player("player-a")
+
+    assert snapshot["players"][0]["club_id"] == "club-manila"
+
+
 def test_wrong_player_cannot_act_and_fold_completes_hand() -> None:
     game = make_game()
     assert game.start_new_hand()

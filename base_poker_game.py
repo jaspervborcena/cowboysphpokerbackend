@@ -16,6 +16,7 @@ class PlayerSeat:
     buy_in_id: str | None = None
     buy_in_amount: int = 0
     status: str = "sitting_in"
+    club_id: str | None = None
 
 
 class BasePokerGame:
@@ -27,6 +28,10 @@ class BasePokerGame:
         buy_in_min: int,
         buy_in_max: int,
         max_seats: int = 9,
+        *,
+        union_id: str | None = None,
+        origin_club_id: str | None = None,
+        table_name: str | None = None,
     ) -> None:
         if small_blind <= 0 or big_blind < small_blind:
             raise ValueError("Blinds must be positive and the big blind must be at least the small blind.")
@@ -41,6 +46,9 @@ class BasePokerGame:
         self.buy_in_min = buy_in_min
         self.buy_in_max = buy_in_max
         self.max_seats = max_seats
+        self.union_id = union_id
+        self.origin_club_id = origin_club_id
+        self.table_name = table_name or table_id
         self.seats: dict[int, PlayerSeat] = {}
         self.poker_game: Any | None = None
         self.hand_history: list[dict[str, Any]] = []
@@ -73,6 +81,7 @@ class BasePokerGame:
         username: str,
         chip_stack: int,
         buy_in_id: str | None = None,
+        club_id: str | None = None,
     ) -> bool:
         if not self.can_add_player(seat_index, user_id, username, chip_stack):
             return False
@@ -83,6 +92,7 @@ class BasePokerGame:
             chip_stack,
             buy_in_id=buy_in_id,
             buy_in_amount=chip_stack,
+            club_id=club_id,
         )
         return True
 
@@ -219,6 +229,7 @@ class BasePokerGame:
                 "seat": seat,
                 "user_id": player.user_id,
                 "username": player.username,
+                "club_id": player.club_id,
                 "stack": player.stack,
                 "status": player.status,
                 "hole_cards": [],
@@ -239,6 +250,10 @@ class BasePokerGame:
 
         return {
             "table_id": self.table_id,
+            "table_name": self.table_name,
+            "is_union_table": self.union_id is not None,
+            "union_id": self.union_id,
+            "origin_club_id": self.origin_club_id,
             "hand_id": self._current_hand_id,
             "is_hand_running": self.is_hand_running,
             "street": street,
@@ -277,6 +292,7 @@ class BasePokerGame:
                 {
                     "user_id": player.user_id,
                     "username": player.username,
+                    "club_id": player.club_id,
                     "seat": seat,
                     "stack": player.stack,
                     "hole_cards": list(self._hand_hole_cards[player_index]),
@@ -359,6 +375,10 @@ class BasePokerGame:
         return {
             "hand_id": self._current_hand_id,
             "table_id": self.table_id,
+            "table_name": self.table_name,
+            "is_union_table": self.union_id is not None,
+            "union_id": self.union_id,
+            "origin_club_id": self.origin_club_id,
             "started_at": self._hand_started_at,
             "timestamp": completed_at,
             "final_board": [str(card) for card in state.get_board_cards(0)],
@@ -387,6 +407,7 @@ class BasePokerGame:
                     "seat": seat,
                     "user_id": self.seats[seat].user_id,
                     "username": self.seats[seat].username,
+                    "club_id": self.seats[seat].club_id,
                     "starting_stack": state.starting_stacks[player_index],
                     "final_stack": state.stacks[player_index],
                     "net_delta": state.payoffs[player_index],

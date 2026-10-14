@@ -37,6 +37,8 @@ The role panel should also state: “Your current role is PLAYER. Role assignmen
 
 All four roles require an active club membership. Role assignment itself is managed outside this API. See [API.md](API.md) for the client contract and route requirements.
 
+Union administration is separate from club roles. `UNION_ADMIN` is assigned per union and can create/start shared tables and delete empty shared tables; club `OWNER` and `MANAGER` roles do not grant those permissions. Active `PLAYER` members join shared tables through their home club, and chip balances remain in that club's ledger. See [UNIONS.md](UNIONS.md) for the domain model and current limits.
+
 ## Completed
 
 - FastAPI health check and routes to create tables, seat players, and start hands.
@@ -44,6 +46,8 @@ All four roles require an active club membership. Role assignment itself is mana
 - Per-player WebSocket state with opponents' private hole cards masked.
 - Firebase ID-token verification and active club membership checks, with role-gated table creation and hand starts.
 - Restricted Firestore hand audits with timestamped replay frames and per-player card filtering through the replay API.
+- Union table discovery and creation, union-admin gating, cross-club seats/sockets, and idempotent daily club debt/credit clearing.
+- Configurable CORS with local Angular origins allowed by default.
 - Automatic turn timeout that checks when possible and folds when facing a bet.
 - Firestore-backed buy-in reservation: verifies available member balance, moves the amount to in-play chips, and reserves a seat idempotently.
 - Firestore transaction to save a hand audit, apply in-play balance deltas, and update seat stacks idempotently by hand ID.
@@ -74,6 +78,7 @@ python -m pip install -r requirements-test.txt
 $env:FIRESTORE_ENABLED = "true"
 $env:FIREBASE_PROJECT_ID = "porpavordelivery"
 $env:GOOGLE_CLOUD_PROJECT = "porpavordelivery"
+$env:CORS_ALLOWED_ORIGINS = "http://localhost:4200,http://127.0.0.1:4200"
 gcloud auth application-default login
 uvicorn app.main:app --reload
 ```
@@ -111,16 +116,16 @@ The following is a gap list, not functionality already present. The app is suita
 
 ### P1: Complete the playable table workflow
 
-- **Table and seat lifecycle:** add authorized list/get/update/close-table routes, sit-out/sit-in, leave-seat, rebuy/top-up, and host/dealer controls. Today only create table, seat player, and start hand exist.
+- **Table and seat lifecycle:** local/union table listing and union table closure exist, but add sit-out/sit-in, leave-seat, rebuy/top-up, cash-out, and host/dealer controls. Local club table metadata and all live table state remain in memory.
 - **WebSocket reliability:** the socket now authenticates with a Firebase token on its first message. Still define versioned message types, action IDs, acknowledgements, and stable error codes; add heartbeat, reconnect/resync behavior, stale-connection cleanup, and backpressure handling. Game errors remain human-readable strings.
 - **Game-state edge cases:** define and test all-in, side-pot, showdown, disconnected-player, timeout, and hand-end behavior. Current automatic timeout checks when possible and otherwise folds; there is no configurable sit-out or disconnect policy.
-- **Firestore metadata and operations:** create and load club/table documents, define schema versions and timestamps, configure access rules/indexes, and test transaction behavior with the Firestore emulator. The current repository reserves seats, transfers buy-ins from `chip_balance` to `in_play_balance`, and applies hand deltas to `in_play_balance`; it does not create club/table records or initialize member balances.
+- **Firestore metadata and operations:** define schema versions/timestamps for local tables, provision union/admin/club membership documents, configure access rules/indexes, and test transactions with the Firestore emulator. The repository does not initialize member balances or recover live game state.
 
 ### P2: Production readiness and extensibility
 
 - **Broader test coverage:** add tests for legal/illegal raise sizing, calls/checks, all-ins and side pots, timeout decisions, duplicate/stale actions, failed/retried settlement, chip conservation, and restart recovery. Current tests cover basic hand start, masking, turn enforcement, fold settlement, and one WebSocket flow.
 - **Game selection:** the engine hardcodes No-Limit Texas Hold'em. Add a game configuration/adapter boundary before enabling other PokerKit variants; different variants need their own betting, action, and state-serialization rules.
-- **Operations:** add structured logs, metrics/tracing, readiness checks, rate limits, validated environment settings, secret handling, CI, and deployment/rollback checks. Configure browser CORS once the UI origin is known.
+- **Operations:** add structured logs, metrics/tracing, readiness checks, rate limits, validated environment settings, secret handling, CI, and deployment/rollback checks. Set `CORS_ALLOWED_ORIGINS` to the exact production frontend origins.
 
 ## Suggested Build Order
 
@@ -130,4 +135,4 @@ The following is a gap list, not functionality already present. The app is suita
 4. Complete table/seat lifecycle and version the WebSocket message contract for the UI.
 5. Expand rules, failure, and integration tests; then add operational gates and additional game variants.
 
-For the current UI contract, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).
+For Union table provisioning, endpoint flows, and shared settlement behavior, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).

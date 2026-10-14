@@ -20,6 +20,10 @@ class ClubRole(str, Enum):
     PLAYER = "PLAYER"
 
 
+class UnionRole(str, Enum):
+    UNION_ADMIN = "UNION_ADMIN"
+
+
 @dataclass(frozen=True)
 class AuthenticatedUser:
     uid: str
@@ -30,6 +34,13 @@ class AuthenticatedUser:
 class ClubMembership:
     user: AuthenticatedUser
     role: ClubRole
+    profile: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class UnionMembership:
+    user: AuthenticatedUser
+    role: UnionRole
     profile: dict[str, Any]
 
 
@@ -100,6 +111,78 @@ async def get_active_club_member(
     )
 
 
+async def load_union_admin(
+    repository: Any,
+    union_id: str,
+    current_user: AuthenticatedUser,
+) -> UnionMembership:
+    try:
+        member = await asyncio.to_thread(
+            repository.get_union_admin,
+            union_id,
+            current_user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union membership lookup is unavailable.") from error
+
+    if member is None or member.get("status") != "active":
+        raise HTTPException(status_code=403, detail="Active union administrator membership is required.")
+    try:
+        role = UnionRole(member.get("role"))
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=403, detail="Union membership has no valid role.") from error
+    if role is not UnionRole.UNION_ADMIN:
+        raise HTTPException(status_code=403, detail="UNION_ADMIN role is required.")
+
+    return UnionMembership(current_user, role, member)
+
+
+async def get_active_union_admin(
+    request: Request,
+    union_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> UnionMembership:
+    return await load_union_admin(
+        request.app.state.repository,
+        union_id,
+        current_user,
+    )
+
+
+async def load_active_union_club_member(
+    repository: Any,
+    union_id: str,
+    club_id: str,
+    current_user: AuthenticatedUser,
+) -> ClubMembership:
+    membership = await load_active_club_member(repository, club_id, current_user)
+    try:
+        is_union_club = await asyncio.to_thread(
+            repository.is_club_in_union,
+            union_id,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union club membership lookup is unavailable.") from error
+    if not is_union_club:
+        raise HTTPException(status_code=403, detail="The club is not an active member of this union.")
+    return membership
+
+
+async def get_active_union_club_member(
+    request: Request,
+    union_id: str,
+    club_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> ClubMembership:
+    return await load_active_union_club_member(
+        request.app.state.repository,
+        union_id,
+        club_id,
+        current_user,
+    )
+
+
 def require_club_role(allowed_roles: list[ClubRole]):
     async def role_dependency(
         membership: ClubMembership = Depends(get_active_club_member),
@@ -113,3 +196,12 @@ def require_club_role(allowed_roles: list[ClubRole]):
         return membership
 
     return role_dependency
+
+
+def require_union_admin():
+    async def union_admin_dependency(
+        membership: UnionMembership = Depends(get_active_union_admin),
+    ) -> UnionMembership:
+        return membership
+
+    return union_admin_dependency

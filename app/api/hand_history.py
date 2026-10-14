@@ -12,7 +12,9 @@ from app.auth.roles import (
     ClubMembership,
     bearer_scheme,
     get_current_user,
+    get_active_union_club_member,
     load_active_club_member,
+    load_active_union_club_member,
 )
 from database import FirestoreRequiredError
 
@@ -80,6 +82,7 @@ def filter_replay_for_user(
     allowed_player_fields = (
         "user_id",
         "username",
+        "club_id",
         "seat",
         "stack",
         "mucked",
@@ -125,3 +128,26 @@ def filter_replay_for_user(
         "total_frames": len(filtered_frames),
         "frames": filtered_frames,
     }
+
+
+@router.get("/unions/{union_id}/hands/{hand_id}/replay")
+async def get_union_hand_replay(
+    request: Request,
+    union_id: str,
+    hand_id: str,
+    club_id: str,
+    membership: ClubMembership = Depends(get_active_union_club_member),
+) -> dict[str, Any]:
+    repository = request.app.state.repository
+    try:
+        hand_data = await asyncio.to_thread(
+            repository.get_union_hand_history,
+            union_id,
+            hand_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union hand history is unavailable.") from error
+    if hand_data is None:
+        raise HTTPException(status_code=404, detail="Union hand history not found.")
+
+    return filter_replay_for_user(hand_data, membership.user.uid)
