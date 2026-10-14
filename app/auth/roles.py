@@ -28,6 +28,7 @@ class UnionRole(str, Enum):
 class AuthenticatedUser:
     uid: str
     display_name: str | None = None
+    platform_admin: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,11 @@ async def verify_id_token(token: str, verifier: FirebaseTokenVerifier) -> Authen
     except FirebaseAuthUnavailable as error:
         raise HTTPException(status_code=503, detail="Firebase authentication is unavailable.") from error
 
-    return AuthenticatedUser(uid=claims["uid"], display_name=claims.get("name"))
+    return AuthenticatedUser(
+        uid=claims["uid"],
+        display_name=claims.get("name"),
+        platform_admin=claims.get("platform_admin") is True,
+    )
 
 
 async def get_current_user(

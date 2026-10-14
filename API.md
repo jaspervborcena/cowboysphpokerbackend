@@ -1,6 +1,8 @@
 # API and WebSocket Contract
 
-This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. This is an initial authorization layer, not a complete production security review.
+This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. The intended economy keeps club-managed money balances separate from global non-cash play-money balances; only some club-chip flows are implemented here, and the global wallet/table flows are not yet present. This is an initial authorization layer, not a complete production security review.
+
+Realtime gameplay is websocket-based. The app protocol for table state and player actions is the WebSocket connection; it is not gRPC. The gRPC dependency is only part of the Google Cloud Firebase/Firestore client stack used for auth and optional persistence.
 
 Base URL for local development: `http://127.0.0.1:8000`  
 WebSocket base URL: `ws://127.0.0.1:8000`
@@ -28,9 +30,9 @@ Membership roles are `OWNER` (Club owner), `MANAGER` (Manager), `AGENT` (Agent),
 
 | Role | Current backend access |
 | --- | --- |
-| `OWNER` | Create tables and start hands. |
-| `MANAGER` | Create tables and start hands. |
-| `AGENT` | No role-specific API actions are currently assigned. |
+| `OWNER` | Create tables, start hands, and manage club wallet transfers. |
+| `MANAGER` | Create tables, start hands, and manage club wallet transfers. |
+| `AGENT` | Send chips to and claim chips back from assigned downline members, subject to the agent's available balance. |
 | `PLAYER` | Buy in, take a seat, and connect to play. |
 
 All roles require active membership. Role assignment is not exposed by this API.
@@ -55,6 +57,68 @@ Requires a valid Firebase ID token and active membership. Response `200`:
 The `role` value is authoritative and is always one of the four role IDs listed above.
 
 Invalid/missing REST credentials return `401`; a valid Firebase user who is not an active club member returns `403`.
+
+### Platform club provisioning
+
+`POST /platform/clubs` requires a valid Firebase ID token with the trusted custom claim `platform_admin: true`. The claim must be assigned through a trusted Firebase Admin process; this API does not allow users to grant themselves platform-admin access.
+
+Request:
+
+```json
+{
+  "name": "New Club",
+  "owner_user_id": "firebase-user-id"
+}
+```
+
+The endpoint returns `201` with the generated club ID, name, owner ID, and initial treasury balance:
+
+```json
+{
+  "club_id": "generated-club-id",
+  "name": "New Club",
+  "owner_user_id": "firebase-user-id",
+  "treasury_balance": 10000
+}
+```
+
+It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
+
+### Club wallet transfers
+
+`POST /clubs/{club_id}/wallet/send-out` transfers available club chips from the authenticated `OWNER`, `MANAGER`, or `AGENT` to a member. An `AGENT` may only transfer to a member whose `agent_id` is the agent's user ID. `POST /clubs/{club_id}/wallet/claim-back` transfers available chips from a member back to the authenticated operator; claim-back is rejected while the member has a nonzero `in_play_balance`. Both operations require a unique `transaction_id` UUID and write balanced member updates plus a club-wide audit record in one Firestore transaction. Reuse the same ID only to safely retry the same transfer.
+
+Request:
+
+```json
+{
+  "user_id": "player-a",
+  "amount": 500,
+  "transaction_id": "00000000-0000-0000-0000-000000000001",
+  "note": "Club chip deposit"
+}
+```
+
+Both endpoints return the transfer type, amount, transaction ID, and server-derived source/destination IDs. Insufficient balance, unauthorized downline, in-play funds, and reused IDs with different transfer details return `409` or `403` as appropriate. Club wallet routes only manage private club chips; global play-money tables and persistent global-wallet APIs are not implemented.
+
+### Club treasury transfers
+
+`GET /clubs/{club_id}/wallet` returns the shared club treasury balance. Only active `OWNER` and `MANAGER` members can read it. The balance is separate from member balances and rake/jackpot pools.
+
+`POST /clubs/{club_id}/wallet/transfers` sends chips from the source club's treasury wallet to another existing club's treasury wallet. Only an active `OWNER` or `MANAGER` of the source club can authorize the transfer; the receiving club does not need to approve it. The source must have sufficient treasury funds. Both club balances and paired audit records are updated atomically, and a repeated `transaction_id` safely replays the same transfer.
+
+Request:
+
+```json
+{
+  "destination_club_id": "club-b",
+  "amount": 2500,
+  "transaction_id": "00000000-0000-0000-0000-000000000002",
+  "note": "Inter-club funding"
+}
+```
+
+Card, debit, credit, and PayPal purchases are not enabled yet. A payment integration must verify provider settlement before crediting a club treasury.
 
 ## Hand History Replay
 
@@ -229,6 +293,12 @@ Response `201`:
 
 Blinds and buy-in limits must be positive, the big blind must not be less than the small blind, and the maximum buy-in must not be less than the minimum. The table is currently created in process memory.
 
+### Update table financial settings
+
+`PATCH /clubs/{club_id}/tables/{table_id}/settings` requires `OWNER` or `MANAGER`. The union equivalent requires `UNION_ADMIN`. `rake_rate` accepts values from `0` through `0.1` (including `0.075`); `rake_cap` and `rake_min_pot` are integer chip amounts. `no_flop_no_drop` disables rake when the hand ends before a flop. BBJ fee collection honors `jackpot_min_pot`. On local club tables, actual rake and BBJ drops reduce winner stacks and update the club treasury in the same idempotent settlement transaction.
+
+BBJ qualifying-hand evaluation/payout, Hand-of-the-Day funding and awards, and union fee allocation are not implemented. Global play-money wallets and global tables are also not implemented by this API.
+
 ### Seat a player
 
 `POST /clubs/{club_id}/tables/{table_id}/seats`
@@ -360,6 +430,16 @@ Example snapshot sent to `player-a`:
 `street` is PokerKit's numeric street index (`0` is pre-flop for the current Hold'em game; `null` means there is no active street). `pot` is the current pot including outstanding bets. `pots` contains the current pot/side-pot amounts. `active_turn_seat` is the seat index to act, or `null` when nobody is acting. Opponents' hidden cards are represented as `"??"`; a player's own cards are sent in clear text only to that player's socket. `hand_id` remains available after completion and can be used to load the replay.
 
 ### Client actions
+
+While another player is acting, a seated player may queue one pre-action on their WebSocket:
+
+```json
+{"type":"pre_action","action":"CHECK_FOLD"}
+{"type":"pre_action","action":"FOLD"}
+{"type":"pre_action","action":"CALL_ANY"}
+```
+
+Send `{"type":"pre_action","action":null}` to clear it. The server acknowledges with `pre_action_set`; the player's own snapshots include their `pre_action` value. On that player's turn, `CHECK_FOLD` checks if no call is due and folds otherwise, `FOLD` folds, and `CALL_ANY` calls the current amount or checks if none is due. The queued action is cleared on execution or when a new hand starts. The server applies queued actions under the table lock and broadcasts the resulting snapshot like a normal action.
 
 Send one JSON object per action:
 

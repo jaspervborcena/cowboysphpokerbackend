@@ -1,6 +1,6 @@
 # Firestore Data Model
 
-This document describes current Firestore writes and suggested metadata shapes. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are audited and apply net results to in-play balances. Union table metadata and per-hand clearing records are written by the backend; local club/table metadata, member initialization, cash-outs, and live table recovery are not implemented.
+This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed money economy and are separate from the intended platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend; global play-money wallets/tables, local club/table metadata, member initialization, external payouts/refunds, and live table recovery are not implemented. Club wallet cash-in and claim-back are operator-mediated transfers between member balances, not external cash payments.
 
 ## Collection Layout
 
@@ -8,6 +8,8 @@ This document describes current Firestore writes and suggested metadata shapes. 
 clubs/{club_id}
   members/{user_id}
     transactions/{buy_in_id}
+  transactions/{transaction_id}
+  treasury/pools
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
@@ -48,7 +50,7 @@ Path: `clubs/{club_id}/members/{user_id}`
 | `user_id` | string | Application user ID; normally matches the document ID. |
 | `username` | string | Display name. |
 | `status` | string | Membership must be `active` for API access; other values are denied. |
-| `role` | string | One of `OWNER`, `MANAGER`, `AGENT`, or `PLAYER`. `OWNER` and `MANAGER` can create tables/start hands; `PLAYER` can buy in, take a seat, and play; `AGENT` has no role-specific API actions yet. |
+| `role` | string | One of `OWNER`, `MANAGER`, `AGENT`, or `PLAYER`. `OWNER`, `MANAGER`, and `AGENT` can operate wallet transfers; agents are limited to assigned downline members. |
 | `chip_balance` | integer | Available balance. Buy-in atomically subtracts the requested amount. |
 | `in_play_balance` | integer | Chips currently held at tables. Buy-in adds the amount; hand settlement applies the player's net result here. |
 
@@ -86,6 +88,36 @@ Seat path: `clubs/{club_id}/tables/{table_id}/seats/{seat_index}`
 ```
 
 The seat document stores the reserved stack and the idempotency key. Hand settlement updates this seat document's `stack` to the hand's final stack. Full table recovery and seat cash-out/removal are not implemented yet.
+
+The same Firestore transaction also creates a club-wide audit entry at `clubs/{club_id}/transactions/{buy_in_id}` with `currency_type: "CLUB_CHIPS"` and `type: "BUY_IN"`. Send-out and claim-back use this collection for double-entry transfer records. Club transaction writes are server-only.
+
+### Club wallet and treasury
+
+`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update both member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back is rejected if the member's `in_play_balance` is nonzero.
+
+The shared club treasury wallet is stored separately at `clubs/{club_id}/treasury/wallet`:
+
+```json
+{
+  "chip_balance": 2500
+}
+```
+
+Platform provisioning through `POST /platform/clubs` creates the club root document, its initial active owner membership, this wallet with `chip_balance: 10000`, and `clubs/{club_id}/transactions/initial-funding` with `type: "INITIAL_GRANT"` in one Firestore transaction. Only Firebase users carrying the trusted `platform_admin: true` custom claim may create clubs. The supplied `owner_user_id` is not checked against Firebase Auth, so the caller must use a valid UID. Existing clubs are not automatically credited. The endpoint generates a new club ID for each request and has no request idempotency key; retrying an ambiguous request may create a second club and grant.
+
+`GET /clubs/{club_id}/wallet` exposes this balance to active owners and managers. `POST /clubs/{club_id}/wallet/transfers` transfers funds from this wallet to another existing club's wallet. The source operator must be an active `OWNER` or `MANAGER`; the transaction checks the role and both club documents, debits and credits balances atomically, and writes matching `INTER_CLUB_SEND_OUT` / `INTER_CLUB_RECEIVE` records under each club's `transactions` collection. Newly provisioned clubs receive the initial 10,000 balance; older clubs are not automatically funded. Debit/credit card and PayPal funding are deferred; no client-supplied payment result can credit this balance.
+
+The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
+
+```json
+{
+  "total_rake_collected": 0,
+  "bad_beat_jackpot_pool": 0,
+  "hand_of_the_day_pool": 0
+}
+```
+
+For local club hands, rake and BBJ drops update these fields atomically with the hand audit and member settlement. Each contribution also gets a server-written club transaction entry keyed by hand ID and type, so a retried hand does not double-count pools. The Hand-of-the-Day field is reserved, but contributions and awards are not applied until their funding and winner rules are defined. Union-wide fee allocation remains undefined and is not applied to these club pools. Global play-money wallets and global-table buy-ins are not implemented.
 
 ### Completed hand audit
 
@@ -190,6 +222,7 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `board` | array of strings | Community cards dealt during the hand. |
 | `final_board` | array of strings | Final public community cards, used by replay summary. |
 | `pot_total`, `rake_amount` | integer | Total chips pushed to pots and amount not paid to players. |
+| `settlement_status` | string | `pending` after the durable hand audit is enqueued; `settled` after player/pool ledger updates commit atomically. |
 | `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred and gross chip awards by winner. |
 | `pot_distributions` | array | PokerKit per-pot/board/hand-type award details. |
 | `deck_state` | object | Remaining, burn, mucked, and reserved cards; restricted audit data. |

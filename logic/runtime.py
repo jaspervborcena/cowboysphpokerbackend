@@ -29,6 +29,7 @@ class TableRuntime:
 
     async def start_hand(self) -> bool:
         async with self.lock:
+            await self._persist_completed_hand()
             started = self.game.start_new_hand()
         if started:
             await self._broadcast_and_reset_timer()
@@ -37,11 +38,24 @@ class TableRuntime:
     async def act(self, user_id: str, action: str, amount: int | None = None) -> None:
         async with self.lock:
             self.game.handle_player_action(user_id, action, amount)
+            await self._apply_pending_pre_actions()
             await self._persist_completed_hand()
         await self._broadcast_and_reset_timer()
 
+    async def set_pre_action(self, user_id: str, option: str | None) -> str | None:
+        async with self.lock:
+            return self.game.set_pre_action(user_id, option)
+
+    async def _apply_pending_pre_actions(self) -> None:
+        while self.game.is_hand_running:
+            actor = self.game.current_actor_user_id
+            if actor is None or not self.game.get_pre_action_for_player(actor)["action"]:
+                return
+            if not self.game.execute_pending_pre_action(actor):
+                return
+
     async def _persist_completed_hand(self) -> None:
-        hand = self.game.pop_completed_hand()
+        hand = self.game.peek_completed_hand()
         if hand is None:
             return
         chip_deltas = {player["user_id"]: player["net_delta"] for player in hand["players"]}
@@ -68,6 +82,7 @@ class TableRuntime:
                 hand,
                 chip_deltas,
             )
+        self.game.acknowledge_completed_hand(hand["hand_id"])
 
     async def _broadcast_and_reset_timer(self) -> None:
         await self.connections.broadcast_table_state(
@@ -91,6 +106,7 @@ class TableRuntime:
                     return
                 action = "FOLD" if (self.game.current_call_amount or 0) > 0 else "CHECK"
                 self.game.handle_player_action(expected_user_id, action)
+                await self._apply_pending_pre_actions()
                 await self._persist_completed_hand()
             await self._broadcast_and_reset_timer()
         except asyncio.CancelledError:

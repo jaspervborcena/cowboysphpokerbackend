@@ -6,6 +6,9 @@ from typing import Any
 from google.cloud import firestore
 
 
+INITIAL_CLUB_TREASURY_FUNDS = 10_000
+
+
 class BuyInStatus(StrEnum):
     RESERVED = "reserved"
     ALREADY_RESERVED = "already_reserved"
@@ -17,11 +20,77 @@ class BuyInStatus(StrEnum):
     UNION_CLUB_NOT_FOUND = "union_club_not_found"
 
 
+class WalletTransactionStatus(StrEnum):
+    COMPLETED = "completed"
+    IDEMPOTENT_REPLAY = "idempotent_replay"
+    CLUB_NOT_FOUND = "club_not_found"
+    SAME_CLUB = "same_club"
+    UNAUTHORIZED_OPERATOR = "unauthorized_operator"
+    INVALID_AMOUNT = "invalid_amount"
+    MEMBER_NOT_FOUND = "member_not_found"
+    INSUFFICIENT_BALANCE = "insufficient_balance"
+    PLAYER_HAS_CHIPS_IN_PLAY = "player_has_chips_in_play"
+    UNAUTHORIZED_DOWNLINE = "unauthorized_downline"
+    INVALID_BALANCE = "invalid_balance"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+
 class FirestoreRequiredError(RuntimeError):
     pass
 
 
 class NullHandRepository:
+    def recover_pending_settlements(self) -> int:
+        return 0
+
+    def get_club_wallet_balance(self, club_id: str) -> int:
+        raise FirestoreRequiredError("Firestore must be enabled to load the club wallet.")
+
+    def create_club(
+        self,
+        club_id: str,
+        name: str,
+        owner_user_id: str,
+        created_by: str,
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to create a club.")
+
+    def transfer_between_club_wallets(
+        self,
+        source_club_id: str,
+        destination_club_id: str,
+        operator_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        raise FirestoreRequiredError("Firestore must be enabled for club wallet transfers.")
+
+    def send_out_club_chips(
+        self,
+        club_id: str,
+        sender_user_id: str,
+        recipient_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        raise FirestoreRequiredError("Firestore must be enabled for club wallet transfers.")
+
+    def claim_back_club_chips(
+        self,
+        club_id: str,
+        player_user_id: str,
+        recipient_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        raise FirestoreRequiredError("Firestore must be enabled for club wallet transfers.")
+
     def get_club_member(self, club_id: str, user_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to verify club membership.")
 
@@ -39,6 +108,23 @@ class NullHandRepository:
 
     def get_unions_for_club(self, club_id: str) -> list[dict[str, str]]:
         raise FirestoreRequiredError("Firestore must be enabled to load club unions.")
+
+    def set_union_admin(
+        self,
+        union_id: str,
+        user_id: str,
+        role: str,
+        status: str,
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to provision a union administrator.")
+
+    def add_union_club(
+        self,
+        union_id: str,
+        club_id: str,
+        club_data: dict[str, Any],
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to provision a union club membership.")
 
     def create_union_table_record(
         self, union_id: str, table_id: str, table_data: dict[str, Any]
@@ -100,6 +186,184 @@ class FirestoreHandRepository:
     def __init__(self, client: firestore.Client) -> None:
         self._client = client
 
+    def create_club(
+        self,
+        club_id: str,
+        name: str,
+        owner_user_id: str,
+        created_by: str,
+    ) -> bool:
+        club_ref = self._client.collection("clubs").document(club_id)
+        owner_ref = club_ref.collection("members").document(owner_user_id)
+        wallet_ref = club_ref.collection("treasury").document("wallet")
+        initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            club_snapshot = club_ref.get(transaction=transaction)
+            if club_snapshot.exists:
+                return False
+
+            transaction.set(
+                club_ref,
+                {
+                    "club_id": club_id,
+                    "name": name,
+                    "status": "active",
+                    "owner_user_id": owner_user_id,
+                    "created_by": created_by,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                owner_ref,
+                {
+                    "user_id": owner_user_id,
+                    "role": "OWNER",
+                    "status": "active",
+                    "chip_balance": 0,
+                    "in_play_balance": 0,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                wallet_ref,
+                {"chip_balance": INITIAL_CLUB_TREASURY_FUNDS},
+            )
+            transaction.set(
+                initial_funding_ref,
+                {
+                    "transaction_id": "initial-funding",
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "INITIAL_GRANT",
+                    "to_club_id": club_id,
+                    "amount": INITIAL_CLUB_TREASURY_FUNDS,
+                    "performed_by": created_by,
+                    "note": "Initial club treasury funding",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return True
+
+        return commit(transaction)
+
+    def get_club_wallet_balance(self, club_id: str) -> int:
+        wallet_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("treasury")
+            .document("wallet")
+        )
+        snapshot = wallet_ref.get()
+        wallet = snapshot.to_dict() or {}
+        balance = wallet.get("chip_balance", 0)
+        if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
+            raise ValueError("Club treasury wallet balance is invalid.")
+        return balance
+
+    def transfer_between_club_wallets(
+        self,
+        source_club_id: str,
+        destination_club_id: str,
+        operator_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            return WalletTransactionStatus.INVALID_AMOUNT
+        if source_club_id == destination_club_id:
+            return WalletTransactionStatus.SAME_CLUB
+
+        clubs_ref = self._client.collection("clubs")
+        source_club_ref = clubs_ref.document(source_club_id)
+        destination_club_ref = clubs_ref.document(destination_club_id)
+        operator_ref = source_club_ref.collection("members").document(operator_user_id)
+        source_wallet_ref = source_club_ref.collection("treasury").document("wallet")
+        destination_wallet_ref = destination_club_ref.collection("treasury").document("wallet")
+        source_ledger_ref = source_club_ref.collection("transactions").document(transaction_id)
+        destination_ledger_ref = destination_club_ref.collection("transactions").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> WalletTransactionStatus:
+            source_club_snapshot = source_club_ref.get(transaction=transaction)
+            destination_club_snapshot = destination_club_ref.get(transaction=transaction)
+            operator_snapshot = operator_ref.get(transaction=transaction)
+            source_wallet_snapshot = source_wallet_ref.get(transaction=transaction)
+            destination_wallet_snapshot = destination_wallet_ref.get(transaction=transaction)
+            source_ledger_snapshot = source_ledger_ref.get(transaction=transaction)
+            destination_ledger_snapshot = destination_ledger_ref.get(transaction=transaction)
+
+            if source_ledger_snapshot.exists or destination_ledger_snapshot.exists:
+                source_entry = source_ledger_snapshot.to_dict() or {}
+                destination_entry = destination_ledger_snapshot.to_dict() or {}
+                same_request = (
+                    source_entry.get("type") == "INTER_CLUB_SEND_OUT"
+                    and destination_entry.get("type") == "INTER_CLUB_RECEIVE"
+                    and source_entry.get("from_club_id") == source_club_id
+                    and source_entry.get("to_club_id") == destination_club_id
+                    and destination_entry.get("from_club_id") == source_club_id
+                    and destination_entry.get("to_club_id") == destination_club_id
+                    and source_entry.get("amount") == amount
+                    and destination_entry.get("amount") == amount
+                )
+                return WalletTransactionStatus.IDEMPOTENT_REPLAY if same_request else WalletTransactionStatus.IDEMPOTENCY_CONFLICT
+
+            if not source_club_snapshot.exists or not destination_club_snapshot.exists:
+                return WalletTransactionStatus.CLUB_NOT_FOUND
+            if not operator_snapshot.exists:
+                return WalletTransactionStatus.MEMBER_NOT_FOUND
+
+            operator = operator_snapshot.to_dict() or {}
+            if operator.get("status") != "active" or str(operator.get("role", "")).upper() not in {"OWNER", "MANAGER"}:
+                return WalletTransactionStatus.UNAUTHORIZED_OPERATOR
+
+            source_wallet = source_wallet_snapshot.to_dict() or {}
+            destination_wallet = destination_wallet_snapshot.to_dict() or {}
+            source_balance = source_wallet.get("chip_balance", 0)
+            destination_balance = destination_wallet.get("chip_balance", 0)
+            if any(
+                isinstance(balance, bool) or not isinstance(balance, int) or balance < 0
+                for balance in (source_balance, destination_balance)
+            ):
+                return WalletTransactionStatus.INVALID_BALANCE
+            if source_balance < amount:
+                return WalletTransactionStatus.INSUFFICIENT_BALANCE
+
+            transaction.update(
+                source_wallet_ref,
+                {"chip_balance": firestore.Increment(-amount)},
+            )
+            transaction.set(
+                destination_wallet_ref,
+                {"chip_balance": firestore.Increment(amount)},
+                merge=True,
+            )
+            transfer_record = {
+                "transaction_id": transaction_id,
+                "currency_type": "CLUB_CHIPS",
+                "from_club_id": source_club_id,
+                "to_club_id": destination_club_id,
+                "amount": amount,
+                "performed_by": performed_by,
+                "note": note,
+                "timestamp": firestore.SERVER_TIMESTAMP,
+            }
+            transaction.set(
+                source_ledger_ref,
+                {**transfer_record, "type": "INTER_CLUB_SEND_OUT"},
+            )
+            transaction.set(
+                destination_ledger_ref,
+                {**transfer_record, "type": "INTER_CLUB_RECEIVE"},
+            )
+            return WalletTransactionStatus.COMPLETED
+
+        return commit(transaction)
+
     def get_club_member(self, club_id: str, user_id: str) -> dict[str, Any] | None:
         member_ref = (
             self._client.collection("clubs")
@@ -111,6 +375,210 @@ class FirestoreHandRepository:
         if not snapshot.exists:
             return None
         return snapshot.to_dict()
+
+    def enqueue_pending_hand(
+        self,
+        hand_ref: Any,
+        hand_summary: dict[str, Any],
+    ) -> bool:
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            snapshot = hand_ref.get(transaction=transaction)
+            if snapshot.exists:
+                existing = snapshot.to_dict() or {}
+                return existing.get("settlement_status") == "pending"
+            transaction.set(
+                hand_ref,
+                {
+                    **hand_summary,
+                    "settlement_status": "pending",
+                    "settlement_enqueued_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return True
+
+        return commit(transaction)
+
+    def recover_pending_settlements(self) -> int:
+        pending_hands = (
+            self._client.collection_group("hands")
+            .where("settlement_status", "==", "pending")
+            .stream()
+        )
+        recovered = 0
+        for snapshot in pending_hands:
+            hand = snapshot.to_dict() or {}
+            players = hand.get("players", [])
+            chip_deltas = {
+                str(player["user_id"]): int(player["net_delta"])
+                for player in players
+                if player.get("user_id") is not None and player.get("net_delta") is not None
+            }
+            union_id = hand.get("union_id")
+            if union_id:
+                player_clubs = {
+                    str(player["user_id"]): str(player["club_id"])
+                    for player in players
+                    if player.get("user_id") is not None and player.get("club_id") is not None
+                }
+                completed = self.persist_union_hand_history_and_ledgers(
+                    str(union_id),
+                    str(hand["table_id"]),
+                    hand,
+                    chip_deltas,
+                    player_clubs,
+                )
+            else:
+                completed = self.persist_hand_history_and_ledgers(
+                    str(hand["club_id"]),
+                    str(hand["table_id"]),
+                    hand,
+                    chip_deltas,
+                )
+            if completed:
+                recovered += 1
+        return recovered
+
+    def send_out_club_chips(
+        self,
+        club_id: str,
+        sender_user_id: str,
+        recipient_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        club_ref = self._client.collection("clubs").document(club_id)
+        sender_ref = club_ref.collection("members").document(sender_user_id)
+        recipient_ref = club_ref.collection("members").document(recipient_user_id)
+        ledger_ref = club_ref.collection("transactions").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> WalletTransactionStatus:
+            prior_snapshot = ledger_ref.get(transaction=transaction)
+            if prior_snapshot.exists:
+                prior = prior_snapshot.to_dict() or {}
+                same_request = (
+                    prior.get("type") == "SEND_OUT"
+                    and prior.get("from_user_id") == sender_user_id
+                    and prior.get("to_user_id") == recipient_user_id
+                    and prior.get("amount") == amount
+                )
+                return WalletTransactionStatus.IDEMPOTENT_REPLAY if same_request else WalletTransactionStatus.IDEMPOTENCY_CONFLICT
+
+            sender_snapshot = sender_ref.get(transaction=transaction)
+            recipient_snapshot = recipient_ref.get(transaction=transaction)
+            if not sender_snapshot.exists or not recipient_snapshot.exists:
+                return WalletTransactionStatus.MEMBER_NOT_FOUND
+
+            sender = sender_snapshot.to_dict() or {}
+            recipient = recipient_snapshot.to_dict() or {}
+            role = str(sender.get("role", "")).upper()
+            if role not in {"OWNER", "MANAGER", "AGENT"}:
+                return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+            if role == "AGENT" and recipient.get("agent_id") != sender_user_id:
+                return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+
+            balance = sender.get("chip_balance", 0)
+            if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
+                return WalletTransactionStatus.INVALID_BALANCE
+            if balance < amount:
+                return WalletTransactionStatus.INSUFFICIENT_BALANCE
+
+            transaction.update(sender_ref, {"chip_balance": firestore.Increment(-amount)})
+            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            transaction.set(
+                ledger_ref,
+                {
+                    "transaction_id": transaction_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "SEND_OUT",
+                    "amount": amount,
+                    "from_user_id": sender_user_id,
+                    "to_user_id": recipient_user_id,
+                    "performed_by": performed_by,
+                    "note": note,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return WalletTransactionStatus.COMPLETED
+
+        return commit(transaction)
+
+    def claim_back_club_chips(
+        self,
+        club_id: str,
+        player_user_id: str,
+        recipient_user_id: str,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+        note: str = "",
+    ) -> WalletTransactionStatus:
+        club_ref = self._client.collection("clubs").document(club_id)
+        player_ref = club_ref.collection("members").document(player_user_id)
+        recipient_ref = club_ref.collection("members").document(recipient_user_id)
+        ledger_ref = club_ref.collection("transactions").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> WalletTransactionStatus:
+            prior_snapshot = ledger_ref.get(transaction=transaction)
+            if prior_snapshot.exists:
+                prior = prior_snapshot.to_dict() or {}
+                same_request = (
+                    prior.get("type") == "CLAIM_BACK"
+                    and prior.get("from_user_id") == player_user_id
+                    and prior.get("to_user_id") == recipient_user_id
+                    and prior.get("amount") == amount
+                )
+                return WalletTransactionStatus.IDEMPOTENT_REPLAY if same_request else WalletTransactionStatus.IDEMPOTENCY_CONFLICT
+
+            player_snapshot = player_ref.get(transaction=transaction)
+            recipient_snapshot = recipient_ref.get(transaction=transaction)
+            if not player_snapshot.exists or not recipient_snapshot.exists:
+                return WalletTransactionStatus.MEMBER_NOT_FOUND
+
+            player = player_snapshot.to_dict() or {}
+            recipient = recipient_snapshot.to_dict() or {}
+            role = str(recipient.get("role", "")).upper()
+            if role not in {"OWNER", "MANAGER", "AGENT"}:
+                return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+            if role == "AGENT" and player.get("agent_id") != recipient_user_id:
+                return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+
+            balance = player.get("chip_balance", 0)
+            in_play = player.get("in_play_balance", 0)
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (balance, in_play)):
+                return WalletTransactionStatus.INVALID_BALANCE
+            if in_play > 0:
+                return WalletTransactionStatus.PLAYER_HAS_CHIPS_IN_PLAY
+            if balance < amount:
+                return WalletTransactionStatus.INSUFFICIENT_BALANCE
+
+            transaction.update(player_ref, {"chip_balance": firestore.Increment(-amount)})
+            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            transaction.set(
+                ledger_ref,
+                {
+                    "transaction_id": transaction_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "CLAIM_BACK",
+                    "amount": amount,
+                    "from_user_id": player_user_id,
+                    "to_user_id": recipient_user_id,
+                    "performed_by": performed_by,
+                    "note": note,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return WalletTransactionStatus.COMPLETED
+
+        return commit(transaction)
 
     def get_hand_history(self, club_id: str, hand_id: str) -> dict[str, Any] | None:
         matches = (
@@ -176,6 +644,56 @@ class FirestoreHandRepository:
             and data.get("union_id")
         ]
         return sorted(unions, key=lambda union: union["union_id"])
+
+    def set_union_admin(
+        self,
+        union_id: str,
+        user_id: str,
+        role: str,
+        status: str,
+    ) -> bool:
+        admin_ref = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("admins")
+            .document(user_id)
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            transaction.set(
+                admin_ref,
+                {
+                    "role": role,
+                    "status": status,
+                },
+                merge=True,
+            )
+            return True
+
+        return commit(transaction)
+
+    def add_union_club(
+        self,
+        union_id: str,
+        club_id: str,
+        club_data: dict[str, Any],
+    ) -> bool:
+        club_ref = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("clubs")
+            .document(club_id)
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            transaction.set(club_ref, club_data, merge=True)
+            return True
+
+        return commit(transaction)
 
     def create_union_table_record(
         self, union_id: str, table_id: str, table_data: dict[str, Any]
@@ -261,6 +779,12 @@ class FirestoreHandRepository:
             .document(club_id)
         )
         buy_in_ref = member_ref.collection("transactions").document(buy_in_id)
+        club_transaction_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("transactions")
+            .document(buy_in_id)
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -269,6 +793,7 @@ class FirestoreHandRepository:
             seat_snapshot = seat_ref.get(transaction=transaction)
             union_club_snapshot = union_club_ref.get(transaction=transaction)
             buy_in_snapshot = buy_in_ref.get(transaction=transaction)
+            club_transaction_snapshot = club_transaction_ref.get(transaction=transaction)
 
             if not union_club_snapshot.exists or (
                 union_club_snapshot.to_dict() or {}
@@ -286,6 +811,8 @@ class FirestoreHandRepository:
                     and seat.get("buy_in_id") == buy_in_id
                 )
                 return BuyInStatus.ALREADY_RESERVED if same_request else BuyInStatus.IDEMPOTENCY_CONFLICT
+            if club_transaction_snapshot.exists:
+                return BuyInStatus.IDEMPOTENCY_CONFLICT
             if seat_snapshot.exists:
                 return BuyInStatus.SEAT_OCCUPIED
             if not member_snapshot.exists:
@@ -330,6 +857,22 @@ class FirestoreHandRepository:
                     "chip_balance_delta": -buy_in_amount,
                     "in_play_balance_delta": buy_in_amount,
                     "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                club_transaction_ref,
+                {
+                    "transaction_id": buy_in_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "BUY_IN",
+                    "table_id": table_id,
+                    "seat_index": seat_index,
+                    "amount": buy_in_amount,
+                    "from_user_id": user_id,
+                    "to_user_id": None,
+                    "performed_by": user_id,
+                    "note": "club_table_buy_in",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
                 },
             )
             return BuyInStatus.RESERVED
@@ -378,16 +921,28 @@ class FirestoreHandRepository:
             club_id: settlement_ref.collection("clubs").document(club_id)
             for club_id in club_net_deltas
         }
+        if not self.enqueue_pending_hand(hand_ref, hand_summary):
+            return False
         transaction = self._client.transaction()
 
         @firestore.transactional
         def commit(transaction: Any) -> bool:
-            if hand_ref.get(transaction=transaction).exists or settlement_hand_ref.get(
-                transaction=transaction
-            ).exists:
+            hand_snapshot = hand_ref.get(transaction=transaction)
+            settlement_snapshot = settlement_hand_ref.get(transaction=transaction)
+            if not hand_snapshot.exists:
                 return False
-
-            transaction.set(hand_ref, hand_summary)
+            if (hand_snapshot.to_dict() or {}).get("settlement_status") != "pending":
+                return False
+            if settlement_snapshot.exists:
+                transaction.set(
+                    hand_ref,
+                    {
+                        "settlement_status": "settled",
+                        "settled_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                return False
             for user_id, delta in chip_deltas.items():
                 transaction.set(
                     member_refs[user_id],
@@ -428,6 +983,14 @@ class FirestoreHandRepository:
                     "rake_amount": hand_summary.get("rake_amount", 0),
                 },
             )
+            transaction.set(
+                hand_ref,
+                {
+                    "settlement_status": "settled",
+                    "settled_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
             return True
 
         return commit(transaction)
@@ -452,13 +1015,36 @@ class FirestoreHandRepository:
             .collection("members").document(user_id)
             for user_id in chip_deltas
         }
+        pool_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("treasury")
+            .document("pools")
+        )
+        rake_amount = int(hand_summary.get("rake_amount", 0))
+        jackpot_amount = int((hand_summary.get("jackpot") or {}).get("fee_collected", 0))
+        hotd_amount = 0
+        transaction_refs = {
+            kind: self._client.collection("clubs").document(club_id)
+            .collection("transactions").document(f"{hand_summary['hand_id']}_{kind.lower()}")
+            for kind, amount in (
+                ("RAKE", rake_amount),
+                ("BBJ_DROP", jackpot_amount),
+                ("HAND_OF_THE_DAY", hotd_amount),
+            )
+            if amount > 0
+        }
+        if not self.enqueue_pending_hand(hand_ref, hand_summary):
+            return False
         transaction = self._client.transaction()
 
         @firestore.transactional
         def commit(transaction: Any) -> bool:
-            if hand_ref.get(transaction=transaction).exists:
+            hand_snapshot = hand_ref.get(transaction=transaction)
+            if not hand_snapshot.exists:
                 return False
-            transaction.set(hand_ref, hand_summary)
+            if (hand_snapshot.to_dict() or {}).get("settlement_status") != "pending":
+                return False
             for user_id, delta in chip_deltas.items():
                 transaction.set(
                     member_refs[user_id],
@@ -479,6 +1065,46 @@ class FirestoreHandRepository:
                     {"stack": player["final_stack"]},
                     merge=True,
                 )
+            pool_updates = {
+                "total_rake_collected": rake_amount,
+                "bad_beat_jackpot_pool": jackpot_amount,
+                "hand_of_the_day_pool": hotd_amount,
+            }
+            if any(pool_updates.values()):
+                transaction.set(
+                    pool_ref,
+                    {key: firestore.Increment(amount) for key, amount in pool_updates.items()},
+                    merge=True,
+                )
+            for kind, amount in (
+                ("RAKE", rake_amount),
+                ("BBJ_DROP", jackpot_amount),
+                ("HAND_OF_THE_DAY", hotd_amount),
+            ):
+                if amount <= 0:
+                    continue
+                transaction.set(
+                    transaction_refs[kind],
+                    {
+                        "transaction_id": f"{hand_summary['hand_id']}_{kind.lower()}",
+                        "currency_type": "CLUB_CHIPS",
+                        "type": kind,
+                        "amount": amount,
+                        "from_user_id": None,
+                        "to_user_id": None,
+                        "performed_by": "system",
+                        "hand_id": hand_summary["hand_id"],
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            transaction.set(
+                hand_ref,
+                {
+                    "settlement_status": "settled",
+                    "settled_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
             return True
 
         return commit(transaction)
@@ -509,6 +1135,12 @@ class FirestoreHandRepository:
             .document(str(seat_index))
         )
         buy_in_ref = member_ref.collection("transactions").document(buy_in_id)
+        club_transaction_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("transactions")
+            .document(buy_in_id)
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -516,6 +1148,7 @@ class FirestoreHandRepository:
             member_snapshot = member_ref.get(transaction=transaction)
             seat_snapshot = seat_ref.get(transaction=transaction)
             buy_in_snapshot = buy_in_ref.get(transaction=transaction)
+            club_transaction_snapshot = club_transaction_ref.get(transaction=transaction)
 
             if buy_in_snapshot.exists:
                 buy_in = buy_in_snapshot.to_dict() or {}
@@ -528,6 +1161,8 @@ class FirestoreHandRepository:
                     and seat.get("buy_in_id") == buy_in_id
                 )
                 return BuyInStatus.ALREADY_RESERVED if same_request else BuyInStatus.IDEMPOTENCY_CONFLICT
+            if club_transaction_snapshot.exists:
+                return BuyInStatus.IDEMPOTENCY_CONFLICT
 
             if seat_snapshot.exists:
                 return BuyInStatus.SEAT_OCCUPIED
@@ -571,6 +1206,22 @@ class FirestoreHandRepository:
                     "chip_balance_delta": -buy_in_amount,
                     "in_play_balance_delta": buy_in_amount,
                     "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                club_transaction_ref,
+                {
+                    "transaction_id": buy_in_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "BUY_IN",
+                    "table_id": table_id,
+                    "seat_index": seat_index,
+                    "amount": buy_in_amount,
+                    "from_user_id": user_id,
+                    "to_user_id": None,
+                    "performed_by": user_id,
+                    "note": "club_table_buy_in",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
                 },
             )
             return BuyInStatus.RESERVED
