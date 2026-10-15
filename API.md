@@ -9,7 +9,40 @@ WebSocket base URL: `ws://127.0.0.1:8000`
 
 FastAPI also provides interactive route documentation at `/docs` while the server is running.
 
+## Error Response Standard
+
+All REST errors use the same response shape. Client-facing messages are generic and must not contain exception text, database details, tokens, or stack traces. Match the numeric `code` in the client; use `trace_id` when reporting a problem to support.
+
+```json
+{
+  "status": "error",
+  "code": 40301,
+  "message": "Access denied.",
+  "errors": [{"message": "You do not have permission to perform this action."}],
+  "trace_id": "err_8f7a6b5c4d3e2f1a"
+}
+```
+
+Validation errors use `status: "fail"` and may include safe field names in `errors`; values and raw parser messages are never returned. Internal logs include the same trace ID, numeric code, technical cause, stack trace for exceptions, and HTTP request context. Do not log credentials or request bodies.
+
+| Code | Meaning | Client message |
+| --- | --- | --- |
+| `40001` | Missing required field | Invalid input provided. |
+| `40002` | Invalid format or malformed message | Invalid input provided. |
+| `40101` | Missing, invalid, or expired authentication | Authentication required. |
+| `40301` | Permission denied | Access denied. |
+| `40401` | Resource not found | Not found. |
+| `40901` | State or request conflict | Request conflict. |
+| `40902` | Idempotency key reused with different action details | Request conflict. |
+| `42901` | Rate limit exceeded | Too many requests. |
+| `50001` | Service unavailable | Service temporarily unavailable. |
+| `50002` | Unexpected internal failure | Internal server error. |
+
+REST request validation currently returns HTTP `400`; authentication, authorization, not-found, conflict, and service failures retain their corresponding HTTP status. The numeric code is the stable application identifier.
+
 ## UI Integration Flow
+
+For a step-by-step UI implementation guide with current v1 action IDs, heartbeat handling, safe errors, and reconnect guidance, see [UI_GUIDE.md](UI_GUIDE.md).
 
 Use the signed-in Firebase user's ID token for every protected REST request and for each new table WebSocket connection. The backend derives `user_id` and role from that verified token and the active Firestore membership; do not send a user ID in the socket URL or use the UI's selected role as authorization.
 
@@ -360,8 +393,9 @@ socket.addEventListener('message', (event: MessageEvent<string>) => {
     // Authentication succeeded; the next message is the initial table snapshot.
     return;
   }
-  if (typeof message === 'object' && message !== null && 'error' in message) {
-    showActionError(String(message.error));
+  if (typeof message === 'object' && message !== null && 'code' in message
+      && 'message' in message) {
+    showApiError(Number(message.code), String(message.message));
     return;
   }
   replaceTableState(message as TableSnapshot);
@@ -374,7 +408,7 @@ The Firebase token must be sent within 10 seconds after the socket opens. The se
 {"type":"authenticated","user_id":"firebase-uid"}
 ```
 
-The next message is a complete player-specific state snapshot. After each accepted action or automatic timeout, the server broadcasts a fresh complete snapshot to each connected player; each player's own cards are visible only on their connection. An invalid action sends `{"error":"<human-readable message>"}` to the acting socket and does not close it. A reconnect must use a new WebSocket, send authentication again, and wait for a fresh snapshot. The server does not currently send heartbeat messages; rely on the browser's `close`/`error` events and reconnect with a fresh ID token.
+The next message is a complete player-specific state snapshot. After each accepted action or automatic timeout, the server broadcasts a fresh complete snapshot to each connected player; each player's own cards are visible only on their connection. Errors use the standardized numeric error body described above; they do not expose raw exception text. The server sends application heartbeat messages and closes idle sockets, so new clients should use v1 and respond to `PING` as described in [UI_GUIDE.md](UI_GUIDE.md). Reconnect with a new WebSocket, send authentication again, and wait for a fresh snapshot.
 
 ### Versioned envelope protocol
 
@@ -404,11 +438,11 @@ Game action:
   "topic": "clubs/demo/tables/table-1/game",
   "event": "PLAYER_ACTION",
   "correlation_id": "action-1",
-  "payload": {"action": "RAISE", "amount": 300}
+  "payload": {"action": "RAISE", "amount": 300, "action_id": "action-<uuid>"}
 }
 ```
 
-Queued pre-actions use `event: "PRE_ACTION"` and `payload: {"action": "CHECK_FOLD"}`; send `null` to clear a queued action. The server responds with `PRE_ACTION_SET`. Invalid commands receive `ACTION_ERROR` with `payload: {"message": "..."}` and the request's correlation ID when valid. A successful game action is reflected in the next `TABLE_SNAPSHOT`; snapshots are broadcasts and have a null correlation ID. Event topics and timestamps on server messages are generated by the server, not copied from client input.
+Queued pre-actions use `event: "PRE_ACTION"` and `payload: {"action": "CHECK_FOLD"}`; send `null` to clear a queued action. The server responds with `PRE_ACTION_SET`. Invalid commands receive `ACTION_ERROR` with the shared error body in `payload` and the request's correlation ID when valid. Every v1 `PLAYER_ACTION` must include a unique `action_id`; retries reuse the same ID and exact action payload. A successful game action is reflected in the next `TABLE_SNAPSHOT`; snapshots are broadcasts and have a null correlation ID. Event topics and timestamps on server messages are generated by the server, not copied from client input.
 
 WebSocket close codes:
 
@@ -418,8 +452,9 @@ WebSocket close codes:
 | `4403` | Inactive membership, unavailable membership record, non-`PLAYER` role, or user is not seated. |
 | `4404` | Table does not exist in this server process. |
 | `4406` | Unsupported versioned WebSocket protocol version. |
-| `4408` | Authentication was not received within 10 seconds. |
+| `4408` | Authentication timeout or idle connection timeout. |
 | `1013` | Firebase or Firestore service is unavailable. |
+| `4400` | Malformed JSON frame. |
 
 Example snapshot sent to `player-a`:
 
@@ -490,10 +525,16 @@ Actions are case-insensitive. `RAISE.amount` is an integer raise-to total for th
 On success, all connected players receive the next full state snapshot; there is no separate action acknowledgement. On invalid input or an illegal/out-of-turn action, only the acting socket receives:
 
 ```json
-{"error":"It is not this player's turn."}
+{
+  "status": "error",
+  "code": 40901,
+  "message": "Request conflict.",
+  "errors": [{"message": "The request could not be completed in the current state."}],
+  "trace_id": "err_<generated-id>"
+}
 ```
 
-The error value is a human-readable string and should not be used as a stable machine code. The configured turn timeout automatically checks when no bet is faced and folds when facing a bet; its result is broadcast as another full snapshot.
+The configured turn timeout automatically checks when no bet is faced and folds when facing a bet; its result is broadcast as another full snapshot.
 
 ## HTTP Errors
 
@@ -503,7 +544,7 @@ The error value is a human-readable string and should not be used as a stable ma
 | `403` | Inactive/non-member account, invalid role, or insufficient route permission. The replay endpoint intentionally returns `403` for missing/invalid authentication too. |
 | `404` | Unknown table, hand, or club member account. |
 | `409` | Duplicate table, occupied/invalid seat, insufficient balance, conflicting `buy_in_id`, hand cannot start, or a non-empty union table cannot be deleted. |
-| `422` | Request body fails validation or table blind/buy-in configuration is invalid. |
+| `400` | Request body fails validation or table blind/buy-in configuration is invalid. |
 | `503` | Firebase token verification or Firestore is unavailable. For a possibly timed-out buy-in, retry with the same `buy_in_id`. |
 
 ## UI Integration Notes

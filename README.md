@@ -24,6 +24,9 @@ tests/                   Engine and API integration tests
 
 `BasePokerGame` is at the project root as requested. `database` owns persistence, `logic` owns live table coordination, and `app/main.py` wires those pieces to the API.
 
+The current WebSocket lifecycle, legacy and v1 message examples, and union-table behavior are documented in [websocket.md](websocket.md).
+The UI workflow, Firebase session handling, role-aware screens, v1 socket messages, retries, heartbeats, and error display guidance are in [UI_GUIDE.md](UI_GUIDE.md).
+
 ## Club Roles
 
 Club membership uses the role IDs `OWNER`, `MANAGER`, `AGENT`, and `PLAYER`. Load the signed-in member's authoritative role from `GET /clubs/{club_id}/members/me`. Show the assigned role as read-only; users cannot change their own role in the app.
@@ -54,10 +57,13 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - FastAPI health check and routes to create tables, seat players, and start hands.
 - PokerKit-backed no-limit Texas Hold'em with server-side turn checking and legal action validation.
 - Per-player WebSocket state with opponents' private hole cards masked.
+- Opt-in v1 WebSocket envelopes for auth, player actions, pre-actions, errors, and snapshots; legacy socket messages remain supported.
 - Firebase ID-token verification and active club membership checks, with role-gated table creation and hand starts.
 - Restricted Firestore hand audits with timestamped replay frames and per-player card filtering through the replay API.
 - Union table discovery and creation, union-admin gating, cross-club seats/sockets, and idempotent daily club debt/credit clearing.
 - Configurable CORS with local Angular origins allowed by default.
+- Numeric error-code enum with standardized, sanitized REST/WebSocket responses and trace-linked structured logs.
+- V1 WebSocket action IDs with bounded in-process duplicate suppression, conflicting-ID errors, heartbeat PING/PONG, and idle connection cleanup.
 - Automatic turn timeout that checks when possible and folds when facing a bet.
 - Firestore-backed buy-in reservation: verifies available member balance, moves the amount to in-play chips, and reserves a seat idempotently.
 - Operator-mediated club wallet send-out and claim-back transfers with role/downline checks and idempotent Firestore audit records.
@@ -122,7 +128,7 @@ The following is a gap list, not functionality already present. The app is suita
 
 ### P0: Security and chip integrity
 
-- **Authorization hardening:** Firebase tokens are verified and active membership plus initial role checks are enforced. Add comprehensive per-table/club policies, review role provisioning and revocation, and security-test every route/socket path before public use.
+- **Authorization hardening:** Firebase tokens are verified and active membership plus initial role checks are enforced. Add comprehensive per-table/club policies, review role provisioning and revocation, validate the initial owner UID during platform club creation, add request idempotency to avoid duplicate 10,000-chip grants, and security-test every route/socket path before public use.
 - **External cash-outs and reconciliation:** local buy-in, operator-mediated club send-out/claim-back, and idempotent hand settlement update Firestore club balances. External payouts, rebuy/top-up, refunds, and reconciliation are still missing; club balances must not be treated as a complete production money ledger until those flows exist.
 - **Rake, BBJ, and promotions:** local tables support `OWNER`/`MANAGER` rake settings up to 10%, caps, no-flop-no-drop, BBJ fee/minimum-pot settings, and idempotent rake/BBJ pool entries. Rake and BBJ drops are deducted from winner awards and reconcile with player deltas. BBJ qualifying-hand evaluation/payout/reseed, Hand-of-the-Day funding and award distribution, union fee allocation, payout rounding policy, and winner announcements remain incomplete. A persistent global play-money wallet and global tables are not implemented.
 - **Reliable settlement retries:** completed hand audits are persisted with `settlement_status: "pending"` before the idempotent balance/pool transaction; that transaction marks them `settled`, and startup retries any pending audits. The runtime also retains the completed hand until persistence succeeds. If Firestore is unavailable before the pending audit is written, only the live process has the retry copy, so durable table recovery and storage-independent buffering remain open.
@@ -131,22 +137,23 @@ The following is a gap list, not functionality already present. The app is suita
 ### P1: Complete the playable table workflow
 
 - **Table and seat lifecycle:** local/union table listing and union table closure exist, but add sit-out/sit-in, leave-seat, rebuy/top-up, cash-out, and host/dealer controls. Local club table metadata and all live table state remain in memory.
-- **WebSocket reliability:** the socket now authenticates with a Firebase token on its first message. Still define versioned message types, action IDs, acknowledgements, and stable error codes; add heartbeat, reconnect/resync behavior, stale-connection cleanup, and backpressure handling. Game errors remain human-readable strings.
+- **WebSocket reliability:** Firebase-first authentication, route-validated v1 topics, standardized numeric error responses, heartbeat PING/PONG, and idle cleanup are implemented; legacy messages remain supported. The UI still needs to adopt v1 and send action IDs. Action deduplication is only bounded process memory, so durable idempotency, bounded send queues, and load-tested backpressure behavior remain. Reconnects authenticate again and receive a full snapshot; no snapshot sequence/version or incremental-delta recovery exists.
 - **Game-state edge cases:** define and test all-in, side-pot, showdown, disconnected-player, timeout, and hand-end behavior. Current automatic timeout checks when possible and otherwise folds; there is no configurable sit-out or disconnect policy.
 - **Firestore metadata and operations:** define schema versions/timestamps for local tables, provision union/admin/club membership documents, configure access rules/indexes, and test transactions with the Firestore emulator. The repository does not initialize member balances or recover live game state.
 
 ### P2: Production readiness and extensibility
 
-- **Broader test coverage:** add tests for legal/illegal raise sizing, calls/checks, all-ins and side pots, timeout decisions, duplicate/stale actions, failed/retried settlement, chip conservation, and restart recovery. Current tests cover basic hand start, masking, turn enforcement, fold settlement, and one WebSocket flow.
+- **Broader test coverage:** add tests for legal/illegal raise sizing, calls/checks, all-ins and side pots, timeout decisions, duplicate/stale actions, failed/retried settlement, chip conservation, and restart recovery. WebSocket tests now cover legacy compatibility, v1 envelopes, union players from different clubs, topic mismatch rejection, and per-player card masking; performance, chat-isolation, and multi-worker behavior remain untested.
 - **Game selection:** the engine hardcodes No-Limit Texas Hold'em. Add a game configuration/adapter boundary before enabling other PokerKit variants; different variants need their own betting, action, and state-serialization rules.
 - **Operations:** add structured logs, metrics/tracing, readiness checks, rate limits, validated environment settings, secret handling, CI, and deployment/rollback checks. Set `CORS_ALLOWED_ORIGINS` to the exact production frontend origins.
 
 ## Suggested Build Order
 
-1. Harden role provisioning/revocation and test authorization rules across all routes and sockets.
-2. Implement cash-out, rebuy, refunds, and settlement recovery with idempotent ledger movements.
-3. Move table ownership/state to a durable single-writer design with restart recovery.
-4. Complete table/seat lifecycle and version the WebSocket message contract for the UI.
-5. Expand rules, failure, and integration tests; then add operational gates and additional game variants.
+1. Close the P0 money and authorization gaps: owner-UID validation and idempotent platform club creation, route/socket policy review, then external payout/refund/reconciliation rules.
+2. Implement the single-writer lease, fencing, durable action journal, checkpoint/replay, and failover design in [websocket.md](websocket.md) before running multiple workers against live tables.
+3. Have the Angular client adopt the opt-in v1 envelope while keeping legacy compatibility during rollout; send action IDs, answer heartbeats, and display generic numeric error states.
+4. Complete the table/seat lifecycle: sit-out, leave-seat, rebuy/top-up, and cash-out.
+5. Add chat only after defining authorization, moderation, rate limits, and bounded queues; then benchmark game latency under chat load and at the target table count.
+6. Expand game/settlement failure tests and operational gates before enabling additional PokerKit variants.
 
 For Union table provisioning, endpoint flows, and shared settlement behavior, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).

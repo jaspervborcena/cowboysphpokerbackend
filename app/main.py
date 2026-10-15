@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
-from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
+from starlette.responses import JSONResponse
 
 from app.api.hand_history import router as hand_history_router
+from app.errors import (
+    ERROR_DEFINITIONS,
+    HTTP_STATUS_CODES,
+    ErrorCode,
+    error_body,
+    log_error,
+    new_trace_id,
+    validation_errors,
+)
 from app.auth.roles import (
     AuthenticatedUser,
     ClubMembership,
@@ -38,8 +51,9 @@ from database import (
 )
 from logic.auth import FirebaseTokenVerifier
 from logic.connections import ConnectionManager
-from logic.runtime import TableRuntime
+from logic.runtime import ActionIdempotencyConflict, TableRuntime
 from logic.websocket_protocol import (
+    MalformedWebSocketMessage,
     PROTOCOL_VERSION,
     UnsupportedWebSocketVersion,
     game_topic,
@@ -121,6 +135,69 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Cowboys PH Poker Game Server", lifespan=lifespan)
+error_logger = logging.getLogger("cowboys.errors")
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_error(request: Request, error: HTTPException) -> JSONResponse:
+    code = HTTP_STATUS_CODES.get(error.status_code, ErrorCode.INTERNAL_SERVER_ERROR)
+    trace_id = new_trace_id()
+    level = logging.WARNING if error.status_code < 500 else logging.ERROR
+    log_error(error_logger, code, trace_id, str(error.detail), request, level)
+    definition = ERROR_DEFINITIONS[code]
+    return JSONResponse(
+        status_code=definition.http_status,
+        content=error_body(code, trace_id),
+        headers=error.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(
+    request: Request,
+    error: RequestValidationError,
+) -> JSONResponse:
+    validation_items = error.errors()
+    code = (
+        ErrorCode.MISSING_REQUIRED_FIELD
+        if validation_items and all(item.get("type") == "missing" for item in validation_items)
+        else ErrorCode.INVALID_FORMAT
+    )
+    trace_id = new_trace_id()
+    log_error(
+        error_logger,
+        code,
+        trace_id,
+        "Request validation failed: "
+        + str([
+            {"type": item.get("type"), "loc": item.get("loc")}
+            for item in validation_items
+        ]),
+        request,
+        logging.WARNING,
+    )
+    return JSONResponse(
+        status_code=400,
+        content=error_body(code, trace_id, validation_errors(validation_items)),
+    )
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, error: Exception) -> JSONResponse:
+    trace_id = new_trace_id()
+    log_error(
+        error_logger,
+        ErrorCode.INTERNAL_SERVER_ERROR,
+        trace_id,
+        error,
+        request,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=error_body(ErrorCode.INTERNAL_SERVER_ERROR, trace_id),
+    )
+
+
 cors_origins = [
     origin.strip()
     for origin in os.getenv(
@@ -146,6 +223,10 @@ app.state.token_verifier = FirebaseTokenVerifier(
 tables: dict[tuple[str, str], TableRuntime] = {}
 max_seats = int(os.getenv("MAX_SEATS", "9"))
 turn_timeout_seconds = int(os.getenv("TURN_TIMEOUT_SECONDS", "30"))
+websocket_heartbeat_interval_seconds = int(
+    os.getenv("WEBSOCKET_HEARTBEAT_INTERVAL_SECONDS", "30")
+)
+websocket_idle_timeout_seconds = int(os.getenv("WEBSOCKET_IDLE_TIMEOUT_SECONDS", "90"))
 
 
 def get_table(club_id: str, table_id: str) -> TableRuntime:
@@ -908,7 +989,14 @@ async def table_websocket_endpoint(
 ) -> None:
     runtime = tables.get((club_id, table_id))
     if runtime is None:
-        await websocket.close(code=4404, reason="Table not found")
+        trace_id = new_trace_id()
+        log_error(error_logger, ErrorCode.RESOURCE_NOT_FOUND, trace_id, "Table not found.", level=logging.WARNING)
+        await websocket.accept()
+        await websocket.send_json(error_body(ErrorCode.RESOURCE_NOT_FOUND, trace_id))
+        await websocket.close(
+            code=4404,
+            reason=ERROR_DEFINITIONS[ErrorCode.RESOURCE_NOT_FOUND].message,
+        )
         return
     await authenticate_player_socket(websocket, runtime, club_id)
 
@@ -921,7 +1009,14 @@ async def union_table_websocket_endpoint(
 ) -> None:
     runtime = tables.get(union_table_key(union_id, table_id))
     if runtime is None:
-        await websocket.close(code=4404, reason="Union table not found")
+        trace_id = new_trace_id()
+        log_error(error_logger, ErrorCode.RESOURCE_NOT_FOUND, trace_id, "Union table not found.", level=logging.WARNING)
+        await websocket.accept()
+        await websocket.send_json(error_body(ErrorCode.RESOURCE_NOT_FOUND, trace_id))
+        await websocket.close(
+            code=4404,
+            reason=ERROR_DEFINITIONS[ErrorCode.RESOURCE_NOT_FOUND].message,
+        )
         return
     await authenticate_player_socket(websocket, runtime, None)
 
@@ -936,14 +1031,43 @@ async def authenticate_player_socket(
     protocol_version: str | None = None
     auth_correlation_id: str | None = None
     topic = game_topic(runtime.connection_scope, runtime.game.table_id)
+    async def reject_authentication(
+        code: ErrorCode,
+        close_code: int,
+        technical_error: str,
+        correlation_id: str | None = None,
+    ) -> None:
+        trace_id = new_trace_id()
+        log_error(error_logger, code, trace_id, technical_error, level=logging.WARNING)
+        body = error_body(code, trace_id)
+        if correlation_id is not None:
+            body["correlation_id"] = correlation_id
+        await websocket.send_json(body)
+        await websocket.close(code=close_code, reason=ERROR_DEFINITIONS[code].message)
+
     try:
         try:
             auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=10)
         except asyncio.TimeoutError:
-            await websocket.close(code=4408, reason="Authentication timed out")
+            await reject_authentication(
+                ErrorCode.AUTHENTICATION_FAILED,
+                4408,
+                "WebSocket authentication timed out.",
+            )
+            return
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            await reject_authentication(
+                ErrorCode.INVALID_FORMAT,
+                4400,
+                f"Invalid JSON authentication message: {error}",
+            )
             return
         if not isinstance(auth_message, dict):
-            await websocket.close(code=4401, reason="Firebase ID token required")
+            await reject_authentication(
+                ErrorCode.INVALID_FORMAT,
+                4401,
+                "Authentication message must be an object.",
+            )
             return
 
         requested_club_id = auth_message.get("club_id")
@@ -954,34 +1078,58 @@ async def authenticate_player_socket(
                     topic,
                 )
             except UnsupportedWebSocketVersion as error:
-                await websocket.close(code=4406, reason=str(error))
+                await reject_authentication(ErrorCode.INVALID_FORMAT, 4406, str(error))
                 return
             except ValueError as error:
-                await websocket.close(code=4401, reason=str(error))
+                await reject_authentication(ErrorCode.INVALID_FORMAT, 4401, str(error))
                 return
             if auth_event != "AUTHENTICATE":
-                await websocket.close(code=4401, reason="AUTHENTICATE event required")
+                await reject_authentication(
+                    ErrorCode.INVALID_FORMAT,
+                    4401,
+                    "AUTHENTICATE event required.",
+                    auth_correlation_id,
+                )
                 return
             protocol_version = PROTOCOL_VERSION
             id_token = auth_payload.get("id_token")
             requested_club_id = auth_payload.get("club_id")
         else:
             if auth_message.get("type") != "authenticate":
-                await websocket.close(code=4401, reason="Firebase ID token required")
+                await reject_authentication(
+                    ErrorCode.AUTHENTICATION_FAILED,
+                    4401,
+                    "Firebase ID token required.",
+                )
                 return
             id_token = auth_message.get("id_token")
         if not isinstance(id_token, str):
-            await websocket.close(code=4401, reason="Firebase ID token required")
+            await reject_authentication(
+                ErrorCode.AUTHENTICATION_FAILED,
+                4401,
+                "Firebase ID token required.",
+                auth_correlation_id,
+            )
             return
 
         if runtime.union_id is not None:
             if not isinstance(requested_club_id, str) or not requested_club_id:
-                await websocket.close(code=4403, reason="A home club ID is required for union tables")
+                await reject_authentication(
+                    ErrorCode.ACCESS_DENIED,
+                    4403,
+                    "A home club ID is required for union tables.",
+                    auth_correlation_id,
+                )
                 return
             club_id = requested_club_id
 
         if club_id is None:
-            await websocket.close(code=4403, reason="Club membership is required")
+            await reject_authentication(
+                ErrorCode.ACCESS_DENIED,
+                4403,
+                "Club membership is required.",
+                auth_correlation_id,
+            )
             return
 
         try:
@@ -1004,7 +1152,8 @@ async def authenticate_player_socket(
                 )
         except HTTPException as error:
             close_code = 4401 if error.status_code == 401 else 1013 if error.status_code == 503 else 4403
-            await websocket.close(code=close_code, reason=str(error.detail))
+            error_code = HTTP_STATUS_CODES.get(error.status_code, ErrorCode.INTERNAL_SERVER_ERROR)
+            await reject_authentication(error_code, close_code, str(error.detail), auth_correlation_id)
             return
 
         user_id = current_user.uid
@@ -1017,7 +1166,12 @@ async def authenticate_player_socket(
             or player_seat is None
             or (runtime.union_id is not None and player_seat.club_id != club_id)
         ):
-            await websocket.close(code=4403, reason="A seated player account is required")
+            await reject_authentication(
+                ErrorCode.ACCESS_DENIED,
+                4403,
+                "A seated player account is required.",
+                auth_correlation_id,
+            )
             return
 
         await connections.connect(
@@ -1050,8 +1204,52 @@ async def authenticate_player_socket(
         else:
             await websocket.send_json({"type": "authenticated", "user_id": user_id})
             await websocket.send_json(initial_state)
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
+        next_heartbeat = last_activity + websocket_heartbeat_interval_seconds
         while True:
-            raw_action = await websocket.receive_json()
+            now = loop.time()
+            idle_remaining = websocket_idle_timeout_seconds - (now - last_activity)
+            heartbeat_remaining = next_heartbeat - now
+            try:
+                raw_action = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=max(0.01, min(idle_remaining, heartbeat_remaining)),
+                )
+            except asyncio.TimeoutError:
+                now = loop.time()
+                if now - last_activity >= websocket_idle_timeout_seconds:
+                    trace_id = new_trace_id()
+                    log_error(
+                        error_logger,
+                        ErrorCode.SERVICE_UNAVAILABLE,
+                        trace_id,
+                        "WebSocket connection exceeded its idle timeout.",
+                        level=logging.INFO,
+                    )
+                    await websocket.send_json(
+                        error_body(ErrorCode.SERVICE_UNAVAILABLE, trace_id)
+                    )
+                    await websocket.close(
+                        code=4408,
+                        reason=ERROR_DEFINITIONS[ErrorCode.SERVICE_UNAVAILABLE].message,
+                    )
+                    break
+                heartbeat_id = str(uuid4())
+                if protocol_version == PROTOCOL_VERSION:
+                    heartbeat = make_envelope("PING", {}, topic, heartbeat_id)
+                else:
+                    heartbeat = {"type": "ping", "correlation_id": heartbeat_id}
+                await websocket.send_json(heartbeat)
+                next_heartbeat = now + websocket_heartbeat_interval_seconds
+                continue
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                trace_id = new_trace_id()
+                log_error(error_logger, ErrorCode.INVALID_FORMAT, trace_id, error, level=logging.WARNING)
+                await websocket.send_json(error_body(ErrorCode.INVALID_FORMAT, trace_id))
+                await websocket.close(code=4400, reason=ERROR_DEFINITIONS[ErrorCode.INVALID_FORMAT].message)
+                break
+            last_activity = loop.time()
             correlation_id: str | None = None
             is_pre_action = False
             try:
@@ -1065,8 +1263,29 @@ async def authenticate_player_socket(
                         raw_action = payload
                     elif event == "PLAYER_ACTION":
                         raw_action = payload
+                        action_id = payload.get("action_id")
+                        if not isinstance(action_id, str) or not action_id or len(action_id) > 128:
+                            raise MalformedWebSocketMessage(
+                                "PLAYER_ACTION requires a non-empty action_id of at most 128 characters."
+                            )
+                    elif event == "PONG":
+                        continue
+                    elif event == "PING":
+                        await websocket.send_json(
+                            make_envelope("PONG", {}, topic, correlation_id)
+                        )
+                        continue
                     else:
-                        raise ValueError("Event must be PLAYER_ACTION or PRE_ACTION.")
+                        raise MalformedWebSocketMessage(
+                            "Event must be PLAYER_ACTION, PRE_ACTION, PING, or PONG."
+                        )
+                elif isinstance(raw_action, dict) and raw_action.get("type") == "pong":
+                    continue
+                elif isinstance(raw_action, dict) and raw_action.get("type") == "ping":
+                    await websocket.send_json(
+                        {"type": "pong", "correlation_id": raw_action.get("correlation_id")}
+                    )
+                    continue
 
                 if is_pre_action or (
                     protocol_version is None
@@ -1075,7 +1294,7 @@ async def authenticate_player_socket(
                 ):
                     option = raw_action.get("action")
                     if option is not None and not isinstance(option, str):
-                        raise ValueError("Pre-action must be a string or null.")
+                        raise MalformedWebSocketMessage("Pre-action must be a string or null.")
                     selected = await runtime.set_pre_action(user_id, option)
                     if protocol_version == PROTOCOL_VERSION:
                         response = make_envelope(
@@ -1089,17 +1308,74 @@ async def authenticate_player_socket(
                     await websocket.send_json(response)
                     continue
                 request = PlayerAction.model_validate(raw_action)
-                await runtime.act(user_id, request.action, request.amount)
+                action_id = raw_action.get("action_id") if isinstance(raw_action, dict) else None
+                replayed = await runtime.act(
+                    user_id,
+                    request.action,
+                    request.amount,
+                    action_id,
+                )
+                if replayed and protocol_version == PROTOCOL_VERSION:
+                    await websocket.send_json(
+                        make_envelope(
+                            "ACTION_ACKNOWLEDGED",
+                            {"action_id": action_id, "duplicate": True},
+                            topic,
+                            correlation_id,
+                        )
+                    )
+            except ActionIdempotencyConflict as error:
+                trace_id = new_trace_id()
+                log_error(
+                    error_logger,
+                    ErrorCode.IDEMPOTENCY_CONFLICT,
+                    trace_id,
+                    error,
+                    level=logging.WARNING,
+                )
+                body = error_body(ErrorCode.IDEMPOTENCY_CONFLICT, trace_id)
+                response = (
+                    make_envelope("ACTION_ERROR", body, topic, correlation_id)
+                    if protocol_version == PROTOCOL_VERSION
+                    else body
+                )
+                await websocket.send_json(response)
             except (ValidationError, ValueError) as error:
+                code = (
+                    ErrorCode.INVALID_FORMAT
+                    if isinstance(
+                        error,
+                        (ValidationError, MalformedWebSocketMessage, UnsupportedWebSocketVersion),
+                    )
+                    else ErrorCode.REQUEST_CONFLICT
+                )
+                trace_id = new_trace_id()
+                log_error(error_logger, code, trace_id, error, level=logging.WARNING)
+                body = error_body(code, trace_id)
                 if protocol_version == PROTOCOL_VERSION:
                     response = make_envelope(
                         "ACTION_ERROR",
-                        {"message": str(error)},
+                        body,
                         topic,
                         correlation_id,
                     )
                 else:
-                    response = {"error": str(error)}
+                    response = body
+                await websocket.send_json(response)
+            except Exception as error:
+                trace_id = new_trace_id()
+                log_error(
+                    error_logger,
+                    ErrorCode.INTERNAL_SERVER_ERROR,
+                    trace_id,
+                    error,
+                )
+                body = error_body(ErrorCode.INTERNAL_SERVER_ERROR, trace_id)
+                response = (
+                    make_envelope("ACTION_ERROR", body, topic, correlation_id)
+                    if protocol_version == PROTOCOL_VERSION
+                    else body
+                )
                 await websocket.send_json(response)
     except WebSocketDisconnect:
         pass

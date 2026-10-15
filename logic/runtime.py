@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 
 from base_poker_game import BasePokerGame
 from database import FirestoreHandRepository, NullHandRepository
 from logic.connections import ConnectionManager
+
+
+class ActionIdempotencyConflict(ValueError):
+    pass
 
 
 class TableRuntime:
@@ -26,6 +31,9 @@ class TableRuntime:
         self.connection_scope = f"union:{union_id}" if union_id else club_id
         self.lock = asyncio.Lock()
         self._turn_task: asyncio.Task[None] | None = None
+        self._recent_actions: OrderedDict[
+            tuple[str, str], tuple[str, int | None]
+        ] = OrderedDict()
 
     async def start_hand(self) -> bool:
         async with self.lock:
@@ -35,12 +43,42 @@ class TableRuntime:
             await self._broadcast_and_reset_timer()
         return started
 
-    async def act(self, user_id: str, action: str, amount: int | None = None) -> None:
+    async def act(
+        self,
+        user_id: str,
+        action: str,
+        amount: int | None = None,
+        action_id: str | None = None,
+    ) -> bool:
         async with self.lock:
-            self.game.handle_player_action(user_id, action, amount)
-            await self._apply_pending_pre_actions()
-            await self._persist_completed_hand()
-        await self._broadcast_and_reset_timer()
+            replayed = False
+            action_key = (user_id, action_id) if action_id is not None else None
+            fingerprint = (action, amount)
+            if action_key is not None and action_key in self._recent_actions:
+                if self._recent_actions[action_key] != fingerprint:
+                    raise ActionIdempotencyConflict(
+                        "Action identifier was reused with different action details."
+                    )
+                self._recent_actions.move_to_end(action_key)
+                replayed = True
+                await self._apply_pending_pre_actions()
+                await self._persist_completed_hand()
+                await self.connections.broadcast_table_state(
+                    self.connection_scope,
+                    self.game.table_id,
+                    self.game,
+                )
+            else:
+                self.game.handle_player_action(user_id, action, amount)
+                if action_key is not None:
+                    self._recent_actions[action_key] = fingerprint
+                    if len(self._recent_actions) > 4096:
+                        self._recent_actions.popitem(last=False)
+                await self._apply_pending_pre_actions()
+                await self._persist_completed_hand()
+        if not replayed:
+            await self._broadcast_and_reset_timer()
+        return replayed
 
     async def set_pre_action(self, user_id: str, option: str | None) -> str | None:
         async with self.lock:

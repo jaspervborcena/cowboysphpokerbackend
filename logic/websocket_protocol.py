@@ -11,6 +11,10 @@ class UnsupportedWebSocketVersion(ValueError):
     pass
 
 
+class MalformedWebSocketMessage(ValueError):
+    pass
+
+
 def game_topic(connection_scope: str, table_id: str) -> str:
     if connection_scope.startswith("union:"):
         union_id = connection_scope.removeprefix("union:")
@@ -39,7 +43,7 @@ def parse_client_envelope(
     expected_topic: str,
 ) -> tuple[str, dict[str, Any], str]:
     if not isinstance(message, dict):
-        raise ValueError("WebSocket envelope must be an object.")
+        raise MalformedWebSocketMessage("WebSocket envelope must be an object.")
     if message.get("version") != PROTOCOL_VERSION:
         raise UnsupportedWebSocketVersion("Unsupported WebSocket protocol version.")
     event = message.get("event")
@@ -47,11 +51,11 @@ def parse_client_envelope(
     correlation_id = message.get("correlation_id")
     payload = message.get("payload")
     if not isinstance(event, str) or not event:
-        raise ValueError("WebSocket envelope event is required.")
+        raise MalformedWebSocketMessage("WebSocket envelope event is required.")
     if topic != expected_topic:
-        raise ValueError("WebSocket envelope topic does not match this connection.")
+        raise MalformedWebSocketMessage("WebSocket envelope topic does not match this connection.")
     if not isinstance(correlation_id, str) or not correlation_id or len(correlation_id) > 128:
-        raise ValueError("WebSocket envelope correlation_id must be a non-empty string of at most 128 characters.")
+        raise MalformedWebSocketMessage("WebSocket envelope correlation_id must be a non-empty string of at most 128 characters.")
     if not isinstance(payload, dict):
-        raise ValueError("WebSocket envelope payload must be an object.")
+        raise MalformedWebSocketMessage("WebSocket envelope payload must be an object.")
     return event, payload, correlation_id

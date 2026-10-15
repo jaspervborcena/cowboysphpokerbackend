@@ -370,6 +370,19 @@ def test_table_api_and_player_websockets(monkeypatch) -> None:
     tables.pop(table_key, None)
 
 
+def test_missing_table_websocket_returns_standard_not_found_error() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/table/missing-club/missing-table") as socket:
+            error = socket.receive_json()
+            assert error["code"] == 40401
+            assert error["message"] == "Not found."
+            assert "missing-table" not in str(error)
+            with pytest.raises(WebSocketDisconnect) as disconnect:
+                socket.receive_json()
+
+    assert disconnect.value.code == 4404
+
+
 def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monkeypatch) -> None:
     club_id = "envelope-test-club"
     table_id = "envelope-test-table"
@@ -423,17 +436,50 @@ def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monke
             if user_id != actor_user_id
         )
 
-        with pytest.raises(WebSocketDisconnect) as disconnect:
-            with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as invalid_socket:
-                invalid_socket.send_json(
-                    {
-                        "version": "1.0",
-                        "topic": "clubs/other-club/tables/other-table/game",
-                        "event": "AUTHENTICATE",
-                        "correlation_id": "wrong-topic",
-                        "payload": {"id_token": f"valid:{actor_user_id}"},
-                    }
-                )
+        with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as malformed_socket:
+            malformed_socket.send_text("{invalid-json")
+            malformed_error = malformed_socket.receive_json()
+            assert malformed_error["code"] == 40002
+            assert malformed_error["message"] == "Invalid input provided."
+            assert "invalid-json" not in str(malformed_error)
+            with pytest.raises(WebSocketDisconnect) as malformed_disconnect:
+                malformed_socket.receive_json()
+        assert malformed_disconnect.value.code == 4400
+
+        with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as expired_socket:
+            expired_socket.send_json(
+                {
+                    "version": "1.0",
+                    "topic": topic,
+                    "event": "AUTHENTICATE",
+                    "correlation_id": "auth-expired",
+                    "payload": {"id_token": "expired-token"},
+                }
+            )
+            expired_error = expired_socket.receive_json()
+            assert expired_error["code"] == 40101
+            assert expired_error["message"] == "Authentication required."
+            assert "invalid token" not in str(expired_error).lower()
+            with pytest.raises(WebSocketDisconnect) as expired_disconnect:
+                expired_socket.receive_json()
+        assert expired_disconnect.value.code == 4401
+
+        with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as invalid_socket:
+            invalid_socket.send_json(
+                {
+                    "version": "1.0",
+                    "topic": "clubs/other-club/tables/other-table/game",
+                    "event": "AUTHENTICATE",
+                    "correlation_id": "wrong-topic",
+                    "payload": {"id_token": f"valid:{actor_user_id}"},
+                }
+            )
+            auth_error = invalid_socket.receive_json()
+            assert auth_error["code"] == 40002
+            assert auth_error["message"] == "Invalid input provided."
+            assert "topic does not match" not in str(auth_error)
+            assert auth_error["trace_id"].startswith("err_")
+            with pytest.raises(WebSocketDisconnect) as disconnect:
                 invalid_socket.receive_json()
         assert disconnect.value.code == 4401
 
@@ -505,7 +551,7 @@ def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monke
                         "topic": topic,
                         "event": "PLAYER_ACTION",
                         "correlation_id": "action-1",
-                        "payload": {"action": action},
+                        "payload": {"action": action, "action_id": "action-id-1"},
                     }
                 )
                 actor_snapshot = actor_socket.receive_json()
@@ -514,6 +560,42 @@ def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monke
                 assert other_snapshot["event"] == "TABLE_SNAPSHOT"
                 assert actor_snapshot["payload"]["pre_action"] is None
                 assert other_snapshot["payload"]["pre_action"] is None
+                replay_frame_count = len(runtime.game._replay_frames)
+
+                actor_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PLAYER_ACTION",
+                        "correlation_id": "action-retry",
+                        "payload": {"action": action, "action_id": "action-id-1"},
+                    }
+                )
+                retry_snapshot = actor_socket.receive_json()
+                other_retry_snapshot = other_socket.receive_json()
+                assert retry_snapshot["event"] == "TABLE_SNAPSHOT"
+                assert other_retry_snapshot["event"] == "TABLE_SNAPSHOT"
+                duplicate_ack = actor_socket.receive_json()
+                assert duplicate_ack["event"] == "ACTION_ACKNOWLEDGED"
+                assert duplicate_ack["payload"] == {
+                    "action_id": "action-id-1",
+                    "duplicate": True,
+                }
+                assert len(runtime.game._replay_frames) == replay_frame_count
+
+                actor_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PLAYER_ACTION",
+                        "correlation_id": "action-id-conflict",
+                        "payload": {"action": "FOLD", "action_id": "action-id-1"},
+                    }
+                )
+                conflict = actor_socket.receive_json()
+                assert conflict["event"] == "ACTION_ERROR"
+                assert conflict["payload"]["code"] == 40902
+                assert "different action details" not in str(conflict)
 
                 actor_socket.send_json(
                     {
@@ -521,13 +603,40 @@ def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monke
                         "topic": topic,
                         "event": "PLAYER_ACTION",
                         "correlation_id": "invalid-action-1",
-                        "payload": {"action": "NOT_A_POKER_ACTION"},
+                        "payload": {
+                            "action": "NOT_A_POKER_ACTION",
+                            "action_id": "invalid-action-id",
+                        },
                     }
                 )
                 action_error = actor_socket.receive_json()
                 assert action_error["event"] == "ACTION_ERROR"
                 assert action_error["correlation_id"] == "invalid-action-1"
-                assert action_error["payload"]["message"]
+                assert action_error["payload"]["code"] == 40901
+                assert "NOT_A_POKER_ACTION" not in str(action_error)
+
+        monkeypatch.setattr(api_main, "websocket_heartbeat_interval_seconds", 1)
+        monkeypatch.setattr(api_main, "websocket_idle_timeout_seconds", 2)
+        with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as idle_socket:
+            idle_socket.send_json(
+                {
+                    "version": "1.0",
+                    "topic": topic,
+                    "event": "AUTHENTICATE",
+                    "correlation_id": "auth-idle",
+                    "payload": {"id_token": f"valid:{other_user_id}"},
+                }
+            )
+            idle_socket.receive_json()
+            idle_socket.receive_json()
+            heartbeat = idle_socket.receive_json()
+            assert heartbeat["event"] == "PING"
+            idle_error = idle_socket.receive_json()
+            assert idle_error["code"] == 50001
+            assert idle_error["message"] == "Service temporarily unavailable."
+            with pytest.raises(WebSocketDisconnect) as idle_disconnect:
+                idle_socket.receive_json()
+            assert idle_disconnect.value.code == 4408
 
     tables.pop(table_key, None)
 
@@ -943,7 +1052,7 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
                         "topic": topic,
                         "event": "PLAYER_ACTION",
                         "correlation_id": "union-action-1",
-                        "payload": {"action": "FOLD"},
+                        "payload": {"action": "FOLD", "action_id": "union-action-id-1"},
                     }
                 )
                 selected_result = selected_socket.receive_json()
@@ -989,7 +1098,10 @@ def test_seating_rejects_insufficient_balance_and_client_stack(monkeypatch) -> N
             },
             headers={"Authorization": "Bearer valid:player-low-balance"},
         )
-        assert old_request.status_code == 422
+        assert old_request.status_code == 400
+        assert old_request.json()["code"] == 40001
+        assert old_request.json()["message"] == "Invalid input provided."
+        assert old_request.json()["trace_id"].startswith("err_")
 
         response = client.post(
             f"/clubs/{club_id}/tables/{table_id}/seats",
@@ -1001,7 +1113,9 @@ def test_seating_rejects_insufficient_balance_and_client_stack(monkeypatch) -> N
             headers={"Authorization": "Bearer valid:player-low-balance"},
         )
         assert response.status_code == 409
-        assert response.json()["detail"] == "Insufficient club chip balance."
+        assert response.json()["code"] == 40901
+        assert response.json()["message"] == "Request conflict."
+        assert "Insufficient club chip balance" not in str(response.json())
         assert tables[table_key].game.seats == {}
         assert repository.balances["player-low-balance"] == 25
 
@@ -1046,6 +1160,10 @@ def test_rest_rejects_missing_and_invalid_firebase_tokens(monkeypatch) -> None:
 
     assert missing.status_code == 401
     assert invalid.status_code == 401
+    for response in (missing, invalid):
+        assert response.json()["code"] == 40101
+        assert response.json()["message"] == "Authentication required."
+        assert "detail" not in response.json()
 
 
 def test_non_admin_member_cannot_create_table(monkeypatch) -> None:
@@ -1060,6 +1178,7 @@ def test_non_admin_member_cannot_create_table(monkeypatch) -> None:
         )
 
     assert response.status_code == 403
+    assert response.json()["code"] == 40301
 
 
 def test_club_wallet_routes_require_operator_role_and_use_authenticated_identity(monkeypatch) -> None:
