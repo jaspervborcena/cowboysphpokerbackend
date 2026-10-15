@@ -9,6 +9,28 @@ This guide describes how a browser UI should connect to the Cowboys PH Poker bac
 - Configure the UI's API base URL, for example `http://127.0.0.1:8000`. Build the WebSocket URL by replacing `http` with `ws` and preserving the same host and port.
 - The UI source is not in this backend repository. This guide is the integration contract for the Angular client or another browser client.
 
+## UI Work Can Start Now
+
+The game-engine rewrite does not block the current frontend. The UI can implement the existing Firebase sign-in, membership/role display, club and union lobbies, NLH table creation, buy-in/seat flow, player-specific WebSocket snapshots, actions, pre-actions, wallet views, safe errors, and hand replay. Use the current endpoint and message examples in this guide and [API.md](API.md).
+
+Keep poker behavior server-authoritative: render the supplied snapshot and legal controls, but do not calculate winners, mutate chip balances, deal cards, or infer hidden cards in the client. The current supported create choice is `no_limit_texas_holdem`; use `/games` and only offer entries with `create_supported: true`.
+
+Frontend work can proceed against typed API/WebSocket interfaces and fixture-backed local mocks. Keep transport, DTOs, and screen state separate so engine internals can change without rewriting the UI.
+
+## Contract Through Engine Replacement
+
+The backend should keep the existing NLH-facing contract stable while replacing PokerKit: REST routes and request/response fields, `game_id`, standardized error codes, the v1 WebSocket envelope and event names, current NLH action payloads, complete `TABLE_SNAPSHOT` behavior, per-player card masking, and the hand replay route. If a breaking protocol change becomes necessary, version it and coordinate it before rollout.
+
+Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game catalog fields. Do not couple UI code to `pokerkit_factory`, PokerKit class names, PokerKit operation records, or engine state objects; those are implementation details and the catalog will become first-party. Never read raw Firestore hand audit documents from the client.
+
+## Wait For Backend Support
+
+- Do not offer PLO/PLO5/PLO6, Tongits, or any other game until its first-party engine is create-supported and its actions, snapshots, replay, and settlement behavior are documented.
+- Tournament registration, blind-level controls, eliminations, table balancing, and tournament prize views need a separately implemented tournament API and event contract.
+- Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
+- Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
+- Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
+
 ## Session and Permissions
 
 1. Get the signed-in Firebase user's ID token when making a request. Send it on protected REST calls as `Authorization: Bearer <id_token>`.
@@ -29,15 +51,19 @@ Roles currently used by the UI:
 
 For a club lobby, load `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions`. For a selected shared lobby, load `GET /clubs/{club_id}/unions/{union_id}/tables`. Keep local club tables and shared union tables distinct in the UI.
 
+Load `GET /games` to inspect available variants. Use `active_game_id` as the default and only allow table creation with entries marked `create_supported: true`. Include the selected `game_id` in create requests; it defaults to `no_limit_texas_holdem` when omitted. Currently NLH is the only create-supported game. Table listings, create responses, and WebSocket snapshots include `game_id`.
+
 For a local table:
 
-1. An `OWNER` or `MANAGER` creates it with `POST /clubs/{club_id}/tables/{table_id}`. Send `small_blind`, `big_blind`, `buy_in_min`, and `buy_in_max`.
+1. An `OWNER` or `MANAGER` creates it with `POST /clubs/{club_id}/tables/{table_id}`. Send `game_id`, `small_blind`, `big_blind`, `buy_in_min`, `buy_in_max`, and `table_size` from the UI template.
 2. A `PLAYER` chooses a seat and buy-in amount. Call `POST /clubs/{club_id}/tables/{table_id}/seats` with `seat_index`, `buy_in_amount`, and a new UUID `buy_in_id`.
 3. Keep that `buy_in_id` for the lifetime of the purchase attempt. If the request times out, retry the same request with the same ID; do not debit or assign chips locally.
 4. Connect each seated player's client to `/ws/table/{club_id}/{table_id}` and authenticate it as described below.
 5. An `OWNER` or `MANAGER` starts a hand through `POST /clubs/{club_id}/tables/{table_id}/hands`. Render gameplay from the WebSocket snapshot, not the REST start response.
 
 For a union table, an active `UNION_ADMIN` creates and starts it through the union endpoints. Each player buys in through `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` using their own active home club, then connects to `/ws/union/{union_id}/{table_id}` and includes that home `club_id` in authentication. The union table is shared; players do not connect to their clubs' separate local tables. Use each snapshot player's `club_id` when displaying club affiliation.
+
+`table_size` sets the capacity for local and union tables. It must be at least `2` and cannot exceed the backend's `MAX_SEATS` setting (default `9`). If omitted by an older client, the server uses `MAX_SEATS`. Mode, fees, restrictions, and other advanced template settings are not yet supported by the create endpoints. Catalog entries not marked create-supported must not be offered as playable variants.
 
 ## WebSocket v1
 

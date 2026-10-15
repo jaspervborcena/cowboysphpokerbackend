@@ -8,6 +8,8 @@ The live poker game protocol is websocket-first. Client actions, table state sna
 
 The Google Cloud libraries in this repo use gRPC under the hood for Firebase and Firestore integration, but the actual game communication at the app layer is websocket-based. Keep the realtime table transport on WebSocket and treat Firestore/Firebase as infrastructure services rather than the live game protocol.
 
+The selected production target is the Firebase/Firestore design in [GAME_SERVER_FIREBASE_ARCHITECTURE.drawio](GAME_SERVER_FIREBASE_ARCHITECTURE.drawio). The target game engine will be first-party code; the current NLH runtime still uses PokerKit and has not yet been replaced.
+
 ## Economy Tiers
 
 The intended economy has two isolated balances: private club chips belong to each club's managed money economy, while global chips are platform play-money for public/global games and promotions. Club balances are stored separately from any global play-money balance and must never be interchangeable. Club cash-in and cash-out are operator-mediated: an `OWNER`, `MANAGER`, or assigned `AGENT` sends chips to a member or claims available chips back from them. Direct player cash-out and external payouts, refunds, and reconciliation are not implemented. Persistent global play-money wallets and global tables are also not implemented.
@@ -15,7 +17,7 @@ The intended economy has two isolated balances: private club chips belong to eac
 ## Project Layout
 
 ```text
-base_poker_game.py       Core table and PokerKit hand behavior
+base_poker_game.py       Current table and PokerKit-backed NLH behavior (transitional)
 database/                Hand-history and chip-ledger persistence
 logic/                   WebSocket connections and table runtime orchestration
 app/main.py              FastAPI app, REST routes, and WebSocket endpoint
@@ -72,21 +74,70 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - Firestore transaction to save a hand audit, apply in-play balance deltas, and update seat stacks idempotently by hand ID.
 - Docker image suitable for Cloud Run, plus focused engine and WebSocket integration tests.
 
-## Poker Games
+## Game Engine Direction
 
-The backend currently runs **No-Limit Texas Hold'em** only. The game type is selected directly in `base_poker_game.py`; the other PokerKit variants below are library capabilities and are not yet exposed by this API.
+The current backend runs **No-Limit Texas Hold'em only**, using PokerKit from `base_poker_game.py`. The optional `game_id` and `/games` catalog are API scaffolding; they do not mean the other listed library games are playable.
 
-Available concrete PokerKit game factories in the installed version:
+**Decision:** replace PokerKit with a first-party game engine that we can maintain and debug. Do not copy PokerKit source. Implement rules from written game specifications and independently tested examples. The target has no PokerKit runtime dependency. Until replacement is complete and verified, the existing engine and `requirements.txt` still depend on PokerKit.
 
-| Category | PokerKit variants |
-| --- | --- |
-| Hold'em | `FixedLimitTexasHoldem`, `NoLimitTexasHoldem`, `NoLimitShortDeckHoldem`, `NoLimitRoyalHoldem` |
-| Omaha | `PotLimitOmahaHoldem`, `FixedLimitOmahaHoldemHighLowSplitEightOrBetter` |
-| Stud | `FixedLimitSevenCardStud`, `FixedLimitSevenCardStudHighLowSplitEightOrBetter`, `FixedLimitRazz` |
-| Draw | `NoLimitDeuceToSevenLowballSingleDraw`, `FixedLimitDeuceToSevenLowballTripleDraw`, `FixedLimitBadugi` |
-| Other variants | `KuhnPoker`, `LeducHoldem`, `Numeral211Holdem`, `RhodeIslandHoldem`, `RoyalRhodeIslandHoldem` |
+| Priority | First-party game scope | Notes |
+| --- | --- | --- |
+| 1 | No-Limit Texas Hold'em | Replace the current engine first; keep existing REST/WebSocket and Firestore contracts stable where possible. |
+| 2 | Pot-Limit Omaha family | Add PLO, PLO5, and PLO6 as validated configurations only after the NLH engine is stable; preserve Omaha's exact-two-hole/exact-three-board evaluation rule. |
+| 3 | Tongits | Build as an independent engine with its own state, actions, meld evaluation, and scoring; do not force it into poker betting abstractions. |
+| Later | Other variants | Add only when selected, specified, implemented, and covered by their own rule and integration tests. |
 
-To add another game, make the game variant configurable, create its PokerKit state with the right blinds, betting structure, and automations, then adapt its legal actions and state serialization. Draw games and variants with different betting structures need different action/state handling; swapping only the PokerKit class is not sufficient. Add variant-specific tests before enabling a game through the API.
+The current game catalog is tied to PokerKit package metadata. Replace it with an explicit first-party registry that lists only engines this server actually implements and supports for table creation.
+
+## Game Server Responsibilities
+
+The boundaries below are the target design, not a claim that every component already exists. Today, `BasePokerGame` combines table behavior with a PokerKit NLH state. The goal is to move game rules into first-party, pure Python engine modules, independent of FastAPI, WebSockets, Firebase, and Firestore.
+
+| Component | Owns | Must not own |
+| --- | --- | --- |
+| API and identity | REST/WebSocket input, authentication, authorization, schema validation, protocol versioning | Poker rules, card dealing, or balance calculations |
+| Table coordinator | Table lifecycle, seat membership, per-table serialization/locking, turn timers, action idempotency, calls into a game engine | Hand ranking or durable money accounting |
+| Game registry/configuration | Stable `game_id` to owned engine mapping; validated blinds, limits, variant options, and supported status | Mutable state shared between tables or arbitrary client-provided rules |
+| Randomness and deck | Secure shuffle source, deck creation, draw/burn operations; injectable deterministic randomness for tests | Betting decisions, hand ranking, or winner selection |
+| Dealing and visibility | Private hole cards, public board cards, burns/mucks, and recipient-specific card visibility | Whether an action is legal or who wins |
+| Game state | Authoritative facts for a hand/table: seats, stacks, street, button, cards, contributions, actor, and status | Rules decisions or database writes |
+| Rules and transitions | First-party validation and legal state transitions for a specific variant, including blinds, betting rounds, raises, all-ins, and hand completion | Transport, persistence, or treasury policy |
+| Hand evaluation | Compare hands according to the variant's ranking rules, including high/low or other split evaluations where applicable | Pot construction, rake, or ledger updates |
+| Pot and outcome resolution | Build main/side pots from contributions, determine eligible players, compare evaluations, resolve ties, and calculate gross awards | Updating player wallets or club treasury documents |
+| Settlement and treasury | Apply rake/fees/promotional contributions and gross awards to chip ledgers atomically and idempotently; enforce chip conservation | Deciding legal poker actions or evaluating hands |
+| Persistence, audit, and replay | Durable hand records, settlement status, action/replay history, recovery checkpoints; restrict private audit data | Being the live rules engine or exposing raw private cards to clients |
+| Snapshot projection | Convert authoritative state into a complete, player-specific view with hidden cards masked | Mutating game state or deciding outcomes |
+| Operations and testing | Metrics, structured logs, health/readiness, load tests, deterministic simulations, rules conformance, and failure/recovery tests | Making game decisions at runtime |
+
+An action should flow through authenticated transport to the table coordinator, then through the variant rules/transition engine. The engine uses the deck and evaluator as needed and produces a completed-hand outcome; a separate settlement service commits chip and treasury changes. Persistence records the audit, while snapshot projection creates each player's safe view. The game engine should emit domain outcomes rather than writing directly to Firestore.
+
+For any new variant, verify the complete path: deterministic setup, legal actions, dealing, state transitions, evaluation, side-pot/tie awards, replay serialization, and idempotent settlement. Only then should the registry advertise it as create-supported.
+
+### Current Status and Gaps
+
+| Area | Already in this repository | Still needed for the selected architecture |
+| --- | --- | --- |
+| Identity and access | Firebase ID-token verification, active membership checks, role-gated REST/WebSocket flows | Full route/table policy review, rate limits, production security review, and operational controls |
+| Client transport | FastAPI REST, legacy and v1 WebSocket protocols, player-specific masked snapshots | Cross-process gateway-to-owner routing, durable replay cursor, reconnect event replay, and load-tested delivery/backpressure |
+| Table runtime | In-process table map, per-table `asyncio.Lock`, turn timeout, bounded in-memory action deduplication | Single authoritative worker per table, leases/fencing, durable action IDs/state versions, checkpoint/recovery, timer recovery |
+| Game engine | NLH gameplay currently delegates to PokerKit through `BasePokerGame`; `/games` exposes catalog metadata | First-party engine contract, owned NLH state/rules/deck/evaluator/pot resolution, deterministic tests, and replacement of PokerKit-dependent catalog/imports |
+| Settlement and economy | Firestore buy-in transactions, hand audits, idempotent hand settlement, club pools, treasury transfers, union clearing | Durable settlement intent/outbox worker, replayable retries, conservation/reconciliation checks, explicit buy-out lifecycle |
+| Persistence | Firestore repositories for current ledgers, audits, and union records | Durable table ownership, event/checkpoint schema, recovery procedures, transaction/contention tests, and a single authority per record type |
+| Operations | Sanitized error codes, trace-linked logs, Docker/Cloud Run setup | Per-table metrics, alerts, load/soak tests, backup/restore drills, safe rollout and rollback |
+
+PokerKit is a **current implementation dependency**, not the target architecture. Remove it from runtime requirements only after the first-party NLH engine has replaced every production import and all API, settlement, audit, replay, and regression tests pass without it. The current `/games` catalog and its tests must also stop importing or introspecting PokerKit before the package can be removed.
+
+### First-Party NLH Replacement Plan
+
+1. Freeze the current client and hand-audit contracts. Write explicit, independently reviewed expected outcomes for representative hands and edge cases so the replacement has a behavioral target.
+2. Define typed engine contracts for configuration, state, actions, legal actions, domain events, completed-hand outcomes, and engine errors. Inject deterministic randomness in tests and a cryptographically secure source in production.
+3. Implement the NLH core as pure game logic: card/deck model, shuffle/deal/burn, betting and turn transitions, hand ranking, main/side-pot eligibility, tie splitting, and gross awards. Keep treasury policy and Firestore writes outside the engine.
+4. Add deterministic unit, property-based, and simulation tests for card uniqueness, legal/illegal actions, all-ins, side pots, ties, chip conservation, and reproducible failures.
+5. Integrate the owned engine behind the table runtime while preserving authorization, snapshots, settlement idempotency, and replay privacy. Do not run two engines as competing authorities for live money state.
+6. Replace the PokerKit-based game catalog with the explicit owned registry. Remove PokerKit imports and the package requirement only after a repository-wide search and full test run confirm the runtime and tests no longer need it.
+7. Stabilize own-engine NLH before starting PLO variants or the separate Tongits engine. Keep those variants unavailable until each has complete rules, evaluation, settlement, replay, and security tests.
+
+The Firebase diagram describes the production target, not a two-week capacity guarantee. For an initial test deployment, keep the game scope to NLH and validate the engine and Firebase transaction behavior before claiming multi-worker or 1,000–10,000-player readiness.
 
 ## Run Locally
 
@@ -94,13 +145,14 @@ To add another game, make the game variant configurable, create its PokerKit sta
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -r requirements-test.txt
-$env:FIRESTORE_ENABLED = "true"
-$env:FIREBASE_PROJECT_ID = "porpavordelivery"
-$env:GOOGLE_CLOUD_PROJECT = "porpavordelivery"
-$env:CORS_ALLOWED_ORIGINS = "http://localhost:4200,http://127.0.0.1:4200"
-gcloud auth application-default login
-uvicorn app.main:app --reload
+Copy-Item .env.example .env
+# Set FIRESTORE_ENABLED=true in .env for Firebase/Firestore-backed workflows.
+$env:CLOUDSDK_PYTHON = (Get-Command python).Source
+gcloud.cmd auth application-default login --project=porpavordelivery
+uvicorn app.main:app --reload --env-file .env
 ```
+
+The local `.env` is ignored by Git. Keep credentials out of it; Google Application Default Credentials are stored separately by `gcloud`. `python-dotenv` is required for Uvicorn's `--env-file` option.
 
 Health check: `http://127.0.0.1:8000/health`. Interactive API docs: `http://127.0.0.1:8000/docs`. UI integration contract: [API.md](API.md).
 
@@ -108,7 +160,58 @@ Club-protected routes require valid Firebase ID tokens, active Firestore members
 
 Completed hands are written to the restricted Firestore hand audit collection. Player clients must use `GET /clubs/{club_id}/hands/{hand_id}/replay`; the server masks opponents' cards unless they were shown at showdown. See [API.md](API.md) for the response contract and [database/README.md](database/README.md) for the audit schema.
 
-Create a table with `POST /clubs/demo/tables/table-1` and JSON `{"small_blind":50,"big_blind":100,"buy_in_min":100,"buy_in_max":1000}`, using a Firebase ID token for an active `OWNER` or `MANAGER`. Seat players with `POST /clubs/demo/tables/table-1/seats`, for example `{"seat_index":0,"buy_in_amount":500,"buy_in_id":"00000000-0000-0000-0000-000000000001"}` and that player's token. Use a new UUID for each purchase and reuse it if retrying. The member document must have `status: "active"`, role `PLAYER`, and an available balance. Seat a second player, then start a hand as an active `OWNER` or `MANAGER`.
+### UI Table Creation Contract
+
+The frontend's table template/defaults are UI-owned; the backend does not read `src/app/data/table-creation-defaults.json`. For a name-only Regular NLH table, the UI may use the template defaults for blinds and buy-in bounds, then call:
+
+```text
+POST /clubs/{club_id}/tables/{table_id}
+Authorization: Bearer <Firebase ID token for an active OWNER or MANAGER>
+Content-Type: application/json
+```
+
+The **current backend request schema supports six fields**:
+
+```json
+{
+	"game_id": "no_limit_texas_holdem",
+	"small_blind": 1,
+	"big_blind": 2,
+	"buy_in_min": 50,
+	"buy_in_max": 1000,
+	"table_size": 9
+}
+```
+
+`table_id` is supplied in the URL, not the body. Slugify the entered name for this ID and ensure it is unique within the club. The current route does not accept a display name: it sets `table_name` to `table_id`, so retain the original friendly name in the UI if it should display differently. `game_id` is optional and defaults to `no_limit_texas_holdem`; it is the only game currently supported for creation, and unsupported IDs are rejected. `table_size` is optional for backward compatibility; when omitted, the server uses `MAX_SEATS`. When supplied, it sets this table's seat capacity and must be at least 2 and no greater than the configured `MAX_SEATS` ceiling (default `9`). The response is `201` with `{"club_id":"...","table_id":"...","game_id":"no_limit_texas_holdem","status":"created"}`.
+
+Other game variants, mode, fees, restrictions, and advanced template options are still unsupported by the backend table engine. Do not offer catalog games with `create_supported: false` as playable choices. Preview-room tables are local-only and should not call this endpoint.
+
+Example browser request:
+
+```typescript
+const idToken = await firebaseUser.getIdToken();
+const response = await fetch(
+	`${apiBase}/clubs/${encodeURIComponent(clubId)}/tables/${encodeURIComponent(tableId)}`,
+	{
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${idToken}`,
+			'Content-Type': 'application/json',
+		},
+		body: JSON.stringify({
+			game_id: 'no_limit_texas_holdem',
+			small_blind: 1,
+			big_blind: 2,
+			buy_in_min: 50,
+			buy_in_max: 1000,
+			table_size: 9,
+		}),
+	},
+);
+```
+
+After the table is created, seat each player with `POST /clubs/{club_id}/tables/{table_id}/seats`, for example `{"seat_index":0,"buy_in_amount":500,"buy_in_id":"00000000-0000-0000-0000-000000000001"}` and that player's token. Use a new UUID for each purchase and reuse it only when retrying that purchase. The member document must have `status: "active"`, role `PLAYER`, and an available balance. Seat a second player, then start a hand as an active `OWNER` or `MANAGER`.
 
 Connect each client to `ws://127.0.0.1:8000/ws/table/demo/table-1`. On socket open, first send `{"type":"authenticate","id_token":"<Firebase ID token>"}`, then wait for the `authenticated` response and initial state snapshot. Send `{"action":"FOLD"}`, `{"action":"CHECK"}`, `{"action":"CALL"}`, or `{"action":"RAISE","amount":300}`. Raise amounts are raise-to totals for the current betting round.
 
@@ -132,7 +235,7 @@ The following is a gap list, not functionality already present. The app is suita
 - **External cash-outs and reconciliation:** local buy-in, operator-mediated club send-out/claim-back, and idempotent hand settlement update Firestore club balances. External payouts, rebuy/top-up, refunds, and reconciliation are still missing; club balances must not be treated as a complete production money ledger until those flows exist.
 - **Rake, BBJ, and promotions:** local tables support `OWNER`/`MANAGER` rake settings up to 10%, caps, no-flop-no-drop, BBJ fee/minimum-pot settings, and idempotent rake/BBJ pool entries. Rake and BBJ drops are deducted from winner awards and reconcile with player deltas. BBJ qualifying-hand evaluation/payout/reseed, Hand-of-the-Day funding and award distribution, union fee allocation, payout rounding policy, and winner announcements remain incomplete. A persistent global play-money wallet and global tables are not implemented.
 - **Reliable settlement retries:** completed hand audits are persisted with `settlement_status: "pending"` before the idempotent balance/pool transaction; that transaction marks them `settled`, and startup retries any pending audits. The runtime also retains the completed hand until persistence succeeds. If Firestore is unavailable before the pending audit is written, only the live process has the retry copy, so durable table recovery and storage-independent buffering remain open.
-- **Durable single-writer tables:** table state is process memory. Persist/recover active tables and use ownership/locking so two Cloud Run instances cannot accept actions for the same hand. Session affinity alone does not provide this guarantee.
+- **Durable single-writer tables:** table state is process memory. Keep live-table tests on one backend instance for now. Before multiple runtime workers, add durable table ownership/fencing, recovery, and cross-process command routing; Pub/Sub is deferred until that split exists. Session affinity alone does not provide this guarantee.
 
 ### P1: Complete the playable table workflow
 
@@ -144,16 +247,34 @@ The following is a gap list, not functionality already present. The app is suita
 ### P2: Production readiness and extensibility
 
 - **Broader test coverage:** add tests for legal/illegal raise sizing, calls/checks, all-ins and side pots, timeout decisions, duplicate/stale actions, failed/retried settlement, chip conservation, and restart recovery. WebSocket tests now cover legacy compatibility, v1 envelopes, union players from different clubs, topic mismatch rejection, and per-player card masking; performance, chat-isolation, and multi-worker behavior remain untested.
-- **Game selection:** the engine hardcodes No-Limit Texas Hold'em. Add a game configuration/adapter boundary before enabling other PokerKit variants; different variants need their own betting, action, and state-serialization rules.
+- **First-party game engine:** the current NLH engine imports PokerKit directly. Implement and verify the owned NLH rules/state/evaluation/outcome path, replace the PokerKit-backed catalog, then remove the dependency. Do not enable PLO or Tongits from catalog metadata alone.
 - **Operations:** add structured logs, metrics/tracing, readiness checks, rate limits, validated environment settings, secret handling, CI, and deployment/rollback checks. Set `CORS_ALLOWED_ORIGINS` to the exact production frontend origins.
 
-## Suggested Build Order
+## Current Work Plan
 
-1. Close the P0 money and authorization gaps: owner-UID validation and idempotent platform club creation, route/socket policy review, then external payout/refund/reconciliation rules.
-2. Implement the single-writer lease, fencing, durable action journal, checkpoint/replay, and failover design in [websocket.md](websocket.md) before running multiple workers against live tables.
-3. Have the Angular client adopt the opt-in v1 envelope while keeping legacy compatibility during rollout; send action IDs, answer heartbeats, and display generic numeric error states.
-4. Complete the table/seat lifecycle: sit-out, leave-seat, rebuy/top-up, and cash-out.
-5. Add chat only after defining authorization, moderation, rate limits, and bounded queues; then benchmark game latency under chat load and at the target table count.
-6. Expand game/settlement failure tests and operational gates before enabling additional PokerKit variants.
+### Now
+
+- Continue UI implementation against the current REST and WebSocket contracts. Keep the frontend game-engine agnostic, offer NLH only, and do not connect the UI to Pub/Sub.
+- For Firebase/Firestore live-table testing, run one backend instance. Pub/Sub is not needed while the gateway and table runtime are in the same process.
+- Freeze the current NLH API, snapshot, replay, and settlement contracts; prepare reviewed expected outcomes for the first-party engine to match.
+
+### Next: First-Party NLH
+
+1. Define typed engine contracts for configuration, state, actions, legal actions, events, outcomes, and errors; inject deterministic randomness in tests and secure randomness in production.
+2. Implement the pure-Python NLH core: card/deck model, shuffle/deal/burn, betting and turn transitions, hand ranking, side-pot eligibility, tie splitting, and gross outcomes.
+3. Add deterministic, property-based, and simulation tests for legal/illegal actions, unique cards, all-ins, side pots, ties, chip conservation, and reproducible failures.
+4. Integrate the owned engine into the existing runtime and verify snapshots, replay privacy, and idempotent Firestore settlement without engine I/O.
+5. Replace the PokerKit-based catalog and tests; remove PokerKit imports and the package only after repository-wide checks and the full test suite pass without it.
+
+### Before Multi-Worker Runtime
+
+- Add table ownership leases with fencing, durable events/checkpoints, recovery of turn deadlines, action deduplication, and reconnect replay.
+- When gateway and runtime workers are separated, add Pub/Sub for internal command/event forwarding. Define ordering, retries, deduplication, and reply routing; Pub/Sub must not become the state or balance authority.
+- Load-test Firestore transaction contention, quotas, recovery, and cost before claiming multi-worker or 1,000–10,000-player readiness.
+
+### Later
+
+- Close remaining security and economy gaps: owner-UID validation, idempotent platform club provisioning, full authorization review, cash-out/refund/reconciliation policy, and operational monitoring.
+- Add PLO/PLO5/PLO6 and Tongits only as separate verified engine milestones. Keep tournament scheduling and balancing in a separate tournament service, not in hand rules.
 
 For Union table provisioning, endpoint flows, and shared settlement behavior, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).

@@ -1,4 +1,7 @@
 import asyncio
+import inspect
+
+import pokerkit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -271,6 +274,84 @@ def configure_test_dependencies(monkeypatch, repository: FakeHandRepository | Nu
     monkeypatch.setattr(api_main.app.state, "token_verifier", FakeTokenVerifier())
 
 
+def test_game_catalog_matches_installed_pokerkit_factories() -> None:
+    installed_factories = {
+        name
+        for name, value in vars(pokerkit).items()
+        if name != "HandHistory"
+        and inspect.isclass(value)
+        and callable(getattr(value, "create_state", None))
+    }
+
+    with TestClient(app) as client:
+        response = client.get("/games")
+
+    assert response.status_code == 200
+    catalog = response.json()
+    entries = catalog["games"]
+    assert catalog["pokerkit_version"]
+    assert catalog["active_game_id"] == "no_limit_texas_holdem"
+    assert {entry["pokerkit_factory"] for entry in entries} == installed_factories
+    assert {entry["game_id"] for entry in entries if entry["create_supported"]} == {
+        "no_limit_texas_holdem"
+    }
+    assert all(entry["pokerkit_available"] for entry in entries)
+    assert all(
+        entry["backend_status"] == "mock" and entry["mock_reason"]
+        for entry in entries
+        if not entry["create_supported"]
+    )
+
+
+def test_table_size_cannot_exceed_server_maximum(monkeypatch) -> None:
+    club_id = "table-size-limit-club"
+    table_id = "oversized-table"
+    repository = FakeHandRepository({"club-owner": 1000}, {"club-owner": "OWNER"})
+    configure_test_dependencies(monkeypatch, repository)
+    monkeypatch.setattr(api_main, "max_seats", 6)
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/clubs/{club_id}/tables/{table_id}",
+            json={
+                "small_blind": 1,
+                "big_blind": 2,
+                "buy_in_min": 50,
+                "buy_in_max": 1000,
+                "table_size": 7,
+            },
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == 40002
+    assert (club_id, table_id) not in tables
+
+
+def test_table_creation_rejects_game_not_supported_by_backend(monkeypatch) -> None:
+    club_id = "unsupported-game-club"
+    table_id = "unsupported-game-table"
+    repository = FakeHandRepository({"club-owner": 1000}, {"club-owner": "OWNER"})
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/clubs/{club_id}/tables/{table_id}",
+            json={
+                "game_id": "pot_limit_omaha_holdem",
+                "small_blind": 1,
+                "big_blind": 2,
+                "buy_in_min": 50,
+                "buy_in_max": 1000,
+            },
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == 40002
+    assert (club_id, table_id) not in tables
+
+
 def test_table_api_and_player_websockets(monkeypatch) -> None:
     club_id = "api-test-club"
     table_id = "api-test-table"
@@ -289,10 +370,20 @@ def test_table_api_and_player_websockets(monkeypatch) -> None:
                 "big_blind": 20,
                 "buy_in_min": 20,
                 "buy_in_max": 1000,
+                "table_size": 4,
+                "game_id": "no_limit_texas_holdem",
             },
             headers={"Authorization": "Bearer valid:club-owner"},
         )
         assert response.status_code == 201
+        assert response.json()["game_id"] == "no_limit_texas_holdem"
+        assert tables[table_key].game.max_seats == 4
+
+        listing = client.get(
+            f"/clubs/{club_id}/tables",
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+        assert listing.json()[0]["game_id"] == "no_limit_texas_holdem"
 
         for seat_index, user_id in enumerate(("api-player-a", "api-player-b")):
             response = client.post(
@@ -316,6 +407,7 @@ def test_table_api_and_player_websockets(monkeypatch) -> None:
             headers={"Authorization": "Bearer valid:club-owner"},
         )
         assert response.status_code == 201
+        assert response.json()["game_id"] == "no_limit_texas_holdem"
         actor_user_id = tables[table_key].game.current_actor_user_id
         assert actor_user_id is not None
         other_user_id = "api-player-b" if actor_user_id == "api-player-a" else "api-player-a"
@@ -329,6 +421,7 @@ def test_table_api_and_player_websockets(monkeypatch) -> None:
                 "user_id": actor_user_id,
             }
             actor_state = actor_socket.receive_json()
+            assert actor_state["game_id"] == "no_limit_texas_holdem"
             actor = next(
                 player for player in actor_state["players"]
                 if player["user_id"] == actor_user_id
@@ -917,6 +1010,8 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
         "big_blind": 20,
         "buy_in_min": 20,
         "buy_in_max": 1000,
+        "table_size": 6,
+        "game_id": "no_limit_texas_holdem",
     }
     with TestClient(app) as client:
         owner_response = client.post(
@@ -932,6 +1027,10 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
             headers={"Authorization": "Bearer valid:union-admin"},
         )
         assert created.status_code == 201
+        assert created.json()["game_id"] == "no_limit_texas_holdem"
+        assert tables[table_key].game.max_seats == 6
+        assert repository.union_table_records[(union_id, table_id)]["max_seats"] == 6
+        assert repository.union_table_records[(union_id, table_id)]["game_id"] == "no_limit_texas_holdem"
         empty_table = client.post(
             f"/unions/{union_id}/tables/empty-table",
             json=table_config,
@@ -959,6 +1058,7 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
         )
         assert tables_response.status_code == 200
         assert tables_response.json()[0]["is_union_table"] is True
+        assert tables_response.json()[0]["game_id"] == "no_limit_texas_holdem"
         assert tables_response.json()[0]["origin_club_id"] == "club-a"
 
         for seat_index, (club_id, user_id) in enumerate(

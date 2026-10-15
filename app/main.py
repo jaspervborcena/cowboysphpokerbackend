@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
@@ -51,6 +51,12 @@ from database import (
 )
 from logic.auth import FirebaseTokenVerifier
 from logic.connections import ConnectionManager
+from logic.game_catalog import (
+    POKERKIT_VERSION,
+    SUPPORTED_GAME_ID,
+    get_game_catalog,
+    is_game_create_supported,
+)
 from logic.runtime import ActionIdempotencyConflict, TableRuntime
 from logic.websocket_protocol import (
     MalformedWebSocketMessage,
@@ -63,10 +69,12 @@ from logic.websocket_protocol import (
 
 
 class CreateTableRequest(BaseModel):
+    game_id: str = Field(default=SUPPORTED_GAME_ID, min_length=1)
     small_blind: int = Field(gt=0)
     big_blind: int = Field(gt=0)
     buy_in_min: int = Field(gt=0)
     buy_in_max: int = Field(gt=0)
+    table_size: int | None = Field(default=None, ge=2)
 
 
 class SeatPlayerRequest(BaseModel):
@@ -126,6 +134,23 @@ class UnionClubProvisionRequest(BaseModel):
 class PlayerAction(BaseModel):
     action: str
     amount: int | None = None
+
+
+class GameCatalogEntry(BaseModel):
+    game_id: str
+    display_name: str
+    category: str
+    pokerkit_factory: str
+    pokerkit_available: bool
+    backend_status: Literal["supported", "mock"]
+    create_supported: bool
+    mock_reason: str | None
+
+
+class GameCatalogResponse(BaseModel):
+    pokerkit_version: str
+    active_game_id: str
+    games: list[GameCatalogEntry]
 
 
 @asynccontextmanager
@@ -229,6 +254,25 @@ websocket_heartbeat_interval_seconds = int(
 websocket_idle_timeout_seconds = int(os.getenv("WEBSOCKET_IDLE_TIMEOUT_SECONDS", "90"))
 
 
+def requested_table_size(table_size: int | None) -> int:
+    seat_capacity = max_seats if table_size is None else table_size
+    if seat_capacity > max_seats:
+        raise HTTPException(
+            status_code=422,
+            detail="Requested table size exceeds the server maximum.",
+        )
+    return seat_capacity
+
+
+def requested_game_id(game_id: str) -> str:
+    if not is_game_create_supported(game_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Requested game is not supported for table creation.",
+        )
+    return game_id
+
+
 def get_table(club_id: str, table_id: str) -> TableRuntime:
     runtime = tables.get((club_id, table_id))
     if runtime is None:
@@ -243,6 +287,7 @@ def union_table_key(union_id: str, table_id: str) -> tuple[str, str]:
 def table_lobby_entry(game: BasePokerGame) -> dict[str, Any]:
     return {
         "table_id": game.table_id,
+        "game_id": game.game_id,
         "table_name": game.table_name,
         "is_union_table": game.union_id is not None,
         "union_id": game.union_id,
@@ -261,6 +306,15 @@ def table_lobby_entry(game: BasePokerGame) -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/games", response_model=GameCatalogResponse)
+async def list_games() -> GameCatalogResponse:
+    return GameCatalogResponse(
+        pokerkit_version=POKERKIT_VERSION,
+        active_game_id=SUPPORTED_GAME_ID,
+        games=get_game_catalog(),
+    )
 
 
 @app.get("/clubs/{club_id}/members/me")
@@ -667,6 +721,8 @@ async def create_table(
     key = (club_id, table_id)
     if key in tables:
         raise HTTPException(status_code=409, detail="Table already exists.")
+    game_id = requested_game_id(request.game_id)
+    seat_capacity = requested_table_size(request.table_size)
     try:
         game = BasePokerGame(
             table_id,
@@ -674,15 +730,21 @@ async def create_table(
             request.big_blind,
             request.buy_in_min,
             request.buy_in_max,
-            max_seats,
+            seat_capacity,
             origin_club_id=club_id,
+            game_id=game_id,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     tables[key] = TableRuntime(
         club_id, game, connections, repository, turn_timeout_seconds
     )
-    return {"club_id": club_id, "table_id": table_id, "status": "created"}
+    return {
+        "club_id": club_id,
+        "table_id": table_id,
+        "game_id": game.game_id,
+        "status": "created",
+    }
 
 
 @app.post("/unions/{union_id}/tables/{table_id}", status_code=201)
@@ -695,6 +757,7 @@ async def create_union_table(
     key = union_table_key(union_id, table_id)
     if key in tables:
         raise HTTPException(status_code=409, detail="Union table already exists.")
+    game_id = requested_game_id(request.game_id)
     try:
         is_origin_club = await asyncio.to_thread(
             repository.is_club_in_union,
@@ -706,6 +769,7 @@ async def create_union_table(
     if not is_origin_club:
         raise HTTPException(status_code=403, detail="The origin club is not an active union member.")
 
+    seat_capacity = requested_table_size(request.table_size)
     try:
         game = BasePokerGame(
             table_id,
@@ -713,10 +777,11 @@ async def create_union_table(
             request.big_blind,
             request.buy_in_min,
             request.buy_in_max,
-            max_seats,
+            seat_capacity,
             union_id=union_id,
             origin_club_id=request.origin_club_id,
             table_name=request.table_name,
+            game_id=game_id,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -728,13 +793,14 @@ async def create_union_table(
             {
                 "union_id": union_id,
                 "table_id": table_id,
+                "game_id": game.game_id,
                 "table_name": request.table_name,
                 "origin_club_id": request.origin_club_id,
                 "small_blind": request.small_blind,
                 "big_blind": request.big_blind,
                 "buy_in_min": request.buy_in_min,
                 "buy_in_max": request.buy_in_max,
-                "max_seats": max_seats,
+                "max_seats": seat_capacity,
                 "status": "open",
             },
         )
@@ -753,6 +819,7 @@ async def create_union_table(
     return {
         "union_id": union_id,
         "table_id": table_id,
+        "game_id": game.game_id,
         "origin_club_id": request.origin_club_id,
         "status": "created",
     }

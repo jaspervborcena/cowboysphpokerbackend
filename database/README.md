@@ -262,7 +262,9 @@ Participating club path: `unions/{union_id}/clubs/{club_id}`
 
 Union table path: `unions/{union_id}/tables/{table_id}`
 
-The union-admin create endpoint writes `union_id`, `table_id`, `table_name`, `origin_club_id`, blinds, buy-in bounds, `max_seats`, and `status: "open"`. Deleting an empty table sets `status: "closed"` and `closed_at`; table history remains available. Live engine state and lobby listing are still held in process memory and are not reconstructed from this document after restart.
+The backend writes `game_id` with the union table metadata. The current create endpoint uses `no_limit_texas_holdem`; other catalog entries are not yet supported for table creation.
+
+The union-admin create endpoint writes `union_id`, `table_id`, `game_id`, `table_name`, `origin_club_id`, blinds, buy-in bounds, `max_seats`, and `status: "open"`. Deleting an empty table sets `status: "closed"` and `closed_at`; table history remains available. Live engine state and lobby listing are still held in process memory and are not reconstructed from this document after restart.
 
 Union seat path: `unions/{union_id}/tables/{table_id}/seats/{seat_index}`
 
@@ -274,6 +276,7 @@ Example shared table metadata at `unions/union-1/tables/final-table`:
 {
   "union_id": "union-1",
   "table_id": "final-table",
+  "game_id": "no_limit_texas_holdem",
   "table_name": "Alliance Main",
   "origin_club_id": "club-a",
   "small_blind": 10,

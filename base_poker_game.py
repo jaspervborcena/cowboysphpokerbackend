@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from pokerkit import Automation, NoLimitTexasHoldem
+from logic.game_catalog import SUPPORTED_GAME_ID, is_game_create_supported
 
 
 def calculate_hand_settlement_finances(
@@ -110,7 +111,10 @@ class BasePokerGame:
         union_id: str | None = None,
         origin_club_id: str | None = None,
         table_name: str | None = None,
+        game_id: str = SUPPORTED_GAME_ID,
     ) -> None:
+        if not is_game_create_supported(game_id):
+            raise ValueError("This game is not supported for table creation.")
         if small_blind <= 0 or big_blind < small_blind:
             raise ValueError("Blinds must be positive and the big blind must be at least the small blind.")
         if buy_in_min <= 0 or buy_in_max < buy_in_min:
@@ -119,6 +123,7 @@ class BasePokerGame:
             raise ValueError("A table must allow at least two seats.")
 
         self.table_id = table_id
+        self.game_id = game_id
         self.small_blind = small_blind
         self.big_blind = big_blind
         self.buy_in_min = buy_in_min
@@ -469,6 +474,7 @@ class BasePokerGame:
 
         return {
             "table_id": self.table_id,
+            "game_id": self.game_id,
             "table_name": self.table_name,
             "is_union_table": self.union_id is not None,
             "union_id": self.union_id,

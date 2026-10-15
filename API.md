@@ -210,24 +210,30 @@ An active admin document with role `UNION_ADMIN` is required for union table cre
 
 ### Discover shared tables
 
+Both local and union table-list entries include `game_id` alongside the table settings and status fields.
+
 `GET /clubs/{club_id}/unions` returns the active unions linked to the caller's active club. `GET /clubs/{club_id}/unions/{union_id}/tables` returns open in-process union tables, with the table name, origin club, blinds, buy-in bounds, seat count, and running state. Local tables are listed by `GET /clubs/{club_id}/tables`.
 
 ### Create and delete a shared table
 
 `POST /unions/{union_id}/tables/{table_id}` requires `UNION_ADMIN`.
 
+The `201` response includes `union_id`, `table_id`, `game_id`, `origin_club_id`, and `status: "created"`. The persisted union table metadata also includes `game_id`.
+
 ```json
 {
+  "game_id": "no_limit_texas_holdem",
   "origin_club_id": "club-a",
   "table_name": "NLH 50/100 Union Main",
   "small_blind": 50,
   "big_blind": 100,
   "buy_in_min": 500,
-  "buy_in_max": 5000
+  "buy_in_max": 5000,
+  "table_size": 9
 }
 ```
 
-The origin club must be an active union member. The route creates metadata at `unions/{union_id}/tables/{table_id}` and starts an in-process game. `DELETE /unions/{union_id}/tables/{table_id}` is also `UNION_ADMIN`-only and only closes an empty table; it returns `409` if a hand is running or players remain seated so funds cannot be orphaned. Closed table documents are retained as audit metadata.
+`game_id` is optional and defaults to `no_limit_texas_holdem`; other values are rejected because they are not yet verified for gameplay, settlement, and replay. `table_size` is optional and follows the same `MAX_SEATS` ceiling as local tables. The origin club must be an active union member. The route creates metadata at `unions/{union_id}/tables/{table_id}` and starts an in-process game. `DELETE /unions/{union_id}/tables/{table_id}` is also `UNION_ADMIN`-only and only closes an empty table; it returns `409` if a hand is running or players remain seated so funds cannot be orphaned. Closed table documents are retained as audit metadata.
 
 ### Seat and play
 
@@ -297,6 +303,41 @@ Response `200`:
 {"status":"ok"}
 ```
 
+### Game catalog
+
+`GET /games` is public and returns the PokerKit factories available in the installed version, together with the backend's implementation status. Use `active_game_id` for the current default. Table creation accepts an optional `game_id`, defaulting to `no_limit_texas_holdem`; only entries with `create_supported: true` are supported. Currently that is the only create-supported game. Unsupported IDs return the standard invalid-format response.
+
+Response `200` (catalog abbreviated):
+
+```json
+{
+  "pokerkit_version": "<installed version>",
+  "active_game_id": "no_limit_texas_holdem",
+  "games": [
+    {
+      "game_id": "no_limit_texas_holdem",
+      "display_name": "No Limit Texas Hold'em",
+      "category": "Hold'em",
+      "pokerkit_factory": "NoLimitTexasHoldem",
+      "pokerkit_available": true,
+      "backend_status": "supported",
+      "create_supported": true,
+      "mock_reason": null
+    },
+    {
+      "game_id": "fixed_limit_texas_holdem",
+      "display_name": "Fixed Limit Texas Hold'em",
+      "category": "Hold'em",
+      "pokerkit_factory": "FixedLimitTexasHoldem",
+      "pokerkit_available": true,
+      "backend_status": "mock",
+      "create_supported": false,
+      "mock_reason": "PokerKit provides this game factory, but gameplay, settlement, and replay integration have not been verified by this backend."
+    }
+  ]
+}
+```
+
 ### Create a table
 
 `POST /clubs/{club_id}/tables/{table_id}`
@@ -307,10 +348,12 @@ Request:
 
 ```json
 {
+  "game_id": "no_limit_texas_holdem",
   "small_blind": 50,
   "big_blind": 100,
   "buy_in_min": 100,
-  "buy_in_max": 1000
+  "buy_in_max": 1000,
+  "table_size": 9
 }
 ```
 
@@ -320,11 +363,12 @@ Response `201`:
 {
   "club_id": "demo",
   "table_id": "table-1",
+  "game_id": "no_limit_texas_holdem",
   "status": "created"
 }
 ```
 
-Blinds and buy-in limits must be positive, the big blind must not be less than the small blind, and the maximum buy-in must not be less than the minimum. The table is currently created in process memory.
+`game_id` is optional and defaults to `no_limit_texas_holdem`; other values are rejected because they are not yet verified for gameplay, settlement, and replay. `table_size` is optional; when omitted, the server uses `MAX_SEATS` (default `9`). When supplied, it must be at least `2` and no greater than `MAX_SEATS`, and sets the seat capacity for this table. Blinds and buy-in limits must be positive, the big blind must not be less than the small blind, and the maximum buy-in must not be less than the minimum. The table is currently created in process memory.
 
 ### Update table financial settings
 
@@ -462,6 +506,7 @@ Example snapshot sent to `player-a`:
 {
   "table_id": "table-1",
   "table_name": "Main Table",
+  "game_id": "no_limit_texas_holdem",
   "is_union_table": false,
   "union_id": null,
   "origin_club_id": "demo",
