@@ -1,6 +1,8 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app import main as api_main
 from app.main import app, tables
@@ -368,6 +370,168 @@ def test_table_api_and_player_websockets(monkeypatch) -> None:
     tables.pop(table_key, None)
 
 
+def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monkeypatch) -> None:
+    club_id = "envelope-test-club"
+    table_id = "envelope-test-table"
+    table_key = (club_id, table_id)
+    topic = f"clubs/{club_id}/tables/{table_id}/game"
+    repository = FakeHandRepository(
+        {"club-owner": 1000, "envelope-player-a": 1000, "envelope-player-b": 1000},
+        {
+            "club-owner": "OWNER",
+            "envelope-player-a": "PLAYER",
+            "envelope-player-b": "PLAYER",
+        },
+    )
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/clubs/{club_id}/tables/{table_id}",
+            json={
+                "small_blind": 10,
+                "big_blind": 20,
+                "buy_in_min": 20,
+                "buy_in_max": 1000,
+            },
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+        assert created.status_code == 201
+        for seat_index, user_id in enumerate(("envelope-player-a", "envelope-player-b")):
+            seated = client.post(
+                f"/clubs/{club_id}/tables/{table_id}/seats",
+                json={
+                    "seat_index": seat_index,
+                    "buy_in_amount": 500,
+                    "buy_in_id": f"00000000-0000-0000-0000-{seat_index + 30:012d}",
+                },
+                headers={"Authorization": f"Bearer valid:{user_id}"},
+            )
+            assert seated.status_code == 201
+        started = client.post(
+            f"/clubs/{club_id}/tables/{table_id}/hands",
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+        assert started.status_code == 201
+
+        runtime = tables[table_key]
+        actor_user_id = runtime.game.current_actor_user_id
+        assert actor_user_id is not None
+        other_user_id = next(
+            user_id
+            for user_id in ("envelope-player-a", "envelope-player-b")
+            if user_id != actor_user_id
+        )
+
+        with pytest.raises(WebSocketDisconnect) as disconnect:
+            with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as invalid_socket:
+                invalid_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": "clubs/other-club/tables/other-table/game",
+                        "event": "AUTHENTICATE",
+                        "correlation_id": "wrong-topic",
+                        "payload": {"id_token": f"valid:{actor_user_id}"},
+                    }
+                )
+                invalid_socket.receive_json()
+        assert disconnect.value.code == 4401
+
+        with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as actor_socket:
+            actor_socket.send_json(
+                {
+                    "version": "1.0",
+                    "topic": topic,
+                    "event": "AUTHENTICATE",
+                    "correlation_id": "auth-actor",
+                    "payload": {"id_token": f"valid:{actor_user_id}"},
+                }
+            )
+            authenticated = actor_socket.receive_json()
+            actor_state_envelope = actor_socket.receive_json()
+            assert authenticated["event"] == "AUTHENTICATED"
+            assert authenticated["payload"]["user_id"] == actor_user_id
+            assert authenticated["correlation_id"] == "auth-actor"
+            assert authenticated["topic"] == topic
+            assert actor_state_envelope["event"] == "TABLE_SNAPSHOT"
+            assert actor_state_envelope["version"] == "1.0"
+            assert actor_state_envelope["timestamp"]
+            actor_state = actor_state_envelope["payload"]
+            actor_cards = next(
+                player["hole_cards"]
+                for player in actor_state["players"]
+                if player["user_id"] == actor_user_id
+            )
+            assert len(actor_cards) == 2
+
+            with client.websocket_connect(f"/ws/table/{club_id}/{table_id}") as other_socket:
+                other_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "AUTHENTICATE",
+                        "correlation_id": "auth-other",
+                        "payload": {"id_token": f"valid:{other_user_id}"},
+                    }
+                )
+                other_socket.receive_json()
+                other_state_envelope = other_socket.receive_json()
+                other_state = other_state_envelope["payload"]
+                hidden_actor = next(
+                    player
+                    for player in other_state["players"]
+                    if player["user_id"] == actor_user_id
+                )
+                assert hidden_actor["hole_cards"] == ["??", "??"]
+
+                other_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PRE_ACTION",
+                        "correlation_id": "pre-action-1",
+                        "payload": {"action": "CHECK_FOLD"},
+                    }
+                )
+                pre_action_ack = other_socket.receive_json()
+                assert pre_action_ack["event"] == "PRE_ACTION_SET"
+                assert pre_action_ack["correlation_id"] == "pre-action-1"
+                assert pre_action_ack["payload"]["action"] == "CHECK_FOLD"
+
+                action = "CALL" if (runtime.game.current_call_amount or 0) > 0 else "CHECK"
+                actor_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PLAYER_ACTION",
+                        "correlation_id": "action-1",
+                        "payload": {"action": action},
+                    }
+                )
+                actor_snapshot = actor_socket.receive_json()
+                other_snapshot = other_socket.receive_json()
+                assert actor_snapshot["event"] == "TABLE_SNAPSHOT"
+                assert other_snapshot["event"] == "TABLE_SNAPSHOT"
+                assert actor_snapshot["payload"]["pre_action"] is None
+                assert other_snapshot["payload"]["pre_action"] is None
+
+                actor_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PLAYER_ACTION",
+                        "correlation_id": "invalid-action-1",
+                        "payload": {"action": "NOT_A_POKER_ACTION"},
+                    }
+                )
+                action_error = actor_socket.receive_json()
+                assert action_error["event"] == "ACTION_ERROR"
+                assert action_error["correlation_id"] == "invalid-action-1"
+                assert action_error["payload"]["message"]
+
+    tables.pop(table_key, None)
+
+
 def test_provision_union_admin_and_club_membership(monkeypatch) -> None:
     repository = FakeHandRepository(
         {"union-admin": 1000, "club-owner": 1000},
@@ -709,40 +873,84 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
         )
         assert occupied_delete.status_code == 409
 
-        start = client.post(
-            f"/unions/{union_id}/tables/{table_id}/hands",
-            headers={"Authorization": "Bearer valid:union-admin"},
-        )
-        assert start.status_code == 201
-
+        topic = f"unions/{union_id}/tables/{table_id}/game"
         with client.websocket_connect(f"/ws/union/{union_id}/{table_id}") as socket_a:
             socket_a.send_json(
                 {
-                    "type": "authenticate",
-                    "id_token": "valid:union-player-a",
-                    "club_id": "club-a",
+                    "version": "1.0",
+                    "topic": topic,
+                    "event": "AUTHENTICATE",
+                    "correlation_id": "union-auth-a",
+                    "payload": {
+                        "id_token": "valid:union-player-a",
+                        "club_id": "club-a",
+                    },
                 }
             )
-            assert socket_a.receive_json()["type"] == "authenticated"
-            state_a = socket_a.receive_json()
-            assert {player["club_id"] for player in state_a["players"]} == {"club-a", "club-b"}
+            assert socket_a.receive_json()["event"] == "AUTHENTICATED"
+            initial_a = socket_a.receive_json()
+            assert initial_a["event"] == "TABLE_SNAPSHOT"
+            assert initial_a["payload"]["is_hand_running"] is False
+            assert {player["club_id"] for player in initial_a["payload"]["players"]} == {"club-a", "club-b"}
 
             with client.websocket_connect(f"/ws/union/{union_id}/{table_id}") as socket_b:
                 socket_b.send_json(
                     {
-                        "type": "authenticate",
-                        "id_token": "valid:union-player-b",
-                        "club_id": "club-b",
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "AUTHENTICATE",
+                        "correlation_id": "union-auth-b",
+                        "payload": {
+                            "id_token": "valid:union-player-b",
+                            "club_id": "club-b",
+                        },
                     }
                 )
-                assert socket_b.receive_json()["type"] == "authenticated"
-                state_b = socket_b.receive_json()
+                assert socket_b.receive_json()["event"] == "AUTHENTICATED"
+                initial_b = socket_b.receive_json()
+                assert initial_b["event"] == "TABLE_SNAPSHOT"
+                assert initial_b["payload"]["is_hand_running"] is False
+
+                start = client.post(
+                    f"/unions/{union_id}/tables/{table_id}/hands",
+                    headers={"Authorization": "Bearer valid:union-admin"},
+                )
+                assert start.status_code == 201
+                started_a = socket_a.receive_json()
+                started_b = socket_b.receive_json()
+                assert started_a["event"] == started_b["event"] == "TABLE_SNAPSHOT"
+                state_a = started_a["payload"]
+                state_b = started_b["payload"]
+                assert state_a["is_hand_running"] is True
+                assert state_b["is_hand_running"] is True
+                assert {player["club_id"] for player in state_a["players"]} == {"club-a", "club-b"}
+                assert {player["club_id"] for player in state_b["players"]} == {"club-a", "club-b"}
+                player_a_view = next(player for player in state_a["players"] if player["user_id"] == "union-player-a")
+                player_b_view = next(player for player in state_a["players"] if player["user_id"] == "union-player-b")
+                assert player_a_view["hole_cards"] != ["??", "??"]
+                assert player_b_view["hole_cards"] == ["??", "??"]
+                player_a_other_view = next(player for player in state_b["players"] if player["user_id"] == "union-player-a")
+                player_b_other_view = next(player for player in state_b["players"] if player["user_id"] == "union-player-b")
+                assert player_a_other_view["hole_cards"] == ["??", "??"]
+                assert player_b_other_view["hole_cards"] != ["??", "??"]
+
                 actor_user_id = tables[table_key].game.current_actor_user_id
                 selected_socket = socket_a if actor_user_id == "union-player-a" else socket_b
                 other_socket = socket_b if selected_socket is socket_a else socket_a
-                selected_socket.send_json({"action": "FOLD"})
-                assert selected_socket.receive_json()["is_hand_running"] is False
-                assert other_socket.receive_json()["is_hand_running"] is False
+                selected_socket.send_json(
+                    {
+                        "version": "1.0",
+                        "topic": topic,
+                        "event": "PLAYER_ACTION",
+                        "correlation_id": "union-action-1",
+                        "payload": {"action": "FOLD"},
+                    }
+                )
+                selected_result = selected_socket.receive_json()
+                other_result = other_socket.receive_json()
+                assert selected_result["event"] == other_result["event"] == "TABLE_SNAPSHOT"
+                assert selected_result["payload"]["is_hand_running"] is False
+                assert other_result["payload"]["is_hand_running"] is False
 
     assert len(repository.union_hand_summaries) == 1
     assert repository.balances["union-player-a"] == 500

@@ -9,6 +9,7 @@ clubs/{club_id}
   members/{user_id}
     transactions/{buy_in_id}
   transactions/{transaction_id}
+  treasury/wallet
   treasury/pools
   tables/{table_id}
     seats/{seat_index}
@@ -267,6 +268,84 @@ Union seat path: `unions/{union_id}/tables/{table_id}/seats/{seat_index}`
 
 The seat reservation includes the player's `club_id`. The buy-in transaction debits that club's `members/{user_id}` record and stores its idempotency transaction under the member's existing `transactions/{buy_in_id}` collection.
 
+Example shared table metadata at `unions/union-1/tables/final-table`:
+
+```json
+{
+  "union_id": "union-1",
+  "table_id": "final-table",
+  "table_name": "Alliance Main",
+  "origin_club_id": "club-a",
+  "small_blind": 10,
+  "big_blind": 20,
+  "buy_in_min": 100,
+  "buy_in_max": 5000,
+  "max_seats": 9,
+  "status": "open"
+}
+```
+
+Example seat records at `unions/union-1/tables/final-table/seats/{seat_index}` show two players whose balances remain in different home clubs:
+
+```json
+{
+  "seat_index": 0,
+  "user_id": "player-a",
+  "club_id": "club-a",
+  "username": "Alice",
+  "stack": 500,
+  "buy_in_id": "00000000-0000-0000-0000-000000000101",
+  "status": "sitting_in",
+  "created_at": "Firestore server timestamp"
+}
+```
+
+```json
+{
+  "seat_index": 1,
+  "user_id": "player-b",
+  "club_id": "club-b",
+  "username": "Bob",
+  "stack": 500,
+  "buy_in_id": "00000000-0000-0000-0000-000000000102",
+  "status": "sitting_in",
+  "created_at": "Firestore server timestamp"
+}
+```
+
+At settlement, the restricted hand document at `unions/union-1/tables/final-table/hands/{hand_id}` retains each player's home-club attribution. For example:
+
+```json
+{
+  "hand_id": "hand-20261015-001",
+  "union_id": "union-1",
+  "table_id": "final-table",
+  "settlement_status": "settled",
+  "players": [
+    {
+      "seat": 0,
+      "user_id": "player-a",
+      "club_id": "club-a",
+      "starting_stack": 500,
+      "final_stack": 650,
+      "net_delta": 150,
+      "hole_cards": ["As", "Ad"]
+    },
+    {
+      "seat": 1,
+      "user_id": "player-b",
+      "club_id": "club-b",
+      "starting_stack": 500,
+      "final_stack": 350,
+      "net_delta": -150,
+      "hole_cards": ["Kh", "Qc"]
+    }
+  ]
+}
+```
+
+This is a schema example, not a checked-in Firestore fixture. Hand audit documents include private card data and must remain server-only; WebSocket clients receive separately masked snapshots instead.
+
 ### Union hand settlement and clearing
 
 Union hand audits live at `unions/{union_id}/tables/{table_id}/hands/{hand_id}`. In one Firestore transaction the backend writes the restricted hand audit, updates each player's home-club `in_play_balance`, updates union seat stacks, and writes a per-hand settlement marker. A retry of the same hand does not repeat those changes.
@@ -277,6 +356,8 @@ Daily aggregate paths are:
 - `unions/{union_id}/settlements/{YYYY-MM-DD}/hands/{hand_id}` with the per-club net deltas and debt/credit positions.
 
 For each club, `net_delta` is the sum of that club's players' hand results. Negative net delta increments `debt` by its absolute value; positive net delta increments `credit`. Current PokerKit games charge no rake, so `rake_amount` is zero and no union software fee or traffic-based rake split is performed.
+
+WebSocket connections, protocol envelopes, topics, and live snapshots are not stored as Firestore documents. The server keeps socket registrations and live table state in process memory; the persisted union hand audit and seat records are the durable records. Chat collections are not defined because chat is not implemented.
 
 ## Suggested Metadata Documents
 

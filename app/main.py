@@ -39,6 +39,13 @@ from database import (
 from logic.auth import FirebaseTokenVerifier
 from logic.connections import ConnectionManager
 from logic.runtime import TableRuntime
+from logic.websocket_protocol import (
+    PROTOCOL_VERSION,
+    UnsupportedWebSocketVersion,
+    game_topic,
+    make_envelope,
+    parse_client_envelope,
+)
 
 
 class CreateTableRequest(BaseModel):
@@ -926,22 +933,48 @@ async def authenticate_player_socket(
 ) -> None:
     await websocket.accept()
     registered = False
+    protocol_version: str | None = None
+    auth_correlation_id: str | None = None
+    topic = game_topic(runtime.connection_scope, runtime.game.table_id)
     try:
         try:
             auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=10)
         except asyncio.TimeoutError:
             await websocket.close(code=4408, reason="Authentication timed out")
             return
-        if (
-            not isinstance(auth_message, dict)
-            or auth_message.get("type") != "authenticate"
-            or not isinstance(auth_message.get("id_token"), str)
-        ):
+        if not isinstance(auth_message, dict):
+            await websocket.close(code=4401, reason="Firebase ID token required")
+            return
+
+        requested_club_id = auth_message.get("club_id")
+        if "version" in auth_message or "event" in auth_message:
+            try:
+                auth_event, auth_payload, auth_correlation_id = parse_client_envelope(
+                    auth_message,
+                    topic,
+                )
+            except UnsupportedWebSocketVersion as error:
+                await websocket.close(code=4406, reason=str(error))
+                return
+            except ValueError as error:
+                await websocket.close(code=4401, reason=str(error))
+                return
+            if auth_event != "AUTHENTICATE":
+                await websocket.close(code=4401, reason="AUTHENTICATE event required")
+                return
+            protocol_version = PROTOCOL_VERSION
+            id_token = auth_payload.get("id_token")
+            requested_club_id = auth_payload.get("club_id")
+        else:
+            if auth_message.get("type") != "authenticate":
+                await websocket.close(code=4401, reason="Firebase ID token required")
+                return
+            id_token = auth_message.get("id_token")
+        if not isinstance(id_token, str):
             await websocket.close(code=4401, reason="Firebase ID token required")
             return
 
         if runtime.union_id is not None:
-            requested_club_id = auth_message.get("club_id")
             if not isinstance(requested_club_id, str) or not requested_club_id:
                 await websocket.close(code=4403, reason="A home club ID is required for union tables")
                 return
@@ -953,7 +986,7 @@ async def authenticate_player_socket(
 
         try:
             current_user = await verify_id_token(
-                auth_message["id_token"],
+                id_token,
                 websocket.app.state.token_verifier,
             )
             if runtime.union_id is None:
@@ -993,26 +1026,81 @@ async def authenticate_player_socket(
             user_id,
             websocket,
             accepted=True,
+            protocol_version=protocol_version,
         )
         registered = True
-        await websocket.send_json({"type": "authenticated", "user_id": user_id})
-        await websocket.send_json(runtime.game.get_masked_state_for_player(user_id))
+        initial_state = runtime.game.get_masked_state_for_player(user_id)
+        if protocol_version == PROTOCOL_VERSION:
+            await websocket.send_json(
+                make_envelope(
+                    "AUTHENTICATED",
+                    {"user_id": user_id},
+                    topic,
+                    auth_correlation_id,
+                )
+            )
+            await websocket.send_json(
+                make_envelope(
+                    "TABLE_SNAPSHOT",
+                    initial_state,
+                    topic,
+                    auth_correlation_id,
+                )
+            )
+        else:
+            await websocket.send_json({"type": "authenticated", "user_id": user_id})
+            await websocket.send_json(initial_state)
         while True:
             raw_action = await websocket.receive_json()
+            correlation_id: str | None = None
+            is_pre_action = False
             try:
-                if isinstance(raw_action, dict) and raw_action.get("type") == "pre_action":
+                if protocol_version == PROTOCOL_VERSION:
+                    event, payload, correlation_id = parse_client_envelope(
+                        raw_action,
+                        topic,
+                    )
+                    if event == "PRE_ACTION":
+                        is_pre_action = True
+                        raw_action = payload
+                    elif event == "PLAYER_ACTION":
+                        raw_action = payload
+                    else:
+                        raise ValueError("Event must be PLAYER_ACTION or PRE_ACTION.")
+
+                if is_pre_action or (
+                    protocol_version is None
+                    and isinstance(raw_action, dict)
+                    and raw_action.get("type") == "pre_action"
+                ):
                     option = raw_action.get("action")
                     if option is not None and not isinstance(option, str):
                         raise ValueError("Pre-action must be a string or null.")
                     selected = await runtime.set_pre_action(user_id, option)
-                    await websocket.send_json(
-                        {"type": "pre_action_set", "action": selected}
-                    )
+                    if protocol_version == PROTOCOL_VERSION:
+                        response = make_envelope(
+                            "PRE_ACTION_SET",
+                            {"action": selected},
+                            topic,
+                            correlation_id,
+                        )
+                    else:
+                        response = {"type": "pre_action_set", "action": selected}
+                    await websocket.send_json(response)
                     continue
                 request = PlayerAction.model_validate(raw_action)
                 await runtime.act(user_id, request.action, request.amount)
             except (ValidationError, ValueError) as error:
-                await websocket.send_json({"error": str(error)})
+                if protocol_version == PROTOCOL_VERSION:
+                    response = make_envelope(
+                        "ACTION_ERROR",
+                        {"message": str(error)},
+                        topic,
+                        correlation_id,
+                    )
+                else:
+                    response = {"error": str(error)}
+                await websocket.send_json(response)
     except WebSocketDisconnect:
         pass
     finally:
