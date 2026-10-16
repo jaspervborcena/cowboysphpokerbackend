@@ -1,11 +1,104 @@
-from base_poker_game import BasePokerGame
+from logic.first_party_table import FirstPartyNLHGame
 
 
-def make_game() -> BasePokerGame:
-    game = BasePokerGame("table-1", 50, 100, 100, 1000)
+def make_game() -> FirstPartyNLHGame:
+    game = FirstPartyNLHGame("table-1", 50, 100, 100, 1000)
     assert game.add_player(0, "player-a", "Alice", 500)
     assert game.add_player(1, "player-b", "Bob", 500)
     return game
+
+
+def test_first_party_table_preserves_snapshot_privacy_and_settlement_contract() -> None:
+    game = FirstPartyNLHGame("owned-table", 50, 100, 100, 1000)
+    assert game.add_player(0, "player-a", "Alice", 500)
+    assert game.add_player(1, "player-b", "Bob", 500)
+
+    assert game.start_new_hand()
+    actor = game.current_actor_user_id
+    assert actor is not None
+    other = "player-b" if actor == "player-a" else "player-a"
+    actor_view = game.get_masked_state_for_player(actor)
+    other_view = game.get_masked_state_for_player(other)
+    actor_cards = next(
+        player["hole_cards"] for player in actor_view["players"]
+        if player["user_id"] == actor
+    )
+    masked_cards = next(
+        player["hole_cards"] for player in other_view["players"]
+        if player["user_id"] == actor
+    )
+    assert len(actor_cards) == 2
+    assert masked_cards == ["??", "??"]
+
+    assert game.handle_player_action(actor, "FOLD")
+    summary = game.pop_completed_hand()
+    assert summary is not None
+    assert summary["is_showdown"] is False
+    assert summary["frames"][-1]["last_action"]["action"] == "FOLD"
+    assert summary["settlement"]["pot_before_fees"] == summary["pot_total"]
+    assert sum(player["final_stack"] for player in summary["players"]) == 1000
+
+
+def test_first_party_showdown_records_a_replay_safe_completed_board() -> None:
+    from app.api.hand_history import filter_replay_for_user
+
+    game = FirstPartyNLHGame("showdown-table", 10, 20, 100, 1000)
+    assert game.add_player(0, "player-a", "Alice", 500)
+    assert game.add_player(1, "player-b", "Bob", 500)
+    assert game.start_new_hand()
+
+    while game.is_hand_running:
+        actor = game.current_actor_user_id
+        assert actor is not None
+        action = "CALL" if (game.current_call_amount or 0) > 0 else "CHECK"
+        assert game.handle_player_action(actor, action)
+
+    summary = game.pop_completed_hand()
+    assert summary is not None
+    assert summary["is_showdown"] is True
+    assert len(summary["final_board"]) == 5
+    assert sum(player["final_stack"] for player in summary["players"]) == 1000
+
+    replay = filter_replay_for_user(summary, "player-a")
+    assert replay["total_frames"] == len(summary["frames"])
+    for frame in replay["frames"]:
+        assert all(len(player["hole_cards"]) == 2 for player in frame["players"])
+
+
+def test_first_party_table_keeps_waiting_button_player_out_of_hand() -> None:
+    game = FirstPartyNLHGame("waiting-button", 5, 10, 100, 1000, max_seats=6)
+    assert game.add_player(0, "new-player", "New", 100)
+    assert game.add_player(2, "alice", "Alice", 100)
+    assert game.add_player(4, "bob", "Bob", 100)
+    game.seats[0].new_to_table = True
+
+    assert game.start_new_hand()
+    assert {player.player_id for player in game.poker_game.players} == {"alice", "bob"}
+    assert game.poker_game.button_seat == 0
+    new_player = next(
+        player for player in game.get_masked_state_for_player("alice")["players"]
+        if player["user_id"] == "new-player"
+    )
+    assert new_player["waiting_for_big_blind"] is True
+    assert new_player["hole_cards"] == []
+
+
+def test_first_party_table_passes_big_blind_consent_and_straddle() -> None:
+    game = FirstPartyNLHGame("straddle-table", 10, 20, 100, 1000, max_seats=6)
+    for seat, player_id in enumerate(("button", "small", "big", "utg")):
+        assert game.add_player(seat, player_id, player_id, 200)
+    game.seats[3].new_to_table = True
+    game.seats[3].accept_big_blind_post = True
+
+    assert game.start_new_hand(straddle_player_id="utg")
+    utg = next(player for player in game.poker_game.players if player.player_id == "utg")
+    assert utg.total_contribution == 60
+    assert game.seats[3].new_to_table is False
+    assert game.seats[3].accept_big_blind_post is False
+    assert any(
+        event.kind.value == "STRADDLE_POSTED" and event.player_id == "utg"
+        for event in game._engine_events
+    )
 
 
 def test_start_hand_and_mask_opponents_hole_cards() -> None:
@@ -31,7 +124,7 @@ def test_start_hand_and_mask_opponents_hole_cards() -> None:
 
 
 def test_player_home_club_is_included_in_table_snapshot() -> None:
-    game = BasePokerGame("union-table", 10, 20, 20, 1000)
+    game = FirstPartyNLHGame("union-table", 10, 20, 20, 1000)
     assert game.add_player(0, "player-a", "Alice", 100, club_id="club-manila")
 
     snapshot = game.get_masked_state_for_player("player-a")
@@ -173,12 +266,12 @@ def test_hand_summary_applies_rake_and_jackpot_before_player_payouts() -> None:
     summary = game.pop_completed_hand()
 
     assert summary is not None
-    assert summary["rake_amount"] == 15
+    assert summary["rake_amount"] == 10
     assert summary["jackpot"]["fee_collected"] == 25
-    assert summary["settlement"]["house_take"] == 40
-    assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 40
-    assert sum(player["net_delta"] for player in summary["players"]) == -40
-    assert sum(player["final_stack"] for player in summary["players"]) == 960
+    assert summary["settlement"]["house_take"] == 35
+    assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 35
+    assert sum(player["net_delta"] for player in summary["players"]) == -35
+    assert sum(player["final_stack"] for player in summary["players"]) == 965
 
 
 def test_rake_and_jackpot_drops_never_exceed_the_completed_pot() -> None:
@@ -225,5 +318,5 @@ def test_hand_summary_reserves_hand_of_day_prize_before_player_payouts() -> None
 
     assert summary is not None
     assert summary["hand_of_the_day"]["eligible"] is True
-    assert summary["settlement"]["house_take"] == 15
-    assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 15
+    assert summary["settlement"]["house_take"] == 10
+    assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 10

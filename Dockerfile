@@ -6,8 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY base_poker_game.py ./
 COPY database ./database
+COPY game_engine ./game_engine
 COPY logic ./logic
 COPY app ./app
 

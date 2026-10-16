@@ -4,10 +4,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-try:
-    from base_poker_game import calculate_hand_settlement_finances as _game_finance_calc
-except Exception:  # pragma: no cover - fallback when imported in isolation
-    _game_finance_calc = None
+from logic.table_game_base import (
+    calculate_hand_settlement_finances as _table_settlement_finances,
+)
 
 
 def calculate_hand_settlement_finances(
@@ -17,42 +16,13 @@ def calculate_hand_settlement_finances(
     jackpot_cfg: dict[str, Any] | None = None,
     showdown_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if _game_finance_calc is not None:
-        return _game_finance_calc(
-            total_pot=total_pot,
-            dealt_flop=dealt_flop,
-            rake_cfg=rake_cfg,
-            jackpot_cfg=jackpot_cfg,
-            showdown_data=showdown_data,
-        )
-
-    pot_total = max(0, int(total_pot))
-    house_rake = 0
-    jackpot_drop = 0
-
-    if rake_cfg:
-        percentage = rake_cfg.get("percentage", rake_cfg.get("rake_rate", rake_cfg.get("rate", 0)))
-        cap_amount = rake_cfg.get("cap_amount", rake_cfg.get("rake_cap", 0))
-        no_flop_no_drop = bool(rake_cfg.get("no_flop_no_drop", True))
-        if percentage and (dealt_flop or not no_flop_no_drop):
-            raw_rake = pot_total * float(percentage)
-            house_rake = int(raw_rake) if not cap_amount else min(int(raw_rake), int(cap_amount))
-
-    playable_pot = max(0, pot_total - house_rake)
-    if jackpot_cfg and jackpot_cfg.get("enabled"):
-        threshold = int(jackpot_cfg.get("min_pot_threshold", jackpot_cfg.get("min_pot", 0)))
-        if playable_pot >= threshold:
-            fee_amount = int(jackpot_cfg.get("fee_amount", jackpot_cfg.get("amount", 0)))
-            jackpot_drop = max(0, min(fee_amount, playable_pot))
-
-    net_winning_pot = max(0, playable_pot - jackpot_drop)
-    return {
-        "house_rake": house_rake,
-        "jackpot_drop": jackpot_drop,
-        "playable_pot": playable_pot,
-        "net_winning_pot": net_winning_pot,
-        "showdown_data": showdown_data,
-    }
+    return _table_settlement_finances(
+        total_pot=total_pot,
+        dealt_flop=dealt_flop,
+        rake_cfg=rake_cfg,
+        jackpot_cfg=jackpot_cfg,
+        showdown_data=showdown_data,
+    )
 
 
 @dataclass

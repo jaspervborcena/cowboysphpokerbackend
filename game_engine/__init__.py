@@ -6,9 +6,12 @@ from game_engine.nlh_state import (
 	NLHHandState,
 	NLHPlayerState,
 	NLHStreet,
+	advance_nlh_street,
+	begin_nlh_showdown,
 	initialize_nlh_hand,
 	project_player_hand_state,
 )
+from game_engine.nlh_rules import NLHEngine, apply_nlh_action, legal_nlh_actions, start_nlh_hand
 from game_engine.contracts import (
 	EngineTransition,
 	HandOutcome,
@@ -19,6 +22,7 @@ from game_engine.contracts import (
 	PokerEngine,
 	PokerEvent,
 	PokerEventKind,
+	PokerGameMode,
 	PokerTableConfig,
 )
 
@@ -39,10 +43,13 @@ __all__ = [
 	"PokerEngine",
 	"PokerEvent",
 	"PokerEventKind",
+	"PokerGameMode",
 	"PokerTableConfig",
 	"NLHHandState",
 	"NLHPlayerState",
 	"NLHStreet",
+	"NLHEngine",
+	"apply_nlh_action",
 	"build_side_pots",
 	"deal_flop",
 	"deal_hole_cards",
@@ -50,7 +57,9 @@ __all__ = [
 	"deal_turn",
 	"evaluate_hand",
 	"initialize_nlh_hand",
+	"legal_nlh_actions",
 	"project_player_hand_state",
 	"resolve_pot_awards",
+	"start_nlh_hand",
 	"visible_hole_cards",
 ]

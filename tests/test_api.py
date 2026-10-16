@@ -1,8 +1,4 @@
 import asyncio
-import inspect
-
-import pokerkit
-
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -10,8 +6,8 @@ from starlette.websockets import WebSocketDisconnect
 from app import main as api_main
 from app.main import app, tables
 from database import BuyInStatus, NullHandRepository, WalletTransactionStatus
-from base_poker_game import BasePokerGame
 from logic.connections import ConnectionManager
+from logic.first_party_table import FirstPartyNLHGame
 from logic.runtime import TableRuntime
 from logic.auth import InvalidFirebaseToken
 
@@ -274,33 +270,113 @@ def configure_test_dependencies(monkeypatch, repository: FakeHandRepository | Nu
     monkeypatch.setattr(api_main.app.state, "token_verifier", FakeTokenVerifier())
 
 
-def test_game_catalog_matches_installed_pokerkit_factories() -> None:
-    installed_factories = {
-        name
-        for name, value in vars(pokerkit).items()
-        if name != "HandHistory"
-        and inspect.isclass(value)
-        and callable(getattr(value, "create_state", None))
-    }
-
+def test_game_catalog_lists_only_first_party_supported_games() -> None:
     with TestClient(app) as client:
         response = client.get("/games")
 
     assert response.status_code == 200
     catalog = response.json()
     entries = catalog["games"]
-    assert catalog["pokerkit_version"]
     assert catalog["active_game_id"] == "no_limit_texas_holdem"
-    assert {entry["pokerkit_factory"] for entry in entries} == installed_factories
-    assert {entry["game_id"] for entry in entries if entry["create_supported"]} == {
-        "no_limit_texas_holdem"
-    }
-    assert all(entry["pokerkit_available"] for entry in entries)
-    assert all(
-        entry["backend_status"] == "mock" and entry["mock_reason"]
-        for entry in entries
-        if not entry["create_supported"]
-    )
+    assert entries == [
+        {
+            "game_id": "no_limit_texas_holdem",
+            "display_name": "No Limit Texas Hold'em",
+            "category": "Hold'em",
+            "backend_status": "supported",
+            "create_supported": True,
+        }
+    ]
+
+
+def test_live_nlh_entry_consent_and_straddle_options(monkeypatch) -> None:
+    club_id = "nlh-options-club"
+    table_id = "nlh-options-table"
+    player_ids = ["option-player-0", "option-player-1", "option-player-2", "option-player-3"]
+    balances = {"option-owner": 1000, **{player_id: 1000 for player_id in player_ids}}
+    roles = {"option-owner": "MANAGER", **{player_id: "PLAYER" for player_id in player_ids}}
+    roles["option-new-player"] = "PLAYER"
+    balances["option-new-player"] = 1000
+    repository = FakeHandRepository(balances, roles)
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/clubs/{club_id}/tables/{table_id}",
+            json={
+                "small_blind": 10,
+                "big_blind": 20,
+                "buy_in_min": 20,
+                "buy_in_max": 500,
+                "table_size": 6,
+            },
+            headers={"Authorization": "Bearer valid:option-owner"},
+        )
+        assert response.status_code == 201
+
+        for seat_index, player_id in enumerate(player_ids):
+            response = client.post(
+                f"/clubs/{club_id}/tables/{table_id}/seats",
+                json={
+                    "seat_index": seat_index,
+                    "buy_in_amount": 200,
+                    "buy_in_id": f"00000000-0000-0000-0000-{seat_index + 101:012d}",
+                },
+                headers={"Authorization": f"Bearer valid:{player_id}"},
+            )
+            assert response.status_code == 201
+
+        start_url = f"/clubs/{club_id}/tables/{table_id}/hands"
+        owner_headers = {"Authorization": "Bearer valid:option-owner"}
+        response = client.post(
+            start_url,
+            json={"straddle_player_id": "not-seated"},
+            headers=owner_headers,
+        )
+        assert response.status_code == 400
+        assert tables[(club_id, table_id)].game._button_offset == 0
+
+        response = client.post(
+            start_url,
+            json={"straddle_player_id": player_ids[3]},
+            headers=owner_headers,
+        )
+        assert response.status_code == 201
+        game = tables[(club_id, table_id)].game
+        straddler = next(
+            player for player in game.poker_game.players
+            if player.player_id == player_ids[3]
+        )
+        assert straddler.street_contribution == 40
+
+        while game.is_hand_running:
+            actor = game.current_actor_user_id
+            assert actor is not None
+            assert game.handle_player_action(actor, "FOLD")
+
+        response = client.post(
+            f"/clubs/{club_id}/tables/{table_id}/seats",
+            json={
+                "seat_index": 4,
+                "buy_in_amount": 200,
+                "buy_in_id": "00000000-0000-0000-0000-000000000201",
+                "accept_big_blind_post": True,
+            },
+            headers={"Authorization": "Bearer valid:option-new-player"},
+        )
+        assert response.status_code == 201
+        assert game.seats[4].new_to_table is True
+        assert game.seats[4].accept_big_blind_post is True
+
+        response = client.post(start_url, headers=owner_headers)
+        assert response.status_code == 201
+        new_player = next(
+            player for player in game.poker_game.players
+            if player.player_id == "option-new-player"
+        )
+        assert new_player.total_contribution == 20
+        assert game.seats[4].new_to_table is False
+        assert game.seats[4].accept_big_blind_post is False
 
 
 def test_table_size_cannot_exceed_server_maximum(monkeypatch) -> None:
@@ -1419,7 +1495,7 @@ def test_runtime_retains_completed_hand_until_repository_acknowledges_it() -> No
             return True
 
     async def run_test() -> None:
-        game = BasePokerGame("retry-table", 10, 20, 20, 1000)
+        game = FirstPartyNLHGame("retry-table", 10, 20, 20, 1000)
         assert game.add_player(0, "player-a", "Alice", 500)
         assert game.add_player(1, "player-b", "Bob", 500)
         repository = FailOnceRepository()

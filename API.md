@@ -237,7 +237,7 @@ The `201` response includes `union_id`, `table_id`, `game_id`, `origin_club_id`,
 
 ### Seat and play
 
-`POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` requires an active `PLAYER` membership in the path club and an active union-club link. Its body is the same as the local seat request (`seat_index`, `buy_in_amount`, `buy_in_id`); it does not accept a user ID or stack. The authenticated UID and username come from Firebase/member data. The Firestore transaction debits that member's home-club `chip_balance`, increments its `in_play_balance`, and reserves the seat under the union table.
+`POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` requires an active `PLAYER` membership in the path club and an active union-club link. Its body is the same as the local seat request (`seat_index`, `buy_in_amount`, `buy_in_id`, and optional `accept_big_blind_post`); it does not accept a user ID or stack. The authenticated UID and username come from Firebase/member data. The Firestore transaction debits that member's home-club `chip_balance`, increments its `in_play_balance`, and reserves the seat under the union table.
 
 `POST /unions/{union_id}/tables/{table_id}/hands` requires `UNION_ADMIN`. Shared WebSockets connect to:
 
@@ -305,34 +305,20 @@ Response `200`:
 
 ### Game catalog
 
-`GET /games` is public and returns the PokerKit factories available in the installed version, together with the backend's implementation status. Use `active_game_id` for the current default. Table creation accepts an optional `game_id`, defaulting to `no_limit_texas_holdem`; only entries with `create_supported: true` are supported. Currently that is the only create-supported game. Unsupported IDs return the standard invalid-format response.
+`GET /games` is public and returns the explicit first-party game registry. Use `active_game_id` for the current default. Table creation accepts an optional `game_id`, defaulting to `no_limit_texas_holdem`; only entries with `create_supported: true` are supported. Currently NLH is the only registered game. Unsupported IDs return the standard invalid-format response.
 
 Response `200` (catalog abbreviated):
 
 ```json
 {
-  "pokerkit_version": "<installed version>",
   "active_game_id": "no_limit_texas_holdem",
   "games": [
     {
       "game_id": "no_limit_texas_holdem",
       "display_name": "No Limit Texas Hold'em",
       "category": "Hold'em",
-      "pokerkit_factory": "NoLimitTexasHoldem",
-      "pokerkit_available": true,
       "backend_status": "supported",
-      "create_supported": true,
-      "mock_reason": null
-    },
-    {
-      "game_id": "fixed_limit_texas_holdem",
-      "display_name": "Fixed Limit Texas Hold'em",
-      "category": "Hold'em",
-      "pokerkit_factory": "FixedLimitTexasHoldem",
-      "pokerkit_available": true,
-      "backend_status": "mock",
-      "create_supported": false,
-      "mock_reason": "PokerKit provides this game factory, but gameplay, settlement, and replay integration have not been verified by this backend."
+      "create_supported": true
     }
   ]
 }
@@ -388,11 +374,12 @@ Request:
 {
   "seat_index": 0,
   "buy_in_amount": 500,
-  "buy_in_id": "00000000-0000-0000-0000-000000000001"
+  "buy_in_id": "00000000-0000-0000-0000-000000000001",
+  "accept_big_blind_post": false
 }
 ```
 
-`buy_in_amount` is the requested amount, not an assigned stack. The server checks the table's buy-in limits and the member's Firestore `chip_balance`, then atomically debits that balance and reserves the seat. `buy_in_id` is a client-generated UUID idempotency key; generate it once for a purchase and reuse the same value if retrying after a timeout or network error. Do not generate a new key for a retry.
+`buy_in_amount` is the requested amount, not an assigned stack. The server checks the table's buy-in limits and the member's Firestore `chip_balance`, then atomically debits that balance and reserves the seat. `buy_in_id` is a client-generated UUID idempotency key; generate it once for a purchase and reuse the same value if retrying after a timeout or network error. Do not generate a new key for a retry. `accept_big_blind_post` defaults to `false`; a new player may set it to `true` to join before the big blind and post one live big blind. The post is not charged twice when the player is already in the natural big-blind seat.
 
 Response `201`: a table-state snapshot. Before a hand starts, `hand_id` is `null`, `is_hand_running` is `false`, and the seated player has an empty `hole_cards` array. The server assigns `stack` equal to the verified `buy_in_amount`.
 
@@ -400,7 +387,7 @@ Response `201`: a table-state snapshot. Before a hand starts, `hand_id` is `null
 
 `POST /clubs/{club_id}/tables/{table_id}/hands`
 
-Requires an active club member with role `OWNER` or `MANAGER`. No request body. Response `201`: a table-state snapshot. This REST response intentionally does not include private cards; connect to the WebSocket as each player to receive that player's private cards.
+Requires an active club member with role `OWNER` or `MANAGER`. The request body is optional. To post a live UTG straddle in a ring hand, send `{"straddle_player_id":"<seated-player-id>"}`. The engine verifies the player is UTG and has at least twice the big blind; heads-up and tournament-mode straddles are rejected. Invalid selections return the standard request error. Response `201`: a table-state snapshot. This REST response intentionally does not include private cards; connect to the WebSocket as each player to receive that player's private cards.
 
 ## WebSocket
 
@@ -542,7 +529,7 @@ Example snapshot sent to `player-a`:
 }
 ```
 
-`street` is PokerKit's numeric street index (`0` is pre-flop for the current Hold'em game; `null` means there is no active street). `pot` is the current pot including outstanding bets. `pots` contains the current pot/side-pot amounts. `active_turn_seat` is the seat index to act, or `null` when nobody is acting. Opponents' hidden cards are represented as `"??"`; a player's own cards are sent in clear text only to that player's socket. `hand_id` remains available after completion and can be used to load the replay.
+`street` is the first-party NLH numeric street index (`0` is pre-flop; `null` means there is no active street). `pot` is the current pot including outstanding bets. `pots` contains the current contribution tranches. `active_turn_seat` is the seat index to act, or `null` when nobody is acting. Opponents' hidden cards are represented as `"??"`; a player's own cards are sent in clear text only to that player's socket. A seated player waiting for the big blind has `waiting_for_big_blind: true` and no hole cards. `hand_id` remains available after completion and can be used to load the replay.
 
 ### Client actions
 
@@ -565,7 +552,7 @@ Send one JSON object per action:
 {"action":"RAISE","amount":300}
 ```
 
-Actions are case-insensitive. `RAISE.amount` is an integer raise-to total for the current betting round, not the additional amount to add. PokerKit validates whether the action and amount are legal. `CHECK` is rejected if the player faces a bet. Only the current actor may act.
+Actions are case-insensitive. `RAISE.amount` is an integer raise-to total for the current betting round, not the additional amount to add. The first-party NLH rules validate whether the action and amount are legal. `CHECK` is rejected if the player faces a bet. Only the current actor may act.
 
 On success, all connected players receive the next full state snapshot; there is no separate action acknowledgement. On invalid input or an illegal/out-of-turn action, only the acting socket receives:
 

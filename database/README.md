@@ -138,7 +138,7 @@ For local club hands, rake and BBJ drops update these fields atomically with the
 
 Path: `clubs/{club_id}/tables/{table_id}/hands/{hand_id}`
 
-The document ID is the generated `hand_id`. This raw audit is server-only: it includes private hole cards, remaining/burn/mucked deck cards, PokerKit operations, and timestamped replay frames. Never expose this document directly to a client. Player replay clients must use `GET /clubs/{club_id}/hands/{hand_id}/replay`, which masks cards for the requesting user.
+The document ID is the generated `hand_id`. This raw audit is server-only: it includes private hole cards, remaining/burn/mucked deck cards, first-party engine events, and timestamped replay frames. Never expose this document directly to a client. Player replay clients must use `GET /clubs/{club_id}/hands/{hand_id}/replay`, which masks cards for the requesting user.
 
 ```json
 {
@@ -239,15 +239,16 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `pot_total`, `rake_amount` | integer | Total chips pushed to pots and amount not paid to players. |
 | `settlement_status` | string | `pending` after the durable hand audit is enqueued; `settled` after player/pool ledger updates commit atomically. |
 | `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred and gross chip awards by winner. |
-| `pot_distributions` | array | PokerKit per-pot/board/hand-type award details. |
+| `pot_distributions` | array | Gross award totals by player for the NLH hand. |
+| `uncalled_returns` | array | Chips returned because no opponent matched a player's contribution. |
 | `deck_state` | object | Remaining, burn, mucked, and reserved cards; restricted audit data. |
 | `frames` | array | Timestamped post-action replay snapshots, including raw hole cards for filtering. |
 | `players` | array of objects | Per-player seat, identity, stacks, net result, and hole cards. |
 | `players[].starting_stack` | integer | Stack at the start of the hand. |
 | `players[].final_stack` | integer | Stack after the hand completes. |
-| `players[].net_delta` | integer | PokerKit payoff (`final_stack - starting_stack`); this delta is applied to `in_play_balance`, not the available wallet. |
+| `players[].net_delta` | integer | First-party settlement result (`final_stack - starting_stack`); this delta is applied to `in_play_balance`, not the available wallet. |
 | `players[].hole_cards` | array of strings | Player's private cards. These must not be exposed through public client reads. |
-| `operations` | array of objects | Ordered PokerKit operation audit. Fields depend on operation type and may include `user_id`, `amount`, `amounts`, `cards`, and `pot_index`. |
+| `operations` | array of objects | Ordered first-party engine event audit, including player IDs, amounts, and dealt cards where applicable. |
 
 The repository checks whether the hand document already exists inside the Firestore transaction. If it exists, it skips the hand write, in-play balance deltas, and seat stack updates, preventing a retry from applying the same hand twice. Firestore security rules must deny direct client reads to `hands` documents; clients use only the authenticated replay endpoint.
 
@@ -372,7 +373,7 @@ Daily aggregate paths are:
 - `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_id}` with integer `debt` and `credit` totals.
 - `unions/{union_id}/settlements/{YYYY-MM-DD}/hands/{hand_id}` with the per-club net deltas and debt/credit positions.
 
-For each club, `net_delta` is the sum of that club's players' hand results. Negative net delta increments `debt` by its absolute value; positive net delta increments `credit`. Current PokerKit games charge no rake, so `rake_amount` is zero and no union software fee or traffic-based rake split is performed.
+For each club, `net_delta` is the sum of that club's players' hand results. Negative net delta increments `debt` by its absolute value; positive net delta increments `credit`. Current union settlement does not allocate a software fee or traffic-based rake split.
 
 WebSocket connections, protocol envelopes, topics, and live snapshots are not stored as Firestore documents. The server keeps socket registrations and live table state in process memory; the persisted union hand audit and seat records are the durable records. Chat collections are not defined because chat is not implemented.
 
@@ -417,7 +418,7 @@ Path: `clubs/{club_id}/tables/{table_id}`
 
 - Store chip values as integers in the smallest unit used by the game. Do not use floating-point amounts.
 - Keep hand audits server-written and admin-only: they contain all players' private hole cards.
-- Never trust a client-provided balance, hand result, or `net_delta`. The authoritative source is the server's completed PokerKit state.
+- Never trust a client-provided balance, hand result, or `net_delta`. The authoritative source is the server's completed first-party hand state.
 - Use Firestore transactions for ledger changes and make settlement idempotent by hand ID.
 - Cash-out is not implemented. Add an idempotent transaction that removes/releases the seat and moves its final stack from `in_play_balance` back to `chip_balance` before treating these fields as a complete wallet ledger.
 - Firebase ID tokens are verified and active club membership is required. REST derives the user ID from the verified token; WebSockets authenticate in their first message. Review role assignments and Firestore rules before public use.

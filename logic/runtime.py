@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 
-from base_poker_game import BasePokerGame
 from database import FirestoreHandRepository, NullHandRepository
 from logic.connections import ConnectionManager
+from logic.table_game_base import TableGameBase
 
 
 class ActionIdempotencyConflict(ValueError):
@@ -16,7 +16,7 @@ class TableRuntime:
     def __init__(
         self,
         club_id: str,
-        game: BasePokerGame,
+        game: TableGameBase,
         connections: ConnectionManager,
         repository: FirestoreHandRepository | NullHandRepository,
         turn_timeout_seconds: int,
@@ -35,10 +35,14 @@ class TableRuntime:
             tuple[str, str], tuple[str, int | None]
         ] = OrderedDict()
 
-    async def start_hand(self) -> bool:
+    async def start_hand(self, straddle_player_id: str | None = None) -> bool:
         async with self.lock:
             await self._persist_completed_hand()
-            started = self.game.start_new_hand()
+            started = (
+                self.game.start_new_hand()
+                if straddle_player_id is None
+                else self.game.start_new_hand(straddle_player_id)
+            )
         if started:
             await self._broadcast_and_reset_timer()
         return started

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from fastapi import WebSocket
 
-from base_poker_game import BasePokerGame
+from logic.table_game_base import TableGameBase
 from logic.websocket_protocol import PROTOCOL_VERSION, game_topic, make_envelope
 
 
@@ -44,7 +44,7 @@ class ConnectionManager:
         if not self.active_connections[key]:
             self.active_connections.pop(key, None)
 
-    async def broadcast_table_state(self, club_id: str, table_id: str, game: BasePokerGame) -> None:
+    async def broadcast_table_state(self, club_id: str, table_id: str, game: TableGameBase) -> None:
         key = (club_id, table_id)
         for connection in list(self.active_connections.get(key, [])):
             try:

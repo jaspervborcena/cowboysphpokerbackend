@@ -34,20 +34,24 @@ def nlh_deal_order(
     player_ids_by_seat: dict[int, str],
     button_seat: int,
     max_seats: int,
+    *,
+    allow_unoccupied_button: bool = False,
 ) -> tuple[str, ...]:
     """Return the clockwise hole-card order, handling the heads-up button rule."""
     if max_seats < 2:
         raise ValueError("A poker table must support at least two seats.")
     if len(player_ids_by_seat) < 2:
         raise ValueError("A poker hand requires at least two players.")
-    if not 0 <= button_seat < max_seats or button_seat not in player_ids_by_seat:
+    if not 0 <= button_seat < max_seats:
+        raise ValueError("Button seat is outside the configured table capacity.")
+    if not allow_unoccupied_button and button_seat not in player_ids_by_seat:
         raise ValueError("Button must be assigned to a seated player.")
     if any(not 0 <= seat < max_seats for seat in player_ids_by_seat):
         raise ValueError("Player seat is outside the configured table capacity.")
     if len(set(player_ids_by_seat.values())) != len(player_ids_by_seat):
         raise ValueError("Player IDs must be unique.")
 
-    if len(player_ids_by_seat) == 2:
+    if len(player_ids_by_seat) == 2 and button_seat in player_ids_by_seat:
         first_seat = button_seat
     else:
         first_seat = next(

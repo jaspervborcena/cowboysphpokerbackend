@@ -1,4 +1,4 @@
-# WebSocket Architecture and PokerKit Fit
+# WebSocket Architecture and NLH Engine Fit
 
 ## Purpose
 
@@ -11,7 +11,7 @@ The current implementation is a single-process, authoritative table flow:
 1. A player connects to `/ws/table/{club_id}/{table_id}` or `/ws/union/{union_id}/{table_id}`.
 2. The server requires a Firebase ID token in the first WebSocket message, checks active membership and `PLAYER` role, and confirms the user is seated. Union sockets also verify the selected home club.
 3. The server sends an authentication acknowledgement and a player-specific full state snapshot. Hole-card masking is performed for each player.
-4. Incoming actions are validated and passed to `TableRuntime`, which serializes mutations with an `asyncio.Lock` and calls the PokerKit-backed game engine.
+4. Incoming actions are validated and passed to `TableRuntime`, which serializes mutations with an `asyncio.Lock` and calls the first-party NLH engine.
 5. After an accepted action, the runtime broadcasts a fresh, masked snapshot to each connected player. Invalid actions return an error to the acting socket.
 6. Completed hands are handed to the repository for idempotent Firestore settlement. Firestore's gRPC transport is an implementation detail, not the application protocol.
 
@@ -128,12 +128,12 @@ Pre-actions use `PRE_ACTION`, with `payload.action` set to `CHECK_FOLD`, `FOLD`,
 
 ## Fit Assessment
 
-The proposal's separation of game and chat concerns is compatible with the domain. PokerKit should remain the authoritative state machine: clients send intent, the server verifies it, and only the table's authoritative runtime mutates game state. Topic routing and Redis can be introduced around that boundary later.
+The proposal's separation of game and chat concerns is compatible with the domain. The first-party NLH engine is the authoritative state machine: clients send intent, the server verifies it, and only the table's authoritative runtime mutates game state. Topic routing and Redis can be introduced around that boundary later.
 
 The proposed sample code is not safe to adopt as written:
 
 - It accepts `user_id` from the query string and does not verify Firebase tokens, active membership, role, or seating. The current backend derives identity from a Firebase token and rejects users who are not seated `PLAYER`s.
-- It publishes client messages to Redis instead of passing actions through the authoritative PokerKit runtime. Redis must not become an alternate path for mutating game state.
+- It publishes client messages to Redis instead of passing actions through the authoritative table runtime. Redis must not become an alternate path for mutating game state.
 - It connects the socket only to the game topic; it does not actually subscribe the socket to the chat topic.
 - It does not implement the claimed chat rate limiting, backpressure isolation, or event acknowledgements.
 - Its card-masking example mutates `payload` in place. A shared message could then carry one player's masked data into another player's response. Masking must use immutable input or a per-recipient copy, and private cards must never be broadcast on a channel where unauthorized consumers can read them.
@@ -147,7 +147,7 @@ The proposed sample code is not safe to adopt as written:
 flowchart LR
     C[Angular client] -->|Firebase-authenticated WebSocket| G[FastAPI WebSocket gateway]
     G -->|authorized game command| R[Authoritative table runtime]
-    R -->|validated action| P[PokerKit-backed game engine]
+    R -->|validated action| P[First-party NLH engine]
     P -->|per-player masked snapshots| G
     G -->|game events| C
     G -->|chat message| H[Chat service with bounded queues and rate limits]
@@ -155,7 +155,7 @@ flowchart LR
     G -. future cross-process routing .-> X[Redis or table-owner router]
 ```
 
-Keep the current PokerKit/runtime boundary. For horizontal scaling, assign each live table a single authoritative owner. Route commands for that table to its owner, and use Redis or another broker only for explicitly designed cross-process command delivery and event fanout. Establish ownership, failover, ordering, and duplicate handling before running the same table on multiple workers. A broker does not replace durable table ownership or recovery.
+Keep the current engine/runtime boundary. For horizontal scaling, assign each live table a single authoritative owner. Route commands for that table to its owner, and use Redis or another broker only for explicitly designed cross-process command delivery and event fanout. Establish ownership, failover, ordering, and duplicate handling before running the same table on multiple workers. A broker does not replace durable table ownership or recovery.
 
 Treat game and chat as separate logical channels even if a client multiplexes them over one authenticated socket. Derive allowed topics server-side from the authenticated user, club membership, seat, and table; never let a client subscribe to an arbitrary club/table topic. Use bounded queues and rate limits for chat. If game latency must remain independent under slow clients or chat floods, use separate sockets or independently managed send queues and validate the choice with load tests.
 
@@ -178,20 +178,20 @@ Do not place tokens or caller-selected user IDs in URLs, topics, or logs. Do not
 
 When distributing events across processes, send only the data appropriate to each audience. Public table events can be broadcast; private hole cards and private player state must be delivered to a specific authorized user. Do not publish an unmasked full state to a general-purpose topic and rely on every downstream consumer to mask it correctly.
 
-## Persistence and PokerKit
+## Persistence and NLH Engine
 
-PokerKit remains in-process and authoritative for legal actions, hand progression, and settlement results. The WebSocket layer should not reimplement betting rules or broadcast client-provided state deltas as truth.
+The first-party NLH engine remains in-process and authoritative for legal actions, hand progression, and gross award results. The WebSocket layer should not reimplement betting rules or broadcast client-provided state deltas as truth.
 
 The current runtime delegates completed-hand persistence and balance updates to the repository, which uses pending settlement records and idempotent Firestore operations. Keep this as one logical settlement workflow. Do not assume that it is one gRPC write: Firestore's internal transport and transaction behavior are not the WebSocket protocol, and the repository owns those details.
 
 ## Multi-Worker Ownership and Recovery Design
 
-The implementation is not multi-worker safe today. `tables`, runtime locks, connection lists, and recent action IDs are process-local. Session affinity does not prevent two workers from creating or mutating the same table, and the current code does not recover a live PokerKit hand after process loss. Do not increase worker count for live tables until this design is implemented and tested.
+The implementation is not multi-worker safe today. `tables`, runtime locks, connection lists, and recent action IDs are process-local. Session affinity does not prevent two workers from creating or mutating the same table, and the current code does not recover a live NLH hand after process loss. Do not increase worker count for live tables until this design is implemented and tested.
 
 1. Assign each canonical table key (club or union scope plus table ID) one owner. Store a renewable lease in a shared coordination store, with an incrementing fencing epoch. Lease acquisition must be atomic; every owner-routed command and persisted write carries the epoch. A worker with an expired or older epoch must be rejected, even if it resumes after a pause.
-2. Route REST mutations and WebSocket game actions to the owner. Gateways authenticate and authorize as they do now, then forward the command with authenticated user ID, table key, action ID, payload hash, and fencing epoch. The gateway must not mutate a local copy. Keep PokerKit as the only game-state authority.
+2. Route REST mutations and WebSocket game actions to the owner. Gateways authenticate and authorize as they do now, then forward the command with authenticated user ID, table key, action ID, payload hash, and fencing epoch. The gateway must not mutate a local copy. Keep the owned engine as the only game-state authority.
 3. Persist an idempotency record keyed by table, hand, user, and `action_id`, including the canonical payload hash, accepted table sequence, and outcome. Repeating a key with the same hash returns the recorded result; a different hash returns `40902`. Persist the record before acknowledging an action. Use a durable transaction or append-only journal; Redis Pub/Sub and the current 4,096-entry memory cache are insufficient.
-4. Checkpoint a versioned canonical table state and monotonically increasing sequence. It must include all private engine state needed to resume safely, stored with access controls and encryption; public snapshots must never contain a deck or opponents' unrevealed cards. Keep an ordered journal of accepted commands after the checkpoint and replay it to recover. First prove PokerKit state can be serialized/replayed deterministically, including the deck and random state; if not, persist a supported engine checkpoint or do not claim in-progress-hand recovery.
+4. Checkpoint a versioned canonical table state and monotonically increasing sequence. It must include all private engine state needed to resume safely, stored with access controls and encryption; public snapshots must never contain a deck or opponents' unrevealed cards. Keep an ordered journal of accepted commands after the checkpoint and replay it to recover. Prove the owned engine state and random/deck state can be serialized and replayed deterministically before claiming in-progress-hand recovery.
 5. On owner loss, wait for lease expiry, acquire a higher fencing epoch, load the latest checkpoint, replay the journal, reconcile pending hand settlement through the existing idempotent repository workflow, and only then accept actions. Clients reconnect and receive a new full, player-masked snapshot. Never run old and new owners concurrently.
 6. Test concurrent lease acquisition, delayed old-owner writes, retries crossing workers, crash/restart mid-hand, replay determinism, private-card masking, and settlement duplication before enabling multi-worker deployment. If recovery or lease state is uncertain, keep the table unavailable for operator recovery instead of accepting actions on incomplete state.
 

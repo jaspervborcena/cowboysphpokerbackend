@@ -55,9 +55,9 @@ Use [`ui-mocks/wallet-dashboard.json`](ui-mocks/wallet-dashboard.json) as the lo
 
 ## Contract Through Engine Replacement
 
-The backend should keep the existing NLH-facing contract stable while replacing PokerKit: REST routes and request/response fields, `game_id`, standardized error codes, the v1 WebSocket envelope and event names, current NLH action payloads, complete `TABLE_SNAPSHOT` behavior, per-player card masking, and the hand replay route. If a breaking protocol change becomes necessary, version it and coordinate it before rollout.
+The backend's live NLH path uses the first-party engine and preserves the REST routes, `game_id`, standardized errors, v1 WebSocket envelopes, NLH action payloads, complete `TABLE_SNAPSHOT` behavior, per-player card masking, and hand replay route. New seat/start fields are optional. Version any future breaking protocol change and coordinate it before rollout.
 
-Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game catalog fields. Do not couple UI code to `pokerkit_factory`, PokerKit class names, PokerKit operation records, or engine state objects; those are implementation details and the catalog will become first-party. Never read raw Firestore hand audit documents from the client.
+Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game catalog fields. Do not couple UI code to engine event records or state objects. Never read raw Firestore hand audit documents from the client.
 
 ## Wait For Backend Support
 

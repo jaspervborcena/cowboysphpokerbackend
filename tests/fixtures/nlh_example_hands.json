@@ -1,0 +1,66 @@
+[
+	{
+		"name": "wheel-straight-beats-trip-kings",
+		"board": ["2c", "3d", "4h", "Ks", "Kd"],
+		"players": [
+			{"player_id": "alice", "hole_cards": ["Ah", "5s"], "contribution": 50},
+			{"player_id": "bob", "hole_cards": ["Kh", "Qh"], "contribution": 50}
+		],
+		"folded_player_ids": [],
+		"odd_chip_order": ["bob", "alice"],
+		"expected_ranks": {
+			"alice": {"category": "STRAIGHT", "tiebreakers": [5]},
+			"bob": {"category": "THREE_OF_A_KIND", "tiebreakers": [13, 12, 4]}
+		},
+		"expected_pots": [
+			{"amount": 100, "eligible_player_ids": ["alice", "bob"]}
+		],
+		"expected_uncalled_returns": {},
+		"expected_awards": {"alice": 100}
+	},
+	{
+		"name": "board-royal-flush-tie-splits-odd-chip",
+		"board": ["As", "Ks", "Qs", "Js", "Ts"],
+		"players": [
+			{"player_id": "alice", "hole_cards": ["2c", "3c"], "contribution": 5},
+			{"player_id": "bob", "hole_cards": ["4c", "5c"], "contribution": 5},
+			{"player_id": "carol", "hole_cards": ["6c", "7c"], "contribution": 1}
+		],
+		"folded_player_ids": ["carol"],
+		"odd_chip_order": ["bob", "alice", "carol"],
+		"expected_ranks": {
+			"alice": {"category": "STRAIGHT_FLUSH", "tiebreakers": [14]},
+			"bob": {"category": "STRAIGHT_FLUSH", "tiebreakers": [14]},
+			"carol": {"category": "STRAIGHT_FLUSH", "tiebreakers": [14]}
+		},
+		"expected_pots": [
+			{"amount": 11, "eligible_player_ids": ["alice", "bob"]}
+		],
+		"expected_uncalled_returns": {},
+		"expected_awards": {"bob": 6, "alice": 5}
+	},
+	{
+		"name": "folded-contribution-side-pot-and-uncalled-return",
+		"board": ["2c", "3d", "4h", "9s", "Jc"],
+		"players": [
+			{"player_id": "alice", "hole_cards": ["Qh", "Qd"], "contribution": 100},
+			{"player_id": "bob", "hole_cards": ["Kh", "Kd"], "contribution": 60},
+			{"player_id": "carol", "hole_cards": ["Ah", "Ad"], "contribution": 20},
+			{"player_id": "dana", "hole_cards": ["9c", "9d"], "contribution": 40}
+		],
+		"folded_player_ids": ["dana"],
+		"odd_chip_order": ["bob", "carol", "dana", "alice"],
+		"expected_ranks": {
+			"alice": {"category": "ONE_PAIR", "tiebreakers": [12, 11, 9, 4]},
+			"bob": {"category": "ONE_PAIR", "tiebreakers": [13, 11, 9, 4]},
+			"carol": {"category": "ONE_PAIR", "tiebreakers": [14, 11, 9, 4]},
+			"dana": {"category": "THREE_OF_A_KIND", "tiebreakers": [9, 11, 4]}
+		},
+		"expected_pots": [
+			{"amount": 80, "eligible_player_ids": ["alice", "bob", "carol"]},
+			{"amount": 100, "eligible_player_ids": ["alice", "bob"]}
+		],
+		"expected_uncalled_returns": {"alice": 40},
+		"expected_awards": {"carol": 80, "bob": 100}
+	}
+]

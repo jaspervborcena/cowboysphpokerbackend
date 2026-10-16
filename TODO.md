@@ -1,47 +1,53 @@
 # Project TODO
 
-Last reviewed: 2026-10-16
+Last reviewed: 2026-10-17
 
 This list tracks repository work, not just architecture proposals. A completed diagram or document does not mean its runtime components are implemented.
 
 ## Completed in the Repository
 
-- [x] Expose the installed game catalog and mark only verified NLH as create-supported.
+- [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
 - [x] Include `game_id` in table listings, snapshots, create responses, and persisted union table metadata.
 - [x] Add focused tests for catalog accuracy and `game_id` propagation/rejection.
 - [x] Document the current backend, first-party engine target, UI contract, and Firebase/Firestore architecture.
 - [x] Create the selected Firebase/Firestore draw.io architecture and remove the conflicting alternatives.
 - [x] Verify the full test suite after the `game_id` implementation: 55 tests passed.
-- [x] Add independent first-party NLH contracts, card/deck, dealing/privacy projection, hand evaluation, and pot/outcome helper modules with focused tests; these are not yet wired into live tables.
+- [x] Add independent first-party NLH contracts, card/deck, dealing/privacy projection, hand evaluation, and pot/outcome helper modules with focused tests.
+- [x] Route newly created club and union tables through the first-party NLH adapter while preserving table snapshots, replay frames, and hand-audit settlement fields.
+- [x] Complete the first-party NLH live path, entry/straddle options, explicit registry, and PokerKit removal; full suite passes (144 tests).
 - [x] Re-run the full repository test suite after engine-helper work: 111 tests passed.
 
 ## Immediate: First-Party NLH Engine
 
-- [ ] Write reviewed NLH example hands and expected outcomes, including edge cases, as behavioral fixtures.
+- [x] Write reviewed NLH example hands and expected outcomes, including edge cases, as behavioral fixtures.
 - [x] Define framework-independent typed engine contracts for game configuration, player inputs, commands/actions, legal actions, events, outcomes, and state transitions.
 - [x] Implement deterministic test randomness and a cryptographically secure production shuffle source in the first-party deck.
 - [x] Implement the first-party 52-card model, shuffle, draw/burn tracking, and explicit deck exhaustion behavior.
 - [x] Add pure NLH hole-card, flop/turn/river dealing and per-viewer hole-card masking helpers with deterministic tests.
 - [x] Initialize first-party preflop state with button-relative dealing and a player-specific projection that masks unrevealed opponent cards.
-- [ ] Add flop/turn/river state transitions and showdown reveal rules; integrate first-party projections into completed-hand records and live WebSocket snapshots.
-- [ ] Implement NLH state transitions and rules: blinds, turn order, checks, calls, folds, raises, all-ins, street progression, and hand completion.
+- [x] Add first-party flop/turn/river state transitions and showdown reveal rules, including folded-card privacy.
+- [x] Integrate first-party projections into completed-hand records and live WebSocket snapshots when the table runtime switches to the owned engine.
+- [x] Implement NLH state transitions and rules: blinds, turn order, checks, calls, folds, raises, all-ins, street progression, and hand completion.
+- [x] Add no-buy-the-button new-player entry rules: natural small-blind entry, wait for the big blind, or accept a live big-blind post.
+- [x] Add one live UTG straddle for ring games; keep tournament-mode hands on separate no-straddle rules.
 - [x] Implement a first-party NLH high-hand evaluator for five-to-seven cards with category and kicker ordering, including wheel straights; cover it with deterministic golden tests.
 - [x] Implement pure NLH main/side-pot construction, folded-player eligibility, uncalled returns, odd-chip tie splitting, and gross award calculation with chip-conservation tests.
-- [ ] Add unit, property-based, and simulation tests for legal/illegal actions, unique cards, side pots, ties, chip conservation, and reproducible failures.
-- [ ] Integrate the owned engine with the existing table runtime without moving networking or Firestore I/O into the engine.
-- [ ] Verify existing snapshots, replay privacy, hand audits, and idempotent Firestore settlement against the new engine.
-- [ ] Replace PokerKit-based catalog and tests with the explicit first-party registry.
-- [ ] Remove PokerKit imports and the `requirements.txt` dependency only after a repository-wide search and full test suite pass without PokerKit.
+- [x] Add unit, property-based, and simulation tests for legal/illegal actions, unique cards, side pots, ties, chip conservation, and reproducible failures.
+- [x] Integrate the owned engine with the existing table runtime without moving networking or Firestore I/O into the engine.
+- [x] Verify snapshots, replay privacy, hand audits, action idempotency, and in-process settlement behavior against the new engine.
+- [x] Replace the PokerKit-based catalog and tests with the explicit first-party registry.
+- [x] Remove PokerKit imports and the `requirements.txt` dependency after a repository-wide search and full test suite pass without PokerKit.
+- [ ] Verify idempotent Firestore settlement with the Firestore emulator before production rollout. Firebase CLI requires JDK 21; the current environment's Java runtime is older.
 
 ## UI: Can Proceed Now
 
 - [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
 - [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
-- [ ] Keep the client engine-agnostic: do not calculate outcomes, alter balances, expose hidden cards, or depend on PokerKit fields.
+- [ ] Keep the client engine-agnostic: do not calculate outcomes, alter balances, expose hidden cards, or depend on engine internals.
 - [ ] Keep the selectable game list limited to entries with `create_supported: true`; currently this is NLH only.
 
-The UI can proceed in parallel with the engine rewrite as long as the current REST, WebSocket, snapshot, and replay contracts remain stable. Coordinate and version any breaking contract changes before rollout. The frontend source is not in this backend repository.
+The UI can proceed against the stable REST, WebSocket, snapshot, and replay contracts. Coordinate and version any breaking contract changes before rollout. The frontend source is not in this backend repository.
 
 ## Before Multi-Worker Live Tables
 

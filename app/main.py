@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
@@ -41,7 +41,6 @@ from app.auth.roles import (
     require_union_admin,
     verify_id_token,
 )
-from base_poker_game import BasePokerGame
 from database import (
     BuyInStatus,
     FirestoreRequiredError,
@@ -51,13 +50,14 @@ from database import (
 )
 from logic.auth import FirebaseTokenVerifier
 from logic.connections import ConnectionManager
+from logic.first_party_table import FirstPartyNLHGame
 from logic.game_catalog import (
-    POKERKIT_VERSION,
     SUPPORTED_GAME_ID,
     get_game_catalog,
     is_game_create_supported,
 )
 from logic.runtime import ActionIdempotencyConflict, TableRuntime
+from logic.table_game_base import TableGameBase
 from logic.websocket_protocol import (
     MalformedWebSocketMessage,
     PROTOCOL_VERSION,
@@ -81,6 +81,11 @@ class SeatPlayerRequest(BaseModel):
     seat_index: int = Field(ge=0)
     buy_in_amount: int = Field(gt=0, strict=True)
     buy_in_id: UUID
+    accept_big_blind_post: bool = False
+
+
+class StartHandRequest(BaseModel):
+    straddle_player_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ClubWalletTransferRequest(BaseModel):
@@ -140,15 +145,11 @@ class GameCatalogEntry(BaseModel):
     game_id: str
     display_name: str
     category: str
-    pokerkit_factory: str
-    pokerkit_available: bool
-    backend_status: Literal["supported", "mock"]
+    backend_status: str
     create_supported: bool
-    mock_reason: str | None
 
 
 class GameCatalogResponse(BaseModel):
-    pokerkit_version: str
     active_game_id: str
     games: list[GameCatalogEntry]
 
@@ -284,7 +285,7 @@ def union_table_key(union_id: str, table_id: str) -> tuple[str, str]:
     return (f"union:{union_id}", table_id)
 
 
-def table_lobby_entry(game: BasePokerGame) -> dict[str, Any]:
+def table_lobby_entry(game: TableGameBase) -> dict[str, Any]:
     return {
         "table_id": game.table_id,
         "game_id": game.game_id,
@@ -311,7 +312,6 @@ async def health() -> dict[str, str]:
 @app.get("/games", response_model=GameCatalogResponse)
 async def list_games() -> GameCatalogResponse:
     return GameCatalogResponse(
-        pokerkit_version=POKERKIT_VERSION,
         active_game_id=SUPPORTED_GAME_ID,
         games=get_game_catalog(),
     )
@@ -724,7 +724,7 @@ async def create_table(
     game_id = requested_game_id(request.game_id)
     seat_capacity = requested_table_size(request.table_size)
     try:
-        game = BasePokerGame(
+        game = FirstPartyNLHGame(
             table_id,
             request.small_blind,
             request.big_blind,
@@ -771,7 +771,7 @@ async def create_union_table(
 
     seat_capacity = requested_table_size(request.table_size)
     try:
-        game = BasePokerGame(
+        game = FirstPartyNLHGame(
             table_id,
             request.small_blind,
             request.big_blind,
@@ -934,6 +934,7 @@ async def seat_player(
             request.buy_in_amount,
             buy_in_id,
             club_id=club_id,
+            accept_big_blind_post=request.accept_big_blind_post,
         )
         if not seated:
             raise HTTPException(
@@ -1015,6 +1016,7 @@ async def seat_union_player(
             request.buy_in_amount,
             buy_in_id,
             club_id=club_id,
+            accept_big_blind_post=request.accept_big_blind_post,
         ):
             raise HTTPException(status_code=500, detail="Buy-in was reserved but union seat could not be assigned.")
         return runtime.game.get_masked_state_for_player(user_id)
@@ -1024,12 +1026,17 @@ async def seat_union_player(
 async def start_hand(
     club_id: str,
     table_id: str,
+    request: StartHandRequest = StartHandRequest(),
     membership: ClubMembership = Depends(
         require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
     ),
 ) -> dict[str, Any]:
     runtime = get_table(club_id, table_id)
-    if not await runtime.start_hand():
+    try:
+        started = await runtime.start_hand(request.straddle_player_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if not started:
         raise HTTPException(status_code=409, detail="A hand needs at least two seated players and no hand may be running.")
     return runtime.game.get_masked_state_for_player("")
 
@@ -1038,12 +1045,17 @@ async def start_hand(
 async def start_union_hand(
     union_id: str,
     table_id: str,
+    request: StartHandRequest = StartHandRequest(),
     membership: UnionMembership = Depends(require_union_admin()),
 ) -> dict[str, Any]:
     runtime = tables.get(union_table_key(union_id, table_id))
     if runtime is None:
         raise HTTPException(status_code=404, detail="Union table not found.")
-    if not await runtime.start_hand():
+    try:
+        started = await runtime.start_hand(request.straddle_player_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if not started:
         raise HTTPException(status_code=409, detail="A hand needs at least two seated players and no hand may be running.")
     return runtime.game.get_masked_state_for_player("")
 

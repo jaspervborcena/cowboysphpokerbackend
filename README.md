@@ -1,6 +1,6 @@
 # Cowboys PH Poker Backend
 
-Python 3.11+ backend starter built with FastAPI, PokerKit, WebSockets, and optional Google Cloud Firestore persistence.
+Python 3.11+ backend built with FastAPI, first-party NLH logic, WebSockets, and optional Google Cloud Firestore persistence.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ The live poker game protocol is websocket-first. Client actions, table state sna
 
 The Google Cloud libraries in this repo use gRPC under the hood for Firebase and Firestore integration, but the actual game communication at the app layer is websocket-based. Keep the realtime table transport on WebSocket and treat Firestore/Firebase as infrastructure services rather than the live game protocol.
 
-The selected production target is the Firebase/Firestore design in [GAME_SERVER_FIREBASE_ARCHITECTURE.drawio](GAME_SERVER_FIREBASE_ARCHITECTURE.drawio). The target game engine will be first-party code; the current NLH runtime still uses PokerKit and has not yet been replaced.
+The selected production target is the Firebase/Firestore design in [GAME_SERVER_FIREBASE_ARCHITECTURE.drawio](GAME_SERVER_FIREBASE_ARCHITECTURE.drawio). Live NLH tables use the first-party engine through `logic/first_party_table.py`; PokerKit is no longer a runtime or test dependency.
 
 ## Economy Tiers
 
@@ -17,14 +17,15 @@ The target has separate wallet accounts for platform/global play-money, the club
 ## Project Layout
 
 ```text
-base_poker_game.py       Current table and PokerKit-backed NLH behavior (transitional)
+logic/table_game_base.py    Shared table metadata, seats, and accounting
+logic/first_party_table.py  Live adapter for the first-party NLH engine
 database/                Hand-history and chip-ledger persistence
 logic/                   WebSocket connections and table runtime orchestration
 app/main.py              FastAPI app, REST routes, and WebSocket endpoint
 tests/                   Engine and API integration tests
 ```
 
-`BasePokerGame` is at the project root as requested. `database` owns persistence, `logic` owns live table coordination, and `app/main.py` wires those pieces to the API.
+`database` owns persistence, `logic` owns live table coordination and game state, and `app/main.py` wires those pieces to the API.
 
 The current WebSocket lifecycle, legacy and v1 message examples, and union-table behavior are documented in [websocket.md](websocket.md).
 The UI workflow, Firebase session handling, role-aware screens, v1 socket messages, retries, heartbeats, and error display guidance are in [UI_GUIDE.md](UI_GUIDE.md).
@@ -57,7 +58,7 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 ## Completed
 
 - FastAPI health check and routes to create tables, seat players, and start hands.
-- PokerKit-backed no-limit Texas Hold'em with server-side turn checking and legal action validation.
+- First-party no-limit Texas Hold'em with server-side turn checking, legal action validation, side pots, and settlement outcomes.
 - Per-player WebSocket state with opponents' private hole cards masked.
 - Opt-in v1 WebSocket envelopes for auth, player actions, pre-actions, errors, and snapshots; legacy socket messages remain supported.
 - Firebase ID-token verification and active club membership checks, with role-gated table creation and hand starts.
@@ -76,9 +77,9 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 
 ## Game Engine Direction
 
-The current backend runs **No-Limit Texas Hold'em only**, using PokerKit from `base_poker_game.py`. The optional `game_id` and `/games` catalog are API scaffolding; they do not mean the other listed library games are playable.
+The current backend runs **No-Limit Texas Hold'em only**, using the first-party engine. The explicit `/games` registry lists only implemented, create-supported games.
 
-**Decision:** replace PokerKit with a first-party game engine that we can maintain and debug. Do not copy PokerKit source. Implement rules from written game specifications and independently tested examples. The target has no PokerKit runtime dependency. Until replacement is complete and verified, the existing engine and `requirements.txt` still depend on PokerKit.
+**Decision:** use a first-party game engine that we can maintain and debug. No PokerKit source is copied or imported, and it is not a project dependency.
 
 | Priority | First-party game scope | Notes |
 | --- | --- | --- |
@@ -87,11 +88,11 @@ The current backend runs **No-Limit Texas Hold'em only**, using PokerKit from `b
 | 3 | Tongits | Build as an independent engine with its own state, actions, meld evaluation, and scoring; do not force it into poker betting abstractions. |
 | Later | Other variants | Add only when selected, specified, implemented, and covered by their own rule and integration tests. |
 
-The current game catalog is tied to PokerKit package metadata. Replace it with an explicit first-party registry that lists only engines this server actually implements and supports for table creation.
+The game catalog is an explicit first-party registry and lists only engines this server implements and supports for table creation.
 
 ## Game Server Responsibilities
 
-The boundaries below are the target design, not a claim that every component already exists. Today, `BasePokerGame` combines table behavior with a PokerKit NLH state. The goal is to move game rules into first-party, pure Python engine modules, independent of FastAPI, WebSockets, Firebase, and Firestore.
+The boundaries below describe the target design. NLH rules live in first-party, pure Python engine modules, independent of FastAPI, WebSockets, Firebase, and Firestore.
 
 | Component | Owns | Must not own |
 | --- | --- | --- |
@@ -120,12 +121,20 @@ For any new variant, verify the complete path: deterministic setup, legal action
 | Identity and access | Firebase ID-token verification, active membership checks, role-gated REST/WebSocket flows | Full route/table policy review, rate limits, production security review, and operational controls |
 | Client transport | FastAPI REST, legacy and v1 WebSocket protocols, player-specific masked snapshots | Cross-process gateway-to-owner routing, durable replay cursor, reconnect event replay, and load-tested delivery/backpressure |
 | Table runtime | In-process table map, per-table `asyncio.Lock`, turn timeout, bounded in-memory action deduplication | Single authoritative worker per table, leases/fencing, durable action IDs/state versions, checkpoint/recovery, timer recovery |
-| Game engine | Live NLH still delegates to PokerKit through `BasePokerGame`. Standalone first-party modules now provide typed contracts, secure/injectable deck, hand evaluator, side-pot/gross-award resolution, preflop state, and player-specific card projection; 56 focused engine-helper tests are included. | Betting/state transitions, street progression, integrated board/reveal lifecycle, reviewed full-hand fixtures, runtime/snapshot/settlement integration, first-party registry, and eventual PokerKit removal |
+| Game engine | Live NLH actions, snapshots, replay frames, entry rules, straddles, and hand outcomes use the first-party engine. Unit, property, simulation, API, and audit tests cover the rules and contracts. | Verify settlement with the Firestore emulator before production rollout |
 | Settlement and economy | Firestore buy-in transactions, hand audits, idempotent hand settlement, club pools, treasury transfers, union clearing | Durable settlement intent/outbox worker, replayable retries, conservation/reconciliation checks, explicit buy-out lifecycle |
 | Persistence | Firestore repositories for current ledgers, audits, and union records | Durable table ownership, event/checkpoint schema, recovery procedures, transaction/contention tests, and a single authority per record type |
 | Operations | Sanitized error codes, trace-linked logs, Docker/Cloud Run setup | Per-table metrics, alerts, load/soak tests, backup/restore drills, safe rollout and rollback |
 
-PokerKit is a **current implementation dependency**, not the target architecture. Remove it from runtime requirements only after the first-party NLH engine has replaced every production import and all API, settlement, audit, replay, and regression tests pass without it. The current `/games` catalog and its tests must also stop importing or introspecting PokerKit before the package can be removed.
+PokerKit is no longer used by the backend. Firestore emulator and production-like transaction verification remain required before enabling real-money settlement.
+
+#### New-Player NLH Entry
+
+The button is not moved to accommodate a joining player. A new player in the small-blind seat is dealt in and posts the natural small blind. Elsewhere they wait for the big blind unless they explicitly accept a live big-blind post at seating; the consent is cleared once they enter a hand. A waiting player may occupy the button seat without being dealt, and the button remains there.
+
+#### Straddle Mode Rules
+
+Ring-game hand starts may specify one straddler: the player immediately after the big blind posts `2 * big_blind`. Preflop action starts after the straddler and the minimum raise increment becomes `2 * big_blind`. Short straddles, heads-up straddles, and tournament-mode straddles are rejected. Tournament gameplay is not implemented.
 
 ### First-Party NLH Replacement Plan
 
@@ -134,7 +143,7 @@ PokerKit is a **current implementation dependency**, not the target architecture
 3. Implement the NLH core as pure game logic: card/deck model, shuffle/deal/burn, betting and turn transitions, hand ranking, main/side-pot eligibility, tie splitting, and gross awards. Keep treasury policy and Firestore writes outside the engine.
 4. Add deterministic unit, property-based, and simulation tests for card uniqueness, legal/illegal actions, all-ins, side pots, ties, chip conservation, and reproducible failures.
 5. Integrate the owned engine behind the table runtime while preserving authorization, snapshots, settlement idempotency, and replay privacy. Do not run two engines as competing authorities for live money state.
-6. Replace the PokerKit-based game catalog with the explicit owned registry. Remove PokerKit imports and the package requirement only after a repository-wide search and full test run confirm the runtime and tests no longer need it.
+6. Verify idempotent Firestore settlement, audit records, and retries with the emulator before production rollout.
 7. Stabilize own-engine NLH before starting PLO variants or the separate Tongits engine. Keep those variants unavailable until each has complete rules, evaluation, settlement, replay, and security tests.
 
 The Firebase diagram describes the production target, not a two-week capacity guarantee. For an initial test deployment, keep the game scope to NLH and validate the engine and Firebase transaction behavior before claiming multi-worker or 1,000–10,000-player readiness.
@@ -241,30 +250,20 @@ The following is a gap list, not functionality already present. The app is suita
 
 - **Table and seat lifecycle:** local/union table listing and union table closure exist, but add sit-out/sit-in, leave-seat, rebuy/top-up, cash-out, and host/dealer controls. Local club table metadata and all live table state remain in memory.
 - **WebSocket reliability:** Firebase-first authentication, route-validated v1 topics, standardized numeric error responses, heartbeat PING/PONG, and idle cleanup are implemented; legacy messages remain supported. The UI still needs to adopt v1 and send action IDs. Action deduplication is only bounded process memory, so durable idempotency, bounded send queues, and load-tested backpressure behavior remain. Reconnects authenticate again and receive a full snapshot; no snapshot sequence/version or incremental-delta recovery exists.
-- **Game-state edge cases:** define and test all-in, side-pot, showdown, disconnected-player, timeout, and hand-end behavior. Current automatic timeout checks when possible and otherwise folds; there is no configurable sit-out or disconnect policy.
+- **Game-state edge cases:** all-ins, side pots, showdowns, timeouts, and hand-end conservation are covered by the first-party NLH tests. Configurable sit-out, disconnect policy, and process-restart recovery remain open.
 - **Firestore metadata and operations:** define schema versions/timestamps for local tables, provision union/admin/club membership documents, configure access rules/indexes, and test transactions with the Firestore emulator. The repository does not initialize member balances or recover live game state.
 
 ### P2: Production readiness and extensibility
 
 - **Broader test coverage:** add tests for legal/illegal raise sizing, calls/checks, all-ins and side pots, timeout decisions, duplicate/stale actions, failed/retried settlement, chip conservation, and restart recovery. WebSocket tests now cover legacy compatibility, v1 envelopes, union players from different clubs, topic mismatch rejection, and per-player card masking; performance, chat-isolation, and multi-worker behavior remain untested.
-- **First-party game engine:** the current NLH engine imports PokerKit directly. Implement and verify the owned NLH rules/state/evaluation/outcome path, replace the PokerKit-backed catalog, then remove the dependency. Do not enable PLO or Tongits from catalog metadata alone.
+- **First-party game engine:** NLH rules, runtime integration, catalog, and dependency migration are complete. Verify Firestore settlement with the emulator before production rollout. Do not enable PLO or Tongits from catalog metadata alone.
 - **Operations:** add structured logs, metrics/tracing, readiness checks, rate limits, validated environment settings, secret handling, CI, and deployment/rollback checks. Set `CORS_ALLOWED_ORIGINS` to the exact production frontend origins.
 
-## Current Work Plan
+### Current Work Plan
 
-### Now
-
-- Continue UI implementation against the current REST and WebSocket contracts. Keep the frontend game-engine agnostic, offer NLH only, and do not connect the UI to Pub/Sub.
-- For Firebase/Firestore live-table testing, run one backend instance. Pub/Sub is not needed while the gateway and table runtime are in the same process.
-- Freeze the current NLH API, snapshot, replay, and settlement contracts; prepare reviewed expected outcomes for the first-party engine to match.
-
-### Next: First-Party NLH
-
-1. Define typed engine contracts for configuration, state, actions, legal actions, events, outcomes, and errors; inject deterministic randomness in tests and secure randomness in production.
-2. Implement the pure-Python NLH core: card/deck model, shuffle/deal/burn, betting and turn transitions, hand ranking, side-pot eligibility, tie splitting, and gross outcomes.
-3. Add deterministic, property-based, and simulation tests for legal/illegal actions, unique cards, all-ins, side pots, ties, chip conservation, and reproducible failures.
-4. Integrate the owned engine into the existing runtime and verify snapshots, replay privacy, and idempotent Firestore settlement without engine I/O.
-5. Replace the PokerKit-based catalog and tests; remove PokerKit imports and the package only after repository-wide checks and the full test suite pass without it.
+- Verify idempotent hand settlement and audit fields with the Firestore emulator, including retries and uncalled returns.
+- Continue UI implementation against the stable REST and WebSocket contracts. Keep the frontend game-engine agnostic, offer NLH only, and do not connect the UI to Pub/Sub.
+- For live-table testing, run one backend instance until durable table ownership and recovery exist.
 
 ### Before Multi-Worker Runtime
 

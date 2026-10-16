@@ -12,11 +12,17 @@ StateT = TypeVar("StateT")
 NLH_GAME_ID = "no_limit_texas_holdem"
 
 
+class PokerGameMode(str, Enum):
+    RING = "RING"
+    TOURNAMENT = "TOURNAMENT"
+
+
 class PokerActionKind(str, Enum):
     FOLD = "FOLD"
     CHECK = "CHECK"
     CALL = "CALL"
     RAISE = "RAISE"
+    ALL_IN = "ALL_IN"
 
 
 class PokerEventKind(str, Enum):
@@ -24,6 +30,12 @@ class PokerEventKind(str, Enum):
     PLAYER_CHECKED = "PLAYER_CHECKED"
     PLAYER_CALLED = "PLAYER_CALLED"
     PLAYER_RAISED = "PLAYER_RAISED"
+    PLAYER_WENT_ALL_IN = "PLAYER_WENT_ALL_IN"
+    SMALL_BLIND_POSTED = "SMALL_BLIND_POSTED"
+    BIG_BLIND_POSTED = "BIG_BLIND_POSTED"
+    STRADDLE_POSTED = "STRADDLE_POSTED"
+    NEW_PLAYER_POSTED_BIG_BLIND = "NEW_PLAYER_POSTED_BIG_BLIND"
+    NEW_PLAYER_WAITING_FOR_BIG_BLIND = "NEW_PLAYER_WAITING_FOR_BIG_BLIND"
     CARDS_DEALT = "CARDS_DEALT"
     BOARD_DEALT = "BOARD_DEALT"
     STREET_CHANGED = "STREET_CHANGED"
@@ -36,6 +48,7 @@ class PokerTableConfig:
     small_blind: int
     big_blind: int
     max_seats: int
+    game_mode: PokerGameMode = PokerGameMode.RING
 
     def __post_init__(self) -> None:
         if not self.game_id:
@@ -47,6 +60,8 @@ class PokerTableConfig:
             raise ValueError("Blinds must be positive integer chip amounts.")
         if self.big_blind < self.small_blind:
             raise ValueError("Big blind cannot be smaller than the small blind.")
+        if not isinstance(self.game_mode, PokerGameMode):
+            raise ValueError("Game mode must be a PokerGameMode.")
         if isinstance(self.max_seats, bool) or not isinstance(self.max_seats, int) or self.max_seats < 2:
             raise ValueError("A poker table must support at least two seats.")
 
@@ -57,6 +72,8 @@ class PlayerSeed:
     seat_index: int
     starting_stack: int
     display_name: str | None = None
+    new_to_table: bool = False
+    accept_big_blind_post: bool = False
 
     def __post_init__(self) -> None:
         if not self.player_id:
@@ -67,6 +84,12 @@ class PlayerSeed:
             raise ValueError("Starting stack must be a non-negative integer.")
         if self.display_name is not None and not self.display_name:
             raise ValueError("Display name must be non-empty when supplied.")
+        if not isinstance(self.new_to_table, bool) or not isinstance(
+            self.accept_big_blind_post, bool
+        ):
+            raise ValueError("New-player entry flags must be booleans.")
+        if self.accept_big_blind_post and not self.new_to_table:
+            raise ValueError("Only a new player can accept an entry post.")
 
 
 @dataclass(frozen=True)
@@ -149,6 +172,10 @@ class PokerEngine(Protocol[StateT]):
         config: PokerTableConfig,
         players: Sequence[PlayerSeed],
         *,
+        table_id: str,
+        hand_id: str,
+        button_seat: int,
+        straddle_player_id: str | None = None,
         shuffle_source: ShuffleSource,
     ) -> StateT: ...
 

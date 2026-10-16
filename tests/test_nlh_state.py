@@ -1,10 +1,13 @@
 import pytest
+from dataclasses import replace
 
 from game_engine import (
     Deck,
     NLHStreet,
     PlayerSeed,
     PokerTableConfig,
+    advance_nlh_street,
+    begin_nlh_showdown,
     initialize_nlh_hand,
     project_player_hand_state,
 )
@@ -78,6 +81,78 @@ def test_public_reveal_is_visible_to_opponents_after_state_update() -> None:
     alice_view = next(player for player in view["players"] if player["user_id"] == "alice")
     alice_state = next(player for player in state.players if player.player_id == "alice")
     assert alice_view["hole_cards"] == [card.code for card in alice_state.hole_cards]
+
+
+def test_street_advancement_deals_flop_turn_and_river_in_order() -> None:
+    deck = Deck.for_testing(37)
+    state = initialize_nlh_hand(
+        "table-a",
+        "hand-streets",
+        make_config(),
+        (PlayerSeed("alice", 1, 500), PlayerSeed("bob", 4, 500)),
+        button_seat=1,
+        deck=deck,
+    )
+
+    state = advance_nlh_street(state)
+    assert state.street is NLHStreet.FLOP
+    assert len(state.community_cards) == 3
+    assert len(deck.burned_cards) == 1
+
+    state = advance_nlh_street(state)
+    assert state.street is NLHStreet.TURN
+    assert len(state.community_cards) == 4
+    assert len(deck.burned_cards) == 2
+
+    state = advance_nlh_street(state)
+    assert state.street is NLHStreet.RIVER
+    assert len(state.community_cards) == 5
+    assert len(deck.burned_cards) == 3
+    assert len(set((*state.community_cards, *(card for player in state.players for card in player.hole_cards), *deck.burned_cards))) == 12
+
+    with pytest.raises(ValueError, match="Only preflop, flop, and turn"):
+        advance_nlh_street(state)
+
+
+def test_showdown_reveals_live_players_but_keeps_folded_cards_hidden() -> None:
+    state = initialize_nlh_hand(
+        "table-a",
+        "hand-showdown",
+        make_config(),
+        (
+            PlayerSeed("alice", 1, 500),
+            PlayerSeed("bob", 3, 500),
+            PlayerSeed("carol", 4, 500),
+        ),
+        button_seat=1,
+        deck=Deck.for_testing(38),
+    )
+    state = advance_nlh_street(advance_nlh_street(advance_nlh_street(state)))
+    state = replace(
+        state,
+        players=tuple(
+            replace(player, folded=player.player_id == "bob")
+            for player in state.players
+        ),
+    )
+
+    with pytest.raises(ValueError, match="fully dealt river board"):
+        begin_nlh_showdown(initialize_nlh_hand(
+            "table-a",
+            "hand-early-showdown",
+            make_config(),
+            (PlayerSeed("alice", 1, 500), PlayerSeed("bob", 4, 500)),
+            button_seat=1,
+            deck=Deck.for_testing(39),
+        ))
+
+    state = begin_nlh_showdown(state)
+    assert state.street is NLHStreet.SHOWDOWN
+    view = project_player_hand_state(state, "alice")
+    players = {player["user_id"]: player for player in view["players"]}
+    assert players["bob"]["hole_cards"] == ["??", "??"]
+    carol_cards = next(player.hole_cards for player in state.players if player.player_id == "carol")
+    assert players["carol"]["hole_cards"] == [card.code for card in carol_cards]
 
 
 def test_projection_rejects_unseated_viewer_and_reveal_of_unknown_player() -> None:
