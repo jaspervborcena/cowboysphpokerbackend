@@ -17,6 +17,42 @@ Keep poker behavior server-authoritative: render the supplied snapshot and legal
 
 Frontend work can proceed against typed API/WebSocket interfaces and fixture-backed local mocks. Keep transport, DTOs, and screen state separate so engine internals can change without rewriting the UI.
 
+### Wallet UI Work Package (Proposed, No Wallet APIs Yet)
+
+The UI can build the wallet surfaces against local fixtures now; do not read wallet documents directly from Firestore. Use distinct labels and never add balances from different scopes together:
+
+| Surface | Wallet to show | UI behavior |
+| --- | --- | --- |
+| Landing page | `GLOBAL_PLAYMONEY` | Show platform play chips only. Do not show or convert club balances here. |
+| Selected club, player view | `CLUB_PLAYER` | Show available club chips and any in-play/table stack separately. |
+| Selected club, agent tools | `CLUB_AGENT` | Show agent operating balance, assigned downline, and transfer history. |
+| Selected club, owner/manager tools | `CLUB_TREASURY` | Show the club reserve and authorized inter-club transfer history. |
+| Active table | `TABLE_ESCROW` / seat stack | Show the player's stack for this table; do not treat it as another spendable wallet. |
+
+The same person may have both agent and player surfaces in a club; use separate wallet cards/views and balances. The current backend has no separate agent/player wallet accounts or persistent global wallet API, so use mock fixtures until those endpoints and permissions are defined.
+
+Proposed UI mock shape (not a current API response):
+
+```typescript
+type WalletType =
+  | 'GLOBAL_PLAYMONEY'
+  | 'CLUB_TREASURY'
+  | 'CLUB_AGENT'
+  | 'CLUB_PLAYER'
+  | 'TABLE_ESCROW';
+
+interface WalletSummary {
+  wallet_id: string;
+  wallet_type: WalletType;
+  currency_type: 'GLOBAL_PLAYMONEY' | 'CLUB_CHIPS';
+  balance: number;
+  club_id: string | null;
+  owner_user_id: string | null;
+}
+```
+
+Use [`ui-mocks/wallet-dashboard.json`](ui-mocks/wallet-dashboard.json) as the local fixture for these surfaces. It deliberately represents one user with both `AGENT` and `PLAYER` roles and distinct wallet IDs. The `mock_only` marker is intentional: these values are not returned by a live endpoint. `in_play_balance` includes the listed table stack; do not add the table stack to the player's available balance or show it as spendable funds. Keep global play chips visually and functionally separate from all club-chip accounts.
+
 ## Contract Through Engine Replacement
 
 The backend should keep the existing NLH-facing contract stable while replacing PokerKit: REST routes and request/response fields, `game_id`, standardized error codes, the v1 WebSocket envelope and event names, current NLH action payloads, complete `TABLE_SNAPSHOT` behavior, per-player card masking, and the hand replay route. If a breaking protocol change becomes necessary, version it and coordinate it before rollout.
@@ -30,6 +66,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 - Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
+- A landing-page platform/global play-money balance needs its own backend wallet API. Do not display a club treasury or club-member balance as the global wallet; the persistent global wallet is not implemented yet.
 
 ## Session and Permissions
 

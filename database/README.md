@@ -2,6 +2,18 @@
 
 This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed money economy and are separate from the intended platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend; global play-money wallets/tables, local club/table metadata, member initialization, external payouts/refunds, and live table recovery are not implemented. Club wallet cash-in and claim-back are operator-mediated transfers between member balances, not external cash payments.
 
+Target wallet accounts are distinct by purpose:
+
+- `GLOBAL_PLAYMONEY`: a platform-level play-money balance shown on the landing page. It is not fiat/crypto and cannot be converted to club chips.
+- `CLUB_TREASURY`: the shared club reserve controlled by authorized club operators.
+- `CLUB_AGENT`: an agent's operating/distribution balance within one club.
+- `CLUB_PLAYER`: a player's available balance within one club. The same Firebase user may have both `CLUB_AGENT` and `CLUB_PLAYER` accounts in that club.
+- `TABLE_ESCROW`: chips committed to a seat/table while in play. Buy-in moves value from the player's club wallet into the table; cash-out returns it through a recorded transaction.
+
+Each account must have an explicit `wallet_type`, scope, owner, and `currency_type`. Ledger transactions must identify source and destination accounts and balance per currency; never sum or implicitly transfer across global and club currencies. Cached balances may be maintained for reads, but ledger entries and account updates must commit atomically and idempotently.
+
+These are target concepts, not current Firestore paths or implemented APIs. Today Firestore has the club treasury and a single member `chip_balance`/`in_play_balance` pair. It does not yet have separate `CLUB_AGENT`, `CLUB_PLAYER`, or `GLOBAL_PLAYMONEY` accounts. Keep the current-field descriptions below as the existing implementation until the migration is designed and shipped.
+
 ## Collection Layout
 
 ```text
@@ -54,6 +66,8 @@ Path: `clubs/{club_id}/members/{user_id}`
 | `role` | string | One of `OWNER`, `MANAGER`, `AGENT`, or `PLAYER`. `OWNER`, `MANAGER`, and `AGENT` can operate wallet transfers; agents are limited to assigned downline members. |
 | `chip_balance` | integer | Available balance. Buy-in atomically subtracts the requested amount. |
 | `in_play_balance` | integer | Chips currently held at tables. Buy-in adds the amount; hand settlement applies the player's net result here. |
+
+Current limitation: a club member has one `role` and one `chip_balance`/`in_play_balance` pair. Agent send-out and claim-back operate on that same member balance, while table buy-in requires the `PLAYER` role. This does not support one Firebase identity acting as both an agent and a player with separate wallets. The target model requires separately scoped agent-operating and personal-player accounts, explicit transfer rules, and distinct audit/idempotency records; do not treat the current member balance as both wallets.
 
 ### Buy-in transaction and seat reservation
 
