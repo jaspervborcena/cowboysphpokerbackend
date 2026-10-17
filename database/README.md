@@ -29,18 +29,26 @@ clubs/{club_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
+    runtime/state
+      actions/{action_hash}
+    runtime/lease
 unions/{union_id}
   admins/{user_id}
   clubs/{club_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
+    runtime/state
+      actions/{action_hash}
+    runtime/lease
   settlements/{YYYY-MM-DD}
     clubs/{club_id}
     hands/{hand_id}
 ```
 
 `clubs`, `members`, `tables`, and `hands` are Firestore collections/subcollections. The `{...}` portions are document IDs, not literal field values.
+
+The repository provides Firestore transaction operations for `tables/{table_id}/runtime/state`, its `actions/{action_hash}` journal, and `tables/{table_id}/runtime/lease`. Checkpoints carry a schema version, sequence, owner ID, fencing epoch, and serialized state. Lease records carry owner, fencing generation, expiry, heartbeat, and status. These operations are unit-tested but are not called by table creation or `TableRuntime`; live table state and ownership remain process-local, and these documents may not exist for a running table.
 
 ## Fields Written by the Backend
 

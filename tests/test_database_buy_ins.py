@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -9,6 +10,8 @@ from database import (
     BuyInStatus,
     FirestoreHandRepository,
     TableActionCommitStatus,
+    TableLeaseConflictError,
+    TableLeaseExpiredError,
     WalletTransactionStatus,
     table_action_fingerprint,
 )
@@ -240,6 +243,63 @@ def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
     assert client.documents[state_path]["owner_id"] == "worker-a"
     assert client.documents[state_path]["fencing_epoch"] == 1
     assert repository.get_table_checkpoint("club", "club-1", "table-1")["checkpoint"] == checkpoint
+
+
+def test_table_lease_is_durable_fenced_and_reclaimable(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    initial = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-lease"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-1", "table-lease", "worker-a", 1, checkpoint
+    )
+
+    first = repository.claim_table_lease(
+        "club", "club-1", "table-lease", "worker-a", 30, now=initial
+    )
+    with pytest.raises(TableLeaseConflictError):
+        repository.claim_table_lease(
+            "club", "club-1", "table-lease", "worker-b", 30,
+            now=initial + timedelta(seconds=1),
+        )
+
+    second = repository.claim_table_lease(
+        "club", "club-1", "table-lease", "worker-b", 30,
+        now=initial + timedelta(seconds=31),
+    )
+    state = repository.get_table_checkpoint("club", "club-1", "table-lease")
+    assert first["fencing_generation"] == 1
+    assert second["fencing_generation"] == 2
+    assert state["owner_id"] == "worker-b"
+    assert state["fencing_epoch"] == 2
+
+    with pytest.raises(TableLeaseConflictError):
+        repository.authorize_table_lease(
+            "club", "club-1", "table-lease", "worker-a", 1,
+            now=initial + timedelta(seconds=32),
+        )
+    with pytest.raises(TableLeaseExpiredError):
+        repository.authorize_table_lease(
+            "club", "club-1", "table-lease", "worker-b", 2,
+            now=initial + timedelta(seconds=62),
+        )
+
+    renewed = repository.renew_table_lease(
+        "club", "club-1", "table-lease", "worker-b", 2, 30,
+        now=initial + timedelta(seconds=32),
+    )
+    assert renewed["lease_expires_at"] == initial + timedelta(seconds=62)
+    assert repository.release_table_lease(
+        "club", "club-1", "table-lease", "worker-b", 2,
+        now=initial + timedelta(seconds=33),
+    ) is True
+
+    third = repository.claim_table_lease(
+        "club", "club-1", "table-lease", "worker-c", 30,
+        now=initial + timedelta(seconds=34),
+    )
+    assert third["fencing_generation"] == 3
 
 
 def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypatch) -> None:

@@ -72,6 +72,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 - Tournament registration, blind-level controls, eliminations, table balancing, and tournament prize views need a separately implemented tournament API and event contract.
 - Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
+- Do not call the game server's `/workers/{worker_id}/...` coordination routes from the client. They are internal, currently unauthenticated, and process-local rather than a production worker control plane.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
 - Reserve-backed initial grants for global wallets and club treasuries are implemented. Platform reserve top-ups, game-earned global chips, and global-play-money tables are not implemented. Do not display a club treasury or club-member balance as the global wallet; user balances remain separate and cannot be converted between wallet types.
 

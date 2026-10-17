@@ -62,7 +62,9 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 ## Before Multi-Worker Live Tables
 
 - [x] Add a Firestore transaction primitive that atomically advances a table checkpoint and records the action fingerprint, guarded by expected sequence and fencing epoch.
-- [ ] Design and implement one authoritative owner per table with durable leases and fencing generations.
+- [x] Add Firestore transaction-backed table lease repository operations for claim, renewal, authorization, and release; preserve fencing generations across expiry and release.
+- [ ] Wire durable leases into runtime ownership, worker claim/heartbeat/release routes, and checkpoint recovery; remove process-local lease state as the ownership source of truth.
+- [ ] Check lease owner, fencing generation, and expiry in the same Firestore transaction that commits each authoritative table mutation; a separate pre-write authorization check is not sufficient.
 - [ ] Wire checkpoint/action transactions into table creation, seating, hand start, player actions, pre-actions, and timeout actions. Stage mutations and publish/acknowledge only after commit; atomically couple buy-in debits with seat/checkpoint updates.
 - [ ] Add protected/encrypted checkpoint storage and turn-deadline recovery.
 - [ ] Add reconnect replay cursors and durable action idempotency.
@@ -84,6 +86,7 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 - [ ] Test cutoff boundaries, delayed/retried expiration jobs, active-hand handling, and recovery when the service is unavailable at the cutoff.
 - [ ] Validate platform club owner UIDs and add request idempotency to prevent duplicate initial grants.
 - [ ] Review authorization for every REST route, WebSocket action, table, union, and administrative operation.
+- [ ] Add service-to-service authentication and trusted ingress restrictions for the currently unauthenticated `/workers/{worker_id}/...` coordination routes; disallow untrusted forced lease reclamation.
 - [ ] Add an idempotent player cash-out request/approval API and define/test seat exit, rebuy/top-up, external payout/refund, and reconciliation before treating club balances as a complete money ledger.
 - [ ] Add Firestore schema versions, access rules/indexes, emulator-backed transaction tests, and backup/restore drills.
 - [ ] Add per-table metrics (mailbox depth, action latency, timer drift, lease renewals), alerts, rate limits, and deployment/rollback checks.
