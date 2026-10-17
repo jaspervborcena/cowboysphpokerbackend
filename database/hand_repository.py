@@ -4,6 +4,7 @@ import hashlib
 import json
 from enum import StrEnum
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from google.cloud import firestore
@@ -72,6 +73,14 @@ class FirestoreRequiredError(RuntimeError):
     pass
 
 
+class TableLeaseConflictError(RuntimeError):
+    pass
+
+
+class TableLeaseExpiredError(RuntimeError):
+    pass
+
+
 class NullHandRepository:
     def recover_pending_settlements(self) -> int:
         return 0
@@ -83,6 +92,61 @@ class NullHandRepository:
         table_id: str,
     ) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load a table checkpoint.")
+
+    def get_table_lease(
+        self, scope_type: str, scope_id: str, table_id: str
+    ) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load a table lease.")
+
+    def claim_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        ttl_seconds: int,
+        *,
+        force_reclaim: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to claim a table lease.")
+
+    def renew_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        ttl_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to renew a table lease.")
+
+    def authorize_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to authorize a table lease.")
+
+    def release_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to release a table lease.")
 
     def initialize_table_checkpoint(
         self,
@@ -271,6 +335,179 @@ class FirestoreHandRepository:
             return None
         return snapshot.to_dict() or {}
 
+    def get_table_lease(
+        self, scope_type: str, scope_id: str, table_id: str
+    ) -> dict[str, Any] | None:
+        snapshot = self._table_runtime_lease_ref(scope_type, scope_id, table_id).get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict() or {}
+
+    def claim_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        ttl_seconds: int,
+        *,
+        force_reclaim: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not worker_id or ttl_seconds < 1:
+            raise ValueError("Worker ID and a positive lease TTL are required.")
+        current_time = now or datetime.now(timezone.utc)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def claim(transaction: Any) -> dict[str, Any]:
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            current = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
+            owner_id = current.get("owner_id")
+            expires_at = current.get("lease_expires_at")
+            active = owner_id is not None and expires_at is not None and expires_at > current_time
+            if active and owner_id == worker_id:
+                return current
+            if active and not force_reclaim:
+                raise TableLeaseConflictError(
+                    f"Table {table_id} is already owned by worker {owner_id}."
+                )
+
+            generation = int(current.get("fencing_generation", 0)) + 1
+            lease = {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": generation,
+                "lease_expires_at": current_time + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current_time,
+                "status": "active",
+            }
+            transaction.set(lease_ref, lease)
+            if state_snapshot.exists:
+                state = state_snapshot.to_dict() or {}
+                transaction.set(
+                    state_ref,
+                    {**state, "owner_id": worker_id, "fencing_epoch": generation},
+                )
+            return lease
+
+        return claim(transaction)
+
+    def renew_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        ttl_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current_time = now or datetime.now(timezone.utc)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def renew(transaction: Any) -> dict[str, Any]:
+            snapshot = lease_ref.get(transaction=transaction)
+            lease = snapshot.to_dict() or {} if snapshot.exists else {}
+            if lease.get("owner_id") != worker_id:
+                raise TableLeaseConflictError(
+                    f"Table {table_id} is not owned by worker {worker_id}."
+                )
+            if lease.get("fencing_generation") != fencing_generation:
+                raise TableLeaseExpiredError(
+                    f"Lease generation mismatch for table {table_id}."
+                )
+            if lease.get("lease_expires_at") is None or lease["lease_expires_at"] <= current_time:
+                raise TableLeaseExpiredError(f"Lease for table {table_id} has expired.")
+            renewed = {
+                **lease,
+                "lease_expires_at": current_time + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current_time,
+            }
+            transaction.set(lease_ref, renewed)
+            return renewed
+
+        return renew(transaction)
+
+    def authorize_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current_time = now or datetime.now(timezone.utc)
+        lease = self.get_table_lease(scope_type, scope_id, table_id)
+        if lease is None:
+            raise TableLeaseExpiredError(f"No active lease exists for table {table_id}.")
+        if lease.get("owner_id") != worker_id:
+            raise TableLeaseConflictError(
+                f"Table {table_id} is not owned by worker {worker_id}."
+            )
+        if lease.get("fencing_generation") != fencing_generation:
+            raise TableLeaseExpiredError(f"Lease generation mismatch for table {table_id}.")
+        if lease.get("lease_expires_at") is None or lease["lease_expires_at"] <= current_time:
+            raise TableLeaseExpiredError(f"Lease for table {table_id} has expired.")
+        return lease
+
+    def release_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        current_time = now or datetime.now(timezone.utc)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def release(transaction: Any) -> bool:
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            lease = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
+            if not lease_snapshot.exists or lease.get("owner_id") is None:
+                return False
+            if lease.get("owner_id") != worker_id:
+                raise TableLeaseConflictError(
+                    f"Table {table_id} is not owned by worker {worker_id}."
+                )
+            if lease.get("fencing_generation") != fencing_generation:
+                raise TableLeaseExpiredError(f"Lease generation mismatch for table {table_id}.")
+            if lease.get("lease_expires_at") is None or lease["lease_expires_at"] <= current_time:
+                raise TableLeaseExpiredError(f"Lease for table {table_id} has expired.")
+            transaction.set(
+                lease_ref,
+                {
+                    **lease,
+                    "owner_id": None,
+                    "lease_expires_at": current_time,
+                    "heartbeat_at": current_time,
+                    "status": "released",
+                },
+            )
+            if state_snapshot.exists:
+                state = state_snapshot.to_dict() or {}
+                transaction.set(state_ref, {**state, "owner_id": None})
+            return True
+
+        return release(transaction)
+
     def initialize_table_checkpoint(
         self,
         scope_type: str,
@@ -410,6 +647,23 @@ class FirestoreHandRepository:
             .document(table_id)
             .collection("runtime")
             .document("state")
+        )
+
+    def _table_runtime_lease_ref(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> Any:
+        if scope_type not in {"club", "union"} or not scope_id or not table_id:
+            raise ValueError("Table scope must be club or union and IDs must be non-empty.")
+        root = self._client.collection("clubs" if scope_type == "club" else "unions")
+        return (
+            root.document(scope_id)
+            .collection("tables")
+            .document(table_id)
+            .collection("runtime")
+            .document("lease")
         )
 
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:

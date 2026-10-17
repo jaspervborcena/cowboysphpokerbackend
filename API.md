@@ -23,6 +23,10 @@ WebSocket base URL for the local game server: `ws://127.0.0.1:8000`.
 
 Use the OpenAPI JSON as the source for UI request/response types or client generation. Protected operations use Firebase Bearer authentication and document their response models and standard error responses. The wallet service includes membership/profile, member-wallet summary, global-wallet, club provisioning, club treasury, and member transfer endpoints; it does not expose game-server table or WebSocket operations. The game server keeps its own REST docs at `/docs` on its configured host (locally `http://127.0.0.1:8000/docs`); use that host for table and gameplay REST routes. The wallet service's OpenAPI document describes the currently deployed revision and is updated when that service is redeployed.
 
+### Internal worker coordination
+
+The game server currently exposes `/workers/{worker_id}/start`, `/workers/{worker_id}/tables`, and per-table lease claim, heartbeat, and release routes. These endpoints are not part of the browser client contract: they currently have no service authentication and use a process-local coordinator rather than the Firestore lease repository. Keep them behind trusted internal ingress and do not use them for multi-instance ownership until authentication and runtime integration are implemented.
+
 ## Error Response Standard
 
 All REST errors use the same response shape. Client-facing messages are generic and must not contain exception text, database details, tokens, or stack traces. Match the numeric `code` in the client; use `trace_id` when reporting a problem to support.

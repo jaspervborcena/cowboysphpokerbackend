@@ -15,6 +15,7 @@ from logic.table_ownership import (
     TableRouteManager,
     WorkerCoordinator,
     WorkerCoordinatorRegistry,
+    WorkerFleetScheduler,
     WorkerLeaseSession,
 )
 
@@ -53,6 +54,23 @@ def test_expired_lease_can_be_reclaimed_and_generation_increments() -> None:
     assert first.fencing_generation == 1
     assert second.fencing_generation == 2
     assert second.owner_worker_id == "worker-b"
+
+
+def test_released_lease_generation_is_not_reused() -> None:
+    router = TableRouteManager(ttl_seconds=30, now_factory=_now)
+    first = router.assign_table("table-release", "worker-a")
+
+    assert router.release_table("table-release", "worker-a") is True
+    second = router.assign_table("table-release", "worker-b")
+
+    assert first.fencing_generation == 1
+    assert second.fencing_generation == 2
+    with pytest.raises(LeaseAlreadyHeldError):
+        router.authorize_table_action(
+            "table-release",
+            "worker-a",
+            first.fencing_generation,
+        )
 
 
 def test_renew_lease_requires_matching_worker_and_generation() -> None:
@@ -241,3 +259,22 @@ def test_worker_registry_binds_multiple_tables_and_releases_worker_set() -> None
     assert set(released) == {"table-20", "table-21", "table-22"}
     assert registry.assigned_tables("worker-registry") == []
     assert all(router.current_owner(table_id) is None for table_id in ["table-20", "table-21", "table-22"])
+
+
+def test_worker_fleet_scheduler_assigns_and_heartbeats_a_table_batch() -> None:
+    router = TableRouteManager(ttl_seconds=30, now_factory=_now)
+    scheduler = WorkerFleetScheduler(router)
+
+    leases = scheduler.assign_worker_tables("worker-scheduler", ["table-50", "table-51", "table-52"])
+    assert set(leases) == {"table-50", "table-51", "table-52"}
+    assert all(router.current_owner(table_id) == "worker-scheduler" for table_id in leases)
+
+    refreshed = scheduler.heartbeat_worker("worker-scheduler", ["table-50", "table-51"])
+    assert set(refreshed) == {"table-50", "table-51"}
+    assert all(refreshed[table_id].owner_worker_id == "worker-scheduler" for table_id in refreshed)
+
+    released = scheduler.release_worker_tables("worker-scheduler", ["table-50", "table-52"])
+    assert set(released) == {"table-50", "table-52"}
+    assert router.current_owner("table-50") is None
+    assert router.current_owner("table-52") is None
+    assert set(scheduler.assigned_tables("worker-scheduler")) == {"table-51"}

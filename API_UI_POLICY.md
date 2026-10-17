@@ -48,6 +48,10 @@ For this repository, the policy is:
 - still considered authoritative because it creates the club record, owner membership, and reserve-backed treasury grant
 - must be implemented as an internal server operation even when a UI flow triggers it
 
+### 1.4 Internal worker coordination
+
+The game server's `/workers/{worker_id}/...` coordination routes are not UI-safe. They currently lack service authentication and mutate only process-local worker/lease state. Do not call them from a browser or expose them through public ingress; durable lease repository operations are not yet wired into those routes.
+
 ---
 
 ## 2. Endpoint classification
