@@ -214,7 +214,7 @@ async def get_my_club_wallet_summary(
     "/me/wallets/global-playmoney/ensure",
     tags=["Global wallet"],
     summary="Ensure my global play-money wallet",
-    description="Idempotently creates a wallet for the authenticated user and grants 20,000 chips if no wallet exists. The current implementation does not debit a shared platform reserve.",
+    description="Atomically and idempotently creates a wallet for the authenticated user with a 20,000-chip initial grant debited from the platform reserve.",
     response_model=GlobalWalletEnsureResponse,
     responses={
         401: error_response("Missing or invalid Firebase ID token."),
@@ -289,7 +289,7 @@ async def get_my_global_playmoney_wallet(
     status_code=201,
     tags=["Club provisioning"],
     summary="Create a club",
-    description="Platform-admin operation. Creates an owner membership and funds the club treasury with 10,000 club chips.",
+    description="Platform-admin operation. Atomically creates an owner membership and funds the club treasury with 10,000 club chips debited from the platform reserve.",
     response_model=ClubProvisionResponse,
     responses={
         401: error_response("Missing or invalid Firebase ID token."),

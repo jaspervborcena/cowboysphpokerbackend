@@ -1,18 +1,20 @@
 # Agent 2: Safe / Non-Authoritative Server Layer Guide
 
-This document defines the second agent's boundary inside the game server, not just in the UI. The split applies to the backend itself: the authoritative engine and wallet logic remain the source of truth, while the safe layer exposes read-only or non-authoritative views and façades.
+This document defines the second agent's boundary inside the game server, not just in the UI. The split applies to the backend itself: the authoritative engine and wallet logic remain the source of truth, while the safe layer exposes read-only or derived views and façades.
 
 ## Core rule
+
+The boundary is based on behavior, not file location.
 
 Agent 2 is responsible for the safe, non-authoritative layer.
 
 It may build:
 - read-only projections and summaries
 - server-side lobby / table status views
-- non-authoritative club setup or pre-approval flows
-- read models, dashboards, and operational reporting
+- derived dashboard and ops reporting
+- read models for club, union, and table lists
 - API docs and client-facing contract descriptions
-- safe façade routes that expose derived information without mutating the authoritative state
+- safe façade routes that expose derived information without mutating authoritative state
 
 It must not change:
 - authoritative wallet balance truth
@@ -20,10 +22,13 @@ It must not change:
 - table ownership / leasing
 - table runtime state
 - seat buy-ins or live game actions
-- any server-side accounting that changes authoritative balances
+- authoritative ledger creation or accounting writes
 - checkpoint, failover, or persistence logic for real runtime state
+- any write route that creates or changes real club, wallet, or table state
 
 If a task changes state, money, ownership, or a live game outcome, it belongs to Agent 1.
+
+> File placement alone is not a safe boundary. A router can contain both read-only GETs and authoritative writes; route semantics determine ownership.
 
 ---
 
@@ -40,16 +45,20 @@ Agent 1 is responsible for:
 - server-side validation and persistence
 - failover, checkpoints, and runtime safety
 
+Even inside [app/main.py](app/main.py), this rule still applies: read-only lobby or projection logic may be developed by Agent 2 only when it stays non-authoritative, but every route that mutates money, table ownership, club state, wallet state, or live runtime state remains Agent 1-owned.
+
 ### Agent 2 owns the safe server layer
 
 Agent 2 is responsible for:
 - lobby and table status read models
 - member dashboards and read-only wallet summaries
 - derived projections for UI and ops screens
-- forms that request initial club creation only when explicitly non-authoritative
+- initial club-request or pre-approval flows only when they are explicitly non-authoritative
 - server-side safe façade routes that read aggregated state without mutating it
 - API docs and client-facing contract examples
 - operational reporting, summaries, and monitoring data that are not authoritative
+
+Agent 2 should not claim “safe” status for any route that can create real club state, treasury state, wallet state, or ownership state.
 
 ---
 
@@ -73,16 +82,15 @@ These can be used to populate dashboard screens and UI state, provided they are 
 
 ### 2. Initial non-authoritative club creation
 
-Agent 2 may support flows like:
-- `POST /platform/clubs`
+Agent 2 may support flows like a pre-creation proposal or staging form, but not a route that creates real club state.
 
-only when the task is explicitly limited to:
-- initial club setup
-- pre-approval or proposal creation
-- user-intent capture before authoritative server processing
-- UI-only staging or draft state
+The rule is strict:
+- if the route creates a real club, owner membership, or funded treasury, it is Agent 1-owned
+- if the route only stages intent or draft state, it may be treated as an Agent 2 workflow
 
-This is allowed only if the route is documented as non-authoritative and does not trigger a real balance or treasury mutation.
+Examples:
+- `POST /platform/clubs` is not a safe Agent 2 route when it creates a real club and funded treasury
+- a UI-only “proposal” or “draft club request” can be Agent 2-only if it is explicitly non-authoritative and never writes live funded state
 
 ### 3. Safe façade and projection work
 
@@ -114,6 +122,7 @@ Agent 2 must not do any of the following:
 - claim chips back from a player
 - debit or credit club treasury
 - mutate a wallet balance
+- create or update authoritative accounting rows
 - settle a hand
 - move chips in/out of play
 - assign or revoke table ownership
@@ -121,6 +130,7 @@ Agent 2 must not do any of the following:
 - start or resolve a hand from the client layer
 - bypass the authoritative backend with optimistic writes
 - create accounting logs that represent real money movement
+- expose a write endpoint as “safe” just because it is in a router with read-only GETs
 
 If a task touches any of the above, it must be handed to Agent 1.
 
@@ -132,8 +142,9 @@ Use this rule on every ticket:
 
 - If it changes state, ownership, money, or gameplay -> Agent 1
 - If it reads state, displays data, or prepares a safe user flow -> Agent 2
+- If the route mutates real club, wallet, or table state, it is Agent 1 regardless of file location
 
-If the task is ambiguous, default to Agent 1 until it is explicitly marked as UI-safe and non-authoritative.
+If the task is ambiguous, default to Agent 1 until it is explicitly marked as non-authoritative and safe.
 
 ---
 
@@ -142,11 +153,13 @@ If the task is ambiguous, default to Agent 1 until it is explicitly marked as UI
 ### Allowed
 - Show the current club member role
 - Display table list with status and seat count
-- Render a “request to create club” form
+- Render a “request to create club” draft form
 - Provide a “view-only ledger” with clearly marked informational use
+- Return a read-only lobby projection built from a server GET
 
 ### Not allowed
-- Creating a real treasury transfer
+- Creating a real club record or funded treasury
+- Creating a reserve-backed grant or authoritative wallet write
 - Claiming a stake in a player's balance
 - Setting table lease ownership from a client request
 - Updating chip balances on behalf of the server
@@ -158,21 +171,23 @@ If the task is ambiguous, default to Agent 1 until it is explicitly marked as UI
 ## Merge and handoff rules
 
 1. Agent 2 should not edit authoritative runtime or persistence files.
-2. Agent 1 should not edit UI-only flows unless the purpose is to expose a missing authoritative route.
+2. Agent 1 should own every route that mutates real club, wallet, or table state.
 3. Shared contracts must be reviewed together before merging.
-4. Any route that has write semantics must be assigned to Agent 1 and documented as authoritative.
+4. A route with write semantics is Agent 1-owned even if it sits in a router that also includes GET endpoints.
+5. Documentation must match the actual route behavior, especially for reserve grants and club creation.
 
 ---
 
 ## Recommended boundary for this repo
 
 Safe scope for Agent 2:
-- [app/api](app/api)
-- [API.md](API.md)
-- [UI_GUIDE.md](UI_GUIDE.md)
-- [README.md](README.md)
-- read-only projection or façade modules used by the app and dashboard layer
-- client-side mock or UI implementation files
+- read-only projection modules and summarization endpoints
+- lobby and dashboard read models
+- read-only wallet summary views
+- documentation and contract reconciliation work
+- client-facing examples that are explicitly marked as informational or non-authoritative
+
+Within [app/main.py](app/main.py), Agent 2 may work only on read-only or derived route logic that does not write authoritative state. Any POST/PUT/PATCH/DELETE, lease claim, settlement, wallet debit/credit, or table lifecycle path stays under Agent 1 ownership and must be coordinated before merging.
 
 Authoritative scope for Agent 1:
 - [app/main.py](app/main.py)
@@ -181,12 +196,25 @@ Authoritative scope for Agent 1:
 - [game_engine](game_engine)
 - wallet/accounting logic and settlement flows
 - all mutation paths and persistence entry points
+- club creation, reserve-backed grants, treasury changes, and ownership/lease writes
+
+---
+
+## Agent 2 backlog for this repo
+
+A practical backlog for Agent 2 should be:
+
+- reconcile API/UI docs and examples with actual route behavior, especially reserve grants and club creation
+- confirm which POST routes are authoritative vs non-authoritative
+- add focused contract tests for read-only routes, permissions, and lobby projection fields
+- improve read-only dashboard or lobby projections while keeping them derived from Agent 1-owned state
+- keep UI implementation in the client repo rather than this backend repo
 
 ---
 
 ## Short version
 
-Agent 2 is for safe read-only projections, façade routes, and non-authoritative flows.
-Agent 1 is for money, ownership, gameplay truth, persistence, and runtime mutation.
+Agent 2 is for safe read-only projections, derived summaries, and documentation work.
+Agent 1 is for money, ownership, gameplay truth, persistence, and every real mutation path.
 
-That separation keeps both agents from interfering with each other while preserving a clean authoritative boundary inside the game server itself.
+The important correction is that file boundaries are not the real rule; route behavior and authoritative writes are the real rule.

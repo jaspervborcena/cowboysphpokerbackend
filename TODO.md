@@ -49,7 +49,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 
 - [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
 - [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
-- [ ] After Firebase account creation, show a mock `GLOBAL_PLAYMONEY` wallet with exactly 20,000 chips; no persistent grant API exists yet. Keep it isolated from club chips and do not offer client-controlled grant amounts.
+- [ ] After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to provision the authenticated user's persistent `GLOBAL_PLAYMONEY` wallet with 20,000 chips, then load it with `GET /me/wallets/global-playmoney`. Keep it isolated from club chips and do not offer client-controlled grant amounts.
 - [ ] After club provisioning, display the live 10,000-chip `CLUB_TREASURY` grant from `POST /platform/clubs` and refresh via `GET /clubs/{club_id}/wallet`. The owner membership's personal `chip_balance` currently starts at zero; do not show the treasury grant as personal funds.
 - [ ] For club players, use the live `POST /clubs/{club_id}/wallet/send-out` flow for funding by an authorized owner, manager, or assigned agent. There is no other club-funding path for players.
 - [ ] Mock a player-initiated cash-out request as pending UI state. An authorized owner, manager, or assigned agent can fulfill it with `POST /clubs/{club_id}/wallet/claim-back`; surface the existing restriction that claim-back is unavailable while `in_play_balance` is nonzero. No request/approval API exists yet.

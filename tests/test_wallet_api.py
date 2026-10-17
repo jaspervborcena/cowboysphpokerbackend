@@ -20,8 +20,13 @@ def test_wallet_api_has_no_live_game_routes() -> None:
     ensure_operation = spec["paths"]["/me/wallets/global-playmoney/ensure"]["post"]
     assert ensure_operation["tags"] == ["Global wallet"]
     assert ensure_operation["security"]
+    assert "platform reserve" in ensure_operation["description"].lower()
+    assert "does not debit" not in ensure_operation["description"].lower()
     assert "GlobalWalletEnsureResponse" in spec["components"]["schemas"]
     assert "401" in ensure_operation["responses"]
+
+    create_club_operation = spec["paths"]["/platform/clubs"]["post"]
+    assert "platform reserve" in create_club_operation["description"].lower()
 
 
 def test_wallet_api_health_and_auth_error_contract() -> None:

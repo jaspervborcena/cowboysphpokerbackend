@@ -22,7 +22,7 @@ def create_app() -> FastAPI:
             },
             {
                 "name": "Global wallet",
-                "description": "The signed-in user's global play-money wallet. This version grants 20,000 directly and does not debit a platform reserve.",
+                "description": "The signed-in user's global play-money wallet. Initial 20,000-chip grants are debited atomically from the platform reserve.",
             },
             {
                 "name": "Club wallets",
