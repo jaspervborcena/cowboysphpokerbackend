@@ -101,6 +101,25 @@ def test_first_party_table_passes_big_blind_consent_and_straddle() -> None:
     )
 
 
+def test_first_party_audit_records_uncalled_return_separately_from_awards() -> None:
+    game = FirstPartyNLHGame("uncalled-table", 50, 100, 100, 1000)
+    assert game.add_player(0, "raiser", "Raiser", 500)
+    assert game.add_player(1, "caller", "Caller", 500)
+    assert game.start_new_hand()
+
+    assert game.handle_player_action("raiser", "RAISE", 500)
+    assert game.handle_player_action("caller", "FOLD")
+
+    hand = game.peek_completed_hand()
+    assert hand is not None
+    assert hand["pot_total"] == 200
+    assert hand["uncalled_returns"] == [{"user_id": "raiser", "amount": 400}]
+    assert {player["user_id"]: player["net_delta"] for player in hand["players"]} == {
+        "raiser": 100,
+        "caller": -100,
+    }
+
+
 def test_start_hand_and_mask_opponents_hole_cards() -> None:
     game = make_game()
 

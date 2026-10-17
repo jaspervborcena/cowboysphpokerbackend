@@ -160,6 +160,26 @@ def test_buy_in_debits_balance_reserves_seat_and_is_idempotent(monkeypatch) -> N
     assert client.documents[member_path]["chip_balance"] == 600
 
 
+def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+
+    wallet, created = repository.ensure_global_wallet("new-user")
+    retried_wallet, retried_created = repository.ensure_global_wallet("new-user")
+
+    wallet_path = ("global_wallets", "new-user")
+    grant_path = ("global_wallets", "new-user", "transactions", "initial-grant")
+    assert created is True
+    assert wallet["wallet_type"] == "GLOBAL_PLAYMONEY"
+    assert wallet["currency_type"] == "GLOBAL_PLAYMONEY"
+    assert wallet["chip_balance"] == 20_000
+    assert retried_created is False
+    assert retried_wallet["chip_balance"] == 20_000
+    assert client.documents[wallet_path]["chip_balance"] == 20_000
+    assert client.documents[grant_path]["amount"] == 20_000
+
+
 def test_buy_in_does_not_write_when_balance_is_insufficient(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     member_path = ("clubs", "club-1", "members", "player-1")

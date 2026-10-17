@@ -10,20 +10,19 @@ from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
-from starlette.responses import JSONResponse
 
 from app.api.hand_history import router as hand_history_router
+from app.api.wallets import router as wallet_router
 from app.errors import (
     ERROR_DEFINITIONS,
-    HTTP_STATUS_CODES,
     ErrorCode,
+    HTTP_STATUS_CODES,
     error_body,
+    install_error_handlers,
     log_error,
     new_trace_id,
-    validation_errors,
 )
 from app.auth.roles import (
     AuthenticatedUser,
@@ -44,8 +43,6 @@ from app.auth.roles import (
 from database import (
     BuyInStatus,
     FirestoreRequiredError,
-    INITIAL_CLUB_TREASURY_FUNDS,
-    WalletTransactionStatus,
     create_hand_repository,
 )
 from logic.auth import FirebaseTokenVerifier
@@ -86,25 +83,6 @@ class SeatPlayerRequest(BaseModel):
 
 class StartHandRequest(BaseModel):
     straddle_player_id: str | None = Field(default=None, min_length=1, max_length=128)
-
-
-class ClubWalletTransferRequest(BaseModel):
-    user_id: str = Field(min_length=1, max_length=128)
-    amount: int = Field(gt=0, strict=True)
-    transaction_id: UUID
-    note: str = Field(default="", max_length=500)
-
-
-class ClubTreasuryTransferRequest(BaseModel):
-    destination_club_id: str = Field(min_length=1, max_length=128)
-    amount: int = Field(gt=0, strict=True)
-    transaction_id: UUID
-    note: str = Field(default="", max_length=500)
-
-
-class CreateClubRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    owner_user_id: str = Field(min_length=1, max_length=128)
 
 
 class CreateUnionTableRequest(CreateTableRequest):
@@ -162,66 +140,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Cowboys PH Poker Game Server", lifespan=lifespan)
 error_logger = logging.getLogger("cowboys.errors")
-
-
-@app.exception_handler(HTTPException)
-async def handle_http_error(request: Request, error: HTTPException) -> JSONResponse:
-    code = HTTP_STATUS_CODES.get(error.status_code, ErrorCode.INTERNAL_SERVER_ERROR)
-    trace_id = new_trace_id()
-    level = logging.WARNING if error.status_code < 500 else logging.ERROR
-    log_error(error_logger, code, trace_id, str(error.detail), request, level)
-    definition = ERROR_DEFINITIONS[code]
-    return JSONResponse(
-        status_code=definition.http_status,
-        content=error_body(code, trace_id),
-        headers=error.headers,
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def handle_request_validation_error(
-    request: Request,
-    error: RequestValidationError,
-) -> JSONResponse:
-    validation_items = error.errors()
-    code = (
-        ErrorCode.MISSING_REQUIRED_FIELD
-        if validation_items and all(item.get("type") == "missing" for item in validation_items)
-        else ErrorCode.INVALID_FORMAT
-    )
-    trace_id = new_trace_id()
-    log_error(
-        error_logger,
-        code,
-        trace_id,
-        "Request validation failed: "
-        + str([
-            {"type": item.get("type"), "loc": item.get("loc")}
-            for item in validation_items
-        ]),
-        request,
-        logging.WARNING,
-    )
-    return JSONResponse(
-        status_code=400,
-        content=error_body(code, trace_id, validation_errors(validation_items)),
-    )
-
-
-@app.exception_handler(Exception)
-async def handle_unexpected_error(request: Request, error: Exception) -> JSONResponse:
-    trace_id = new_trace_id()
-    log_error(
-        error_logger,
-        ErrorCode.INTERNAL_SERVER_ERROR,
-        trace_id,
-        error,
-        request,
-    )
-    return JSONResponse(
-        status_code=500,
-        content=error_body(ErrorCode.INTERNAL_SERVER_ERROR, trace_id),
-    )
+install_error_handlers(app)
 
 
 cors_origins = [
@@ -240,6 +159,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(hand_history_router)
+app.include_router(wallet_router)
 connections = ConnectionManager()
 repository = create_hand_repository(os.getenv("FIRESTORE_ENABLED", "false").lower() == "true")
 app.state.repository = repository
@@ -315,206 +235,6 @@ async def list_games() -> GameCatalogResponse:
         active_game_id=SUPPORTED_GAME_ID,
         games=get_game_catalog(),
     )
-
-
-@app.get("/clubs/{club_id}/members/me")
-async def get_my_club_membership(
-    club_id: str,
-    membership: ClubMembership = Depends(get_active_club_member),
-) -> dict[str, str]:
-    profile = membership.profile
-    return {
-        "club_id": club_id,
-        "user_id": membership.user.uid,
-        "username": str(
-            profile.get("username")
-            or membership.user.display_name
-            or membership.user.uid
-        ),
-        "role": membership.role.value,
-    }
-
-
-def wallet_transaction_http_error(status: WalletTransactionStatus) -> HTTPException:
-    if status is WalletTransactionStatus.CLUB_NOT_FOUND:
-        return HTTPException(status_code=404, detail="Source or destination club not found.")
-    if status is WalletTransactionStatus.SAME_CLUB:
-        return HTTPException(status_code=422, detail="A club cannot transfer chips to itself.")
-    if status is WalletTransactionStatus.MEMBER_NOT_FOUND:
-        return HTTPException(status_code=404, detail="Club member account not found.")
-    if status is WalletTransactionStatus.UNAUTHORIZED_OPERATOR:
-        return HTTPException(status_code=403, detail="Only club owners and managers can transfer treasury funds.")
-    if status is WalletTransactionStatus.UNAUTHORIZED_DOWNLINE:
-        return HTTPException(status_code=403, detail="The operator is not authorized for this member.")
-    if status is WalletTransactionStatus.PLAYER_HAS_CHIPS_IN_PLAY:
-        return HTTPException(status_code=409, detail="Claim back is unavailable while the member has chips in play.")
-    if status is WalletTransactionStatus.INSUFFICIENT_BALANCE:
-        return HTTPException(status_code=409, detail="Insufficient available club chip balance.")
-    if status is WalletTransactionStatus.INVALID_BALANCE:
-        return HTTPException(status_code=409, detail="Club wallet balance is invalid.")
-    if status is WalletTransactionStatus.INVALID_AMOUNT:
-        return HTTPException(status_code=422, detail="Transfer amount must be a positive integer.")
-    if status is WalletTransactionStatus.IDEMPOTENCY_CONFLICT:
-        return HTTPException(status_code=409, detail="transaction_id was already used for a different transfer.")
-    return HTTPException(status_code=500, detail="Club wallet transaction could not be completed.")
-
-
-@app.post("/platform/clubs", status_code=201)
-async def create_club(
-    request: CreateClubRequest,
-    platform_admin: AuthenticatedUser = Depends(get_current_user),
-) -> dict[str, Any]:
-    if not platform_admin.platform_admin:
-        raise HTTPException(status_code=403, detail="Platform administrator access is required.")
-
-    club_id = str(uuid4())
-    try:
-        created = await asyncio.to_thread(
-            repository.create_club,
-            club_id,
-            request.name,
-            request.owner_user_id,
-            platform_admin.uid,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club provisioning is unavailable.") from error
-    if not created:
-        raise HTTPException(status_code=409, detail="Club ID already exists; retry the request.")
-    return {
-        "club_id": club_id,
-        "name": request.name,
-        "owner_user_id": request.owner_user_id,
-        "treasury_balance": INITIAL_CLUB_TREASURY_FUNDS,
-    }
-
-
-@app.get("/clubs/{club_id}/wallet")
-async def get_club_wallet(
-    club_id: str,
-    membership: ClubMembership = Depends(
-        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
-    ),
-) -> dict[str, Any]:
-    try:
-        balance = await asyncio.to_thread(repository.get_club_wallet_balance, club_id)
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club wallet is unavailable.") from error
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail="Club wallet balance is invalid.") from error
-    return {"club_id": club_id, "currency_type": "CLUB_CHIPS", "chip_balance": balance}
-
-
-@app.post("/clubs/{club_id}/wallet/transfers")
-async def transfer_between_club_wallets(
-    club_id: str,
-    request: ClubTreasuryTransferRequest,
-    membership: ClubMembership = Depends(
-        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
-    ),
-) -> dict[str, Any]:
-    operator_id = membership.user.uid
-    try:
-        status = await asyncio.to_thread(
-            repository.transfer_between_club_wallets,
-            club_id,
-            request.destination_club_id,
-            operator_id,
-            request.amount,
-            str(request.transaction_id),
-            operator_id,
-            request.note,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club wallet is unavailable.") from error
-    if status not in {
-        WalletTransactionStatus.COMPLETED,
-        WalletTransactionStatus.IDEMPOTENT_REPLAY,
-    }:
-        raise wallet_transaction_http_error(status)
-    return {
-        "transaction_id": str(request.transaction_id),
-        "type": "INTER_CLUB_TRANSFER",
-        "from_club_id": club_id,
-        "to_club_id": request.destination_club_id,
-        "amount": request.amount,
-        "status": status.value,
-    }
-
-
-@app.post("/clubs/{club_id}/wallet/send-out")
-async def send_out_club_chips(
-    club_id: str,
-    request: ClubWalletTransferRequest,
-    membership: ClubMembership = Depends(
-        require_club_role([ClubRole.OWNER, ClubRole.MANAGER, ClubRole.AGENT])
-    ),
-) -> dict[str, Any]:
-    operator_id = membership.user.uid
-    try:
-        status = await asyncio.to_thread(
-            repository.send_out_club_chips,
-            club_id,
-            operator_id,
-            request.user_id,
-            request.amount,
-            str(request.transaction_id),
-            operator_id,
-            request.note,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club wallet is unavailable.") from error
-    if status not in {
-        WalletTransactionStatus.COMPLETED,
-        WalletTransactionStatus.IDEMPOTENT_REPLAY,
-    }:
-        raise wallet_transaction_http_error(status)
-    return {
-        "club_id": club_id,
-        "transaction_id": str(request.transaction_id),
-        "type": "SEND_OUT",
-        "amount": request.amount,
-        "from_user_id": operator_id,
-        "to_user_id": request.user_id,
-        "status": status.value,
-    }
-
-
-@app.post("/clubs/{club_id}/wallet/claim-back")
-async def claim_back_club_chips(
-    club_id: str,
-    request: ClubWalletTransferRequest,
-    membership: ClubMembership = Depends(
-        require_club_role([ClubRole.OWNER, ClubRole.MANAGER, ClubRole.AGENT])
-    ),
-) -> dict[str, Any]:
-    operator_id = membership.user.uid
-    try:
-        status = await asyncio.to_thread(
-            repository.claim_back_club_chips,
-            club_id,
-            request.user_id,
-            operator_id,
-            request.amount,
-            str(request.transaction_id),
-            operator_id,
-            request.note,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club wallet is unavailable.") from error
-    if status not in {
-        WalletTransactionStatus.COMPLETED,
-        WalletTransactionStatus.IDEMPOTENT_REPLAY,
-    }:
-        raise wallet_transaction_http_error(status)
-    return {
-        "club_id": club_id,
-        "transaction_id": str(request.transaction_id),
-        "type": "CLAIM_BACK",
-        "amount": request.amount,
-        "from_user_id": request.user_id,
-        "to_user_id": operator_id,
-        "status": status.value,
-    }
 
 
 @app.get("/clubs/{club_id}/tables")

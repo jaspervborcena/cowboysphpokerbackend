@@ -7,6 +7,7 @@ from google.cloud import firestore
 
 
 INITIAL_CLUB_TREASURY_FUNDS = 10_000
+INITIAL_GLOBAL_PLAYMONEY_FUNDS = 20_000
 
 
 class BuyInStatus(StrEnum):
@@ -42,6 +43,12 @@ class FirestoreRequiredError(RuntimeError):
 class NullHandRepository:
     def recover_pending_settlements(self) -> int:
         return 0
+
+    def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:
+        raise FirestoreRequiredError("Firestore must be enabled to provision a global wallet.")
+
+    def get_global_wallet(self, user_id: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load a global wallet.")
 
     def get_club_wallet_balance(self, club_id: str) -> int:
         raise FirestoreRequiredError("Firestore must be enabled to load the club wallet.")
@@ -185,6 +192,56 @@ class NullHandRepository:
 class FirestoreHandRepository:
     def __init__(self, client: firestore.Client) -> None:
         self._client = client
+
+    def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:
+        wallet_ref = self._client.collection("global_wallets").document(user_id)
+        grant_ref = wallet_ref.collection("transactions").document("initial-grant")
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> tuple[dict[str, Any], bool]:
+            wallet_snapshot = wallet_ref.get(transaction=transaction)
+            if wallet_snapshot.exists:
+                wallet = wallet_snapshot.to_dict() or {}
+                return wallet, False
+
+            wallet = {
+                "wallet_id": f"global-wallet-{user_id}",
+                "wallet_type": "GLOBAL_PLAYMONEY",
+                "currency_type": "GLOBAL_PLAYMONEY",
+                "owner_user_id": user_id,
+                "chip_balance": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
+            }
+            transaction.set(
+                wallet_ref,
+                {
+                    **wallet,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                grant_ref,
+                {
+                    "transaction_id": "initial-grant",
+                    "wallet_type": "GLOBAL_PLAYMONEY",
+                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "type": "INITIAL_GRANT",
+                    "amount": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
+                    "to_user_id": user_id,
+                    "performed_by": "system",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return wallet, True
+
+        return commit(transaction)
+
+    def get_global_wallet(self, user_id: str) -> dict[str, Any] | None:
+        snapshot = self._client.collection("global_wallets").document(user_id).get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict() or {}
 
     def create_club(
         self,

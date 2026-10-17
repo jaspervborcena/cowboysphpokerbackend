@@ -40,9 +40,28 @@ class FakeHandRepository:
         self.interclub_calls: list[tuple[object, ...]] = []
         self.club_wallet_balances: dict[str, int] = {}
         self.created_clubs: list[tuple[str, str, str, str]] = []
+        self.in_play_balances: dict[str, int] = {}
+        self.global_wallets: dict[str, dict[str, object]] = {}
 
     def recover_pending_settlements(self) -> int:
         return 0
+
+    def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, object], bool]:
+        wallet = self.global_wallets.get(user_id)
+        if wallet is not None:
+            return wallet, False
+        wallet = {
+            "wallet_id": f"global-wallet-{user_id}",
+            "wallet_type": "GLOBAL_PLAYMONEY",
+            "currency_type": "GLOBAL_PLAYMONEY",
+            "owner_user_id": user_id,
+            "chip_balance": 20_000,
+        }
+        self.global_wallets[user_id] = wallet
+        return wallet, True
+
+    def get_global_wallet(self, user_id: str) -> dict[str, object] | None:
+        return self.global_wallets.get(user_id)
 
     def create_club(
         self,
@@ -98,13 +117,15 @@ class FakeHandRepository:
         self.wallet_calls.append(("CLAIM_BACK", club_id, player_user_id, recipient_user_id, amount, transaction_id, performed_by, note))
         return WalletTransactionStatus.COMPLETED
 
-    def get_club_member(self, club_id: str, user_id: str) -> dict[str, str] | None:
+    def get_club_member(self, club_id: str, user_id: str) -> dict[str, object] | None:
         if user_id not in self.balances:
             return None
         return {
             "status": "active",
             "role": self.roles.get(user_id, "owner"),
             "username": f"Name {user_id}",
+            "chip_balance": self.balances[user_id],
+            "in_play_balance": self.in_play_balances.get(user_id, 0),
         }
 
     def reserve_buy_in(
@@ -287,6 +308,67 @@ def test_game_catalog_lists_only_first_party_supported_games() -> None:
             "create_supported": True,
         }
     ]
+
+
+def test_global_playmoney_wallet_is_provisioned_once_for_authenticated_user(monkeypatch) -> None:
+    repository = FakeHandRepository({})
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        unauthorized = client.post("/me/wallets/global-playmoney/ensure")
+        first = client.post(
+            "/me/wallets/global-playmoney/ensure",
+            headers={"Authorization": "Bearer valid:wallet-user"},
+        )
+        retry = client.post(
+            "/me/wallets/global-playmoney/ensure",
+            headers={"Authorization": "Bearer valid:wallet-user"},
+        )
+        wallet = client.get(
+            "/me/wallets/global-playmoney",
+            headers={"Authorization": "Bearer valid:wallet-user"},
+        )
+        another_user = client.get(
+            "/me/wallets/global-playmoney",
+            headers={"Authorization": "Bearer valid:other-user"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert first.status_code == 200
+    assert first.json()["created"] is True
+    assert first.json()["balance"] == 20_000
+    assert retry.status_code == 200
+    assert retry.json()["created"] is False
+    assert retry.json()["balance"] == 20_000
+    assert wallet.status_code == 200
+    assert wallet.json()["user_id"] == "wallet-user"
+    assert wallet.json()["currency_type"] == "GLOBAL_PLAYMONEY"
+    assert another_user.status_code == 404
+
+
+def test_member_wallet_summary_separates_available_and_in_play_chips(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"wallet-player": 14_600},
+        {"wallet-player": "PLAYER"},
+    )
+    repository.in_play_balances["wallet-player"] = 1_200
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/clubs/wallet-club/members/me/wallet",
+            headers={"Authorization": "Bearer valid:wallet-player"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "club_id": "wallet-club",
+        "user_id": "wallet-player",
+        "role": "PLAYER",
+        "currency_type": "CLUB_CHIPS",
+        "available_balance": 14_600,
+        "in_play_balance": 1_200,
+    }
 
 
 def test_live_nlh_entry_consent_and_straddle_options(monkeypatch) -> None:

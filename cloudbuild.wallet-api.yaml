@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.wallet-api
+      - -t
+      - asia-east1-docker.pkg.dev/$PROJECT_ID/poker-services/wallet-api:latest
+      - .
+images:
+  - asia-east1-docker.pkg.dev/$PROJECT_ID/poker-services/wallet-api:latest

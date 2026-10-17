@@ -9,7 +9,9 @@ from enum import IntEnum
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.responses import JSONResponse
 
 
 class ErrorCode(IntEnum):
@@ -174,3 +176,64 @@ def log_error(
             "client_ip": request.client.host if request.client else None,
         }
     logger.log(level, json.dumps(record, separators=(",", ":")))
+
+
+def install_error_handlers(app: FastAPI, logger_name: str = "cowboys.errors") -> None:
+    error_logger = logging.getLogger(logger_name)
+
+    @app.exception_handler(HTTPException)
+    async def handle_http_error(request: Request, error: HTTPException) -> JSONResponse:
+        code = HTTP_STATUS_CODES.get(error.status_code, ErrorCode.INTERNAL_SERVER_ERROR)
+        trace_id = new_trace_id()
+        level = logging.WARNING if error.status_code < 500 else logging.ERROR
+        log_error(error_logger, code, trace_id, str(error.detail), request, level)
+        definition = ERROR_DEFINITIONS[code]
+        return JSONResponse(
+            status_code=definition.http_status,
+            content=error_body(code, trace_id),
+            headers=error.headers,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        validation_items = error.errors()
+        code = (
+            ErrorCode.MISSING_REQUIRED_FIELD
+            if validation_items and all(item.get("type") == "missing" for item in validation_items)
+            else ErrorCode.INVALID_FORMAT
+        )
+        trace_id = new_trace_id()
+        log_error(
+            error_logger,
+            code,
+            trace_id,
+            "Request validation failed: "
+            + str([
+                {"type": item.get("type"), "loc": item.get("loc")}
+                for item in validation_items
+            ]),
+            request,
+            logging.WARNING,
+        )
+        return JSONResponse(
+            status_code=400,
+            content=error_body(code, trace_id, validation_errors(validation_items)),
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, error: Exception) -> JSONResponse:
+        trace_id = new_trace_id()
+        log_error(
+            error_logger,
+            ErrorCode.INTERNAL_SERVER_ERROR,
+            trace_id,
+            error,
+            request,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=error_body(ErrorCode.INTERNAL_SERVER_ERROR, trace_id),
+        )

@@ -1,12 +1,13 @@
 # UI Integration Guide
 
-This guide describes how a browser UI should connect to the Cowboys PH Poker backend. It covers the implemented club and union table workflows, REST authentication, WebSocket v1 messages, state rendering, errors, and reconnect behavior. Detailed endpoint fields and response schemas remain in [API.md](API.md); the protocol rationale and scaling limits are in [websocket.md](websocket.md).
+This guide describes how a browser UI should connect to the Cowboys PH Poker services. It covers wallet REST calls, club and union table workflows, Firebase authentication, WebSocket v1 messages, state rendering, errors, and reconnect behavior. Detailed endpoint fields and response schemas remain in [API.md](API.md); the protocol rationale and scaling limits are in [websocket.md](websocket.md).
 
 ## Before Starting
 
 - Configure Firebase in the host page as `window.__COWBOYS_FIREBASE_CONFIG__` and sign the user in with Firebase Authentication.
-- Run the API using the local setup in [README.md](README.md). Protected workflows require Firebase verification and active membership data in Firestore.
-- Configure the UI's API base URL, for example `http://127.0.0.1:8000`. Build the WebSocket URL by replacing `http` with `ws` and preserving the same host and port.
+- Send the current Firebase ID token as `Authorization: Bearer <id_token>` on protected REST requests; do not access wallet documents directly from Firestore.
+- Configure separate service URLs. The deployed Wallet API is `https://cowboys-wallet-api-4rusyqoipa-de.a.run.app`; local development can run it at `http://127.0.0.1:8001` using [README.md](README.md). The game server's REST and WebSocket base remains independently configured (local REST example: `http://127.0.0.1:8000`; WebSocket uses `ws://127.0.0.1:8000`).
+- Use the Wallet API base URL for membership and wallet endpoints. Use the game-server base URL for live tables, gameplay REST routes, and WebSockets. The wallet API currently allows browser origins `http://localhost:4200` and `http://127.0.0.1:4200`.
 - The UI source is not in this backend repository. This guide is the integration contract for the Angular client or another browser client.
 
 ## UI Work Can Start Now
@@ -17,19 +18,25 @@ Keep poker behavior server-authoritative: render the supplied snapshot and legal
 
 Frontend work can proceed against typed API/WebSocket interfaces and fixture-backed local mocks. Keep transport, DTOs, and screen state separate so engine internals can change without rewriting the UI.
 
-### Wallet UI Work Package (Proposed, No Wallet APIs Yet)
+### Wallet API
 
-The UI can build the wallet surfaces against local fixtures now; do not read wallet documents directly from Firestore. Use distinct labels and never add balances from different scopes together:
+The Wallet API is deployed separately from the game server. After Firebase sign-in, call `POST /me/wallets/global-playmoney/ensure` once to provision the signed-in user's wallet, then call `GET /me/wallets/global-playmoney` on later loads. The ensure endpoint is idempotent, but it currently grants 20,000 chips directly; it does not debit the proposed platform reserve. Do not simulate or modify wallet balances in the UI.
+
+Use distinct labels and never add balances from different scopes together:
 
 | Surface | Wallet to show | UI behavior |
 | --- | --- | --- |
-| Landing page | `GLOBAL_PLAYMONEY` | Show platform play chips only. Do not show or convert club balances here. |
-| Selected club, player view | `CLUB_PLAYER` | Show available club chips and any in-play/table stack separately. |
-| Selected club, agent tools | `CLUB_AGENT` | Show agent operating balance, assigned downline, and transfer history. |
-| Selected club, owner/manager tools | `CLUB_TREASURY` | Show the club reserve and authorized inter-club transfer history. |
+| Landing page | `GLOBAL_PLAYMONEY` | Load from `GET /me/wallets/global-playmoney`; provision with the `ensure` endpoint if needed. This wallet is separate from club chips. |
+| Selected club, player view | Current member balance | Load `GET /clubs/{club_id}/members/me/wallet`. Requires an active membership document at `clubs/{club_id}/members/{uid}`. Show `available_balance` and `in_play_balance` separately; render the current table stack from the game snapshot. |
+| Selected club, agent tools | Current member balance | No separate `CLUB_AGENT` account exists. `POST /clubs/{club_id}/wallet/send-out` and `/claim-back` support authorized transfers against the same member balance. |
+| Selected club, owner/manager tools | `CLUB_TREASURY` | `GET /clubs/{club_id}/wallet` reads the treasury. `POST /platform/clubs` creates a club with 10,000 treasury chips; the owner's personal member balance starts at zero. |
 | Active table | `TABLE_ESCROW` / seat stack | Show the player's stack for this table; do not treat it as another spendable wallet. |
 
-The same person may have both agent and player surfaces in a club; use separate wallet cards/views and balances. The current backend has no separate agent/player wallet accounts or persistent global wallet API, so use mock fixtures until those endpoints and permissions are defined.
+All wallet routes require a Firebase ID token. Club routes additionally require an active club membership; `GET /clubs/{club_id}/wallet` and inter-club treasury transfers require `OWNER` or `MANAGER`, while member send-out and claim-back permit `OWNER`, `MANAGER`, or an assigned `AGENT`. Claim-back is rejected while the member's `in_play_balance` is nonzero. Transfer requests require an idempotency `transaction_id`.
+
+The backend does not provide a player-initiated cash-out request/approval workflow. A UI may show a clearly labeled pending mock request, but must not change balances locally. An authorized operator can fulfill a claim-back through the existing endpoint. `GET /clubs/{club_id}/members/me` returns role/profile data; use the `/wallet` route for member balances.
+
+The same person may have both agent and player roles, but current balances are not separate by role. The wallet-dashboard fixture remains a conceptual composite, not a single API response; label its data as mock and use the live routes for real balances and club-chip movements.
 
 Proposed UI mock shape (not a current API response):
 
@@ -66,12 +73,12 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 - Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
-- A landing-page platform/global play-money balance needs its own backend wallet API. Do not display a club treasury or club-member balance as the global wallet; the persistent global wallet is not implemented yet.
+- Global-wallet provisioning and reads are available through the Wallet API, but reserve-backed issuance, platform top-ups, game-earned global chips, and global-play-money tables are not implemented. Do not display a club treasury or club-member balance as the global wallet.
 
 ## Session and Permissions
 
 1. Get the signed-in Firebase user's ID token when making a request. Send it on protected REST calls as `Authorization: Bearer <id_token>`.
-2. Call `GET /clubs/{club_id}/members/me` and use the returned `role`, `username`, and `user_id` to render the session and available controls.
+2. Call `GET /clubs/{club_id}/members/me` on the Wallet API and use the returned `role`, `username`, and `user_id` to render the session and available controls. Load the member's balances separately from `GET /clubs/{club_id}/members/me/wallet`.
 3. Treat the role as read-only. The server authorizes every operation from the verified Firebase identity and active membership; never trust a role, user ID, or permission supplied by the UI.
 4. On `40101`, refresh/re-authenticate with Firebase and retry a safe read. On `40301`, show an access-denied state and do not repeatedly retry.
 
@@ -182,7 +189,7 @@ For an uncertain buy-in result, retry with the original `buy_in_id`. For an unce
 
 ## Useful Checks
 
-- Open `http://127.0.0.1:8000/docs` to inspect REST routes while the API is running.
+- Open `https://cowboys-wallet-api-4rusyqoipa-de.a.run.app/docs` for the deployed wallet REST routes, or `http://127.0.0.1:8001/docs` for a local wallet API. The game server's local REST docs remain at `http://127.0.0.1:8000/docs`.
 - Verify missing/invalid Firebase credentials render the generic `40101` response.
 - Verify local and union players see different masked snapshots and that union player rows show `club_id`.
 - Verify duplicate action retries do not apply a second game action, and that the client answers server PINGs.

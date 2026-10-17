@@ -1,13 +1,27 @@
 # API and WebSocket Contract
 
-This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. The intended economy keeps club-managed money balances separate from global non-cash play-money balances; only some club-chip flows are implemented here, and the global wallet/table flows are not yet present. This is an initial authorization layer, not a complete production security review.
+This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. The economy keeps club-managed chips separate from global non-cash play money. Global-wallet provisioning and reads, club-member wallet summaries, and some club-chip flows are implemented; global-play-money tables and transfers between global and club balances are not. This is an initial authorization layer, not a complete production security review.
 
 Realtime gameplay is websocket-based. The app protocol for table state and player actions is the WebSocket connection; it is not gRPC. The gRPC dependency is only part of the Google Cloud Firebase/Firestore client stack used for auth and optional persistence.
 
-Base URL for local development: `http://127.0.0.1:8000`  
-WebSocket base URL: `ws://127.0.0.1:8000`
+There are two service base URLs; one service can expose many REST routes:
 
-FastAPI also provides interactive route documentation at `/docs` while the server is running.
+| Service | Local URL | Deployed URL | Responsibility |
+| --- | --- | --- | --- |
+| Wallet REST API (`cowboys-wallet-api`) | `http://127.0.0.1:8001` | `https://cowboys-wallet-api-4rusyqoipa-de.a.run.app` | Membership, global wallet, club provisioning, and club wallet routes. |
+| Game server | `http://127.0.0.1:8000` | Configure separately | Live table REST routes and WebSockets. |
+
+WebSocket base URL for the local game server: `ws://127.0.0.1:8000`.
+
+### Swagger / OpenAPI
+
+`cowboys-wallet-api` is one Cloud Run service hosting multiple REST endpoints; it is not a single endpoint or a Cloud Function. It is deployed separately from the game server:
+
+- Interactive Swagger UI: [Wallet API Swagger](https://cowboys-wallet-api-4rusyqoipa-de.a.run.app/docs)
+- Machine-readable OpenAPI document: [Wallet API OpenAPI JSON](https://cowboys-wallet-api-4rusyqoipa-de.a.run.app/openapi.json)
+- Wallet API base URL: `https://cowboys-wallet-api-4rusyqoipa-de.a.run.app`
+
+Use the OpenAPI JSON as the source for UI request/response types or client generation. Protected operations use Firebase Bearer authentication and document their response models and standard error responses. The wallet service includes membership/profile, member-wallet summary, global-wallet, club provisioning, club treasury, and member transfer endpoints; it does not expose game-server table or WebSocket operations. The game server keeps its own REST docs at `/docs` on its configured host (locally `http://127.0.0.1:8000/docs`); use that host for table and gameplay REST routes. The wallet service's OpenAPI document describes the currently deployed revision and is updated when that service is redeployed.
 
 ## Error Response Standard
 
@@ -46,14 +60,15 @@ For a step-by-step UI implementation guide with current v1 action IDs, heartbeat
 
 Use the signed-in Firebase user's ID token for every protected REST request and for each new table WebSocket connection. The backend derives `user_id` and role from that verified token and the active Firestore membership; do not send a user ID in the socket URL or use the UI's selected role as authorization.
 
-1. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name.
-2. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
-3. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
-4. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
-5. As `PLAYER`, buy in locally with `POST /clubs/{club_id}/tables/{table_id}/seats`, or into a union table with `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats`. The union seat request debits the selected home club's member balance. Generate one UUID for `buy_in_id`; retain and reuse it only when retrying that same purchase.
-6. Connect to `/ws/table/{club_id}/{table_id}` for a local table, or `/ws/union/{union_id}/{table_id}` for a shared table. Send the Firebase token first; union auth also includes the player's verified home-club selection. Wait for `authenticated` and then render the player-specific snapshot.
-7. Start local hands with the club endpoint or shared hands with the union endpoint. Send game actions over the socket and replace the UI state with each complete snapshot.
-8. Use the snapshot's `hand_id` for replay. Local hands use `/clubs/{club_id}/hands/{hand_id}/replay`; union hands use `/unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`.
+1. After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to create the user's initial global play-money wallet if it does not exist. This is an explicit API call, not an automatic Firebase Auth trigger. Use `GET /me/wallets/global-playmoney` to refresh it later.
+2. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name, and `GET /clubs/{club_id}/members/me/wallet` to load that membership's available and in-play club-chip balances.
+3. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
+4. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
+5. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
+6. As `PLAYER`, buy in locally with `POST /clubs/{club_id}/tables/{table_id}/seats`, or into a union table with `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats`. The union seat request debits the selected home club's member balance. Generate one UUID for `buy_in_id`; retain and reuse it only when retrying that same purchase.
+7. Connect to `/ws/table/{club_id}/{table_id}` for a local table, or `/ws/union/{union_id}/{table_id}` for a shared table. Send the Firebase token first; union auth also includes the player's verified home-club selection. Wait for `authenticated` and then render the player-specific snapshot.
+8. Start local hands with the club endpoint or shared hands with the union endpoint. Send game actions over the socket and replace the UI state with each complete snapshot.
+9. Use the snapshot's `hand_id` for replay. Local hands use `/clubs/{club_id}/hands/{hand_id}/replay`; union hands use `/unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`.
 
 The Angular client reads Firebase configuration from `window.__COWBOYS_FIREBASE_CONFIG__`; the host must provide that configuration and establish a signed-in user before protected API calls can succeed. The demo `player-a` ID alone cannot authenticate. Local CORS defaults allow `http://localhost:4200` and `http://127.0.0.1:4200`. Set `CORS_ALLOWED_ORIGINS` to a comma-separated exact-origin allowlist in each deployment.
 
@@ -90,6 +105,44 @@ Requires a valid Firebase ID token and active membership. Response `200`:
 The `role` value is authoritative and is always one of the four role IDs listed above.
 
 Invalid/missing REST credentials return `401`; a valid Firebase user who is not an active club member returns `403`.
+
+### Wallet summaries
+
+`GET /clubs/{club_id}/members/me/wallet` requires a valid Firebase ID token and active membership in the requested club. It returns the authenticated member's single current club-chip balance pair; agent and player roles do not have separate accounts or balances yet. `available_balance` and `in_play_balance` are separate values and must not be combined with the global play-money balance or table snapshots.
+
+Response `200`:
+
+```json
+{
+  "club_id": "demo",
+  "user_id": "player-a",
+  "role": "PLAYER",
+  "currency_type": "CLUB_CHIPS",
+  "available_balance": 12500,
+  "in_play_balance": 500
+}
+```
+
+Invalid/missing credentials return `401`; inactive or missing membership returns `403`; invalid stored balance values return `409`; unavailable Firestore returns `503`.
+
+### Global play-money wallet
+
+`POST /me/wallets/global-playmoney/ensure` requires a valid Firebase ID token and has no request body. It creates a `GLOBAL_PLAYMONEY` wallet for the authenticated UID with exactly 20,000 chips and an initial-grant transaction, atomically and idempotently. If the wallet already exists, it returns the existing balance without granting more chips. The client must call this endpoint after Firebase sign-up/sign-in when provisioning is needed; Firebase account creation alone does not invoke it.
+
+Response `200`:
+
+```json
+{
+  "wallet_id": "global-wallet-player-a",
+  "wallet_type": "GLOBAL_PLAYMONEY",
+  "currency_type": "GLOBAL_PLAYMONEY",
+  "user_id": "player-a",
+  "balance": 20000,
+  "created": true
+}
+```
+
+`created` is `false` when the wallet already existed. `GET /me/wallets/global-playmoney` reads the authenticated user's wallet without creating one; it returns the same wallet fields except `created`. Missing wallet returns `404`; invalid stored balance returns `409`; invalid/missing credentials return `401`; unavailable Firestore returns `503`. These endpoints never accept a client-supplied user ID or grant amount. Global play money cannot be converted to or transferred into club chips, and global-table gameplay is not implemented.
 
 ### Platform club provisioning
 
@@ -132,7 +185,7 @@ Request:
 }
 ```
 
-Both endpoints return the transfer type, amount, transaction ID, and server-derived source/destination IDs. Insufficient balance, unauthorized downline, in-play funds, and reused IDs with different transfer details return `409` or `403` as appropriate. Club wallet routes only manage private club chips; global play-money tables and persistent global-wallet APIs are not implemented.
+Both endpoints return the transfer type, amount, transaction ID, and server-derived source/destination IDs. Insufficient balance, unauthorized downline, in-play funds, and reused IDs with different transfer details return `409` or `403` as appropriate. Club wallet routes only manage private club chips; they do not transfer to or from global play money.
 
 ### Club treasury transfers
 
@@ -360,7 +413,7 @@ Response `201`:
 
 `PATCH /clubs/{club_id}/tables/{table_id}/settings` requires `OWNER` or `MANAGER`. The union equivalent requires `UNION_ADMIN`. `rake_rate` accepts values from `0` through `0.1` (including `0.075`); `rake_cap` and `rake_min_pot` are integer chip amounts. `no_flop_no_drop` disables rake when the hand ends before a flop. BBJ fee collection honors `jackpot_min_pot`. On local club tables, actual rake and BBJ drops reduce winner stacks and update the club treasury in the same idempotent settlement transaction.
 
-BBJ qualifying-hand evaluation/payout, Hand-of-the-Day funding and awards, and union fee allocation are not implemented. Global play-money wallets and global tables are also not implemented by this API.
+BBJ qualifying-hand evaluation/payout, Hand-of-the-Day funding and awards, union fee allocation, and global-play-money tables are not implemented. Global play-money wallet provisioning and reads are implemented by the endpoints in [Global play-money wallet](#global-play-money-wallet); they cannot be used to join club tables or transfer funds to club wallets.
 
 ### Seat a player
 

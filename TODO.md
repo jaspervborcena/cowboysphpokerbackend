@@ -15,7 +15,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Verify the full test suite after the `game_id` implementation: 55 tests passed.
 - [x] Add independent first-party NLH contracts, card/deck, dealing/privacy projection, hand evaluation, and pot/outcome helper modules with focused tests.
 - [x] Route newly created club and union tables through the first-party NLH adapter while preserving table snapshots, replay frames, and hand-audit settlement fields.
-- [x] Complete the first-party NLH live path, entry/straddle options, explicit registry, and PokerKit removal; full suite passes (144 tests).
+- [x] Complete the first-party NLH live path, entry/straddle options, explicit registry, and PokerKit removal; full suite passes (145 passed, 1 emulator test skipped).
 - [x] Re-run the full repository test suite after engine-helper work: 111 tests passed.
 
 ## Immediate: First-Party NLH Engine
@@ -38,12 +38,18 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Verify snapshots, replay privacy, hand audits, action idempotency, and in-process settlement behavior against the new engine.
 - [x] Replace the PokerKit-based catalog and tests with the explicit first-party registry.
 - [x] Remove PokerKit imports and the `requirements.txt` dependency after a repository-wide search and full test suite pass without PokerKit.
-- [ ] Verify idempotent Firestore settlement with the Firestore emulator before production rollout. Firebase CLI requires JDK 21; the current environment's Java runtime is older.
+- [x] Add a Firestore emulator config and a focused first-party NLH settlement/idempotency integration test.
+- [ ] Run the Firestore emulator settlement test before production rollout. Firebase CLI requires JDK 21; the current environment only has JDK 17.
 
 ## UI: Can Proceed Now
 
 - [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
 - [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
+- [ ] After Firebase account creation, show a mock `GLOBAL_PLAYMONEY` wallet with exactly 20,000 chips; no persistent grant API exists yet. Keep it isolated from club chips and do not offer client-controlled grant amounts.
+- [ ] After club provisioning, display the live 10,000-chip `CLUB_TREASURY` grant from `POST /platform/clubs` and refresh via `GET /clubs/{club_id}/wallet`. The owner membership's personal `chip_balance` currently starts at zero; do not show the treasury grant as personal funds.
+- [ ] For club players, use the live `POST /clubs/{club_id}/wallet/send-out` flow for funding by an authorized owner, manager, or assigned agent. There is no other club-funding path for players.
+- [ ] Mock a player-initiated cash-out request as pending UI state. An authorized owner, manager, or assigned agent can fulfill it with `POST /clubs/{club_id}/wallet/claim-back`; surface the existing restriction that claim-back is unavailable while `in_play_balance` is nonzero. No request/approval API exists yet.
+- [ ] Show available and in-play member balances separately, and keep global play money, club treasury funds, operator funds, player funds, and table stacks distinct.
 - [ ] Keep the client engine-agnostic: do not calculate outcomes, alter balances, expose hidden cards, or depend on engine internals.
 - [ ] Keep the selectable game list limited to entries with `create_supported: true`; currently this is NLH only.
 
@@ -62,17 +68,17 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 
 - [ ] Define Firestore wallet accounts for `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, `CLUB_AGENT`, `CLUB_PLAYER`, and table escrow, with explicit owners, scopes, and currency types.
 - [ ] Support one Firebase identity as both an `AGENT` and a `PLAYER` with separate club-scoped agent-operating and personal-player wallets/ledgers. Define role grants, transfer boundaries, idempotency, and audit rules; never merge these balances.
-- [ ] On new account creation, provision a persistent `GLOBAL_PLAYMONEY` wallet and grant exactly 20,000 play-money chips once. Make account creation/grant idempotent and keep this balance separate from all club accounts.
-- [ ] On club creation, grant exactly 10,000 `CLUB_CHIPS` for the owner once. Current provisioning seeds the club treasury with 10,000 while the owner's personal member balance starts at zero; confirm whether the intended grant is treasury-only or should credit the owner's separate `CLUB_PLAYER` wallet, then align behavior and audit records.
+- [ ] On new account creation, provision a persistent `GLOBAL_PLAYMONEY` wallet and grant exactly 20,000 play-money chips once through trusted server-side provisioning. Make it idempotent; never expose an arbitrary client-controlled grant amount or mix it with club accounts.
+- [ ] Confirm whether club creation's existing idempotent 10,000 `CLUB_TREASURY` grant is the complete owner benefit or whether a separate `CLUB_PLAYER` grant is intended. Current owner personal balance starts at zero; preserve distinct account scopes and audit records.
 - [ ] Specify double-entry wallet movements for treasury-to-agent funding, agent-to-player distribution/claim-back, player buy-in to table escrow, hand settlement, and cash-out. Commit ledger entries and cached account balances atomically and idempotently.
-- [ ] Define UI-facing wallet summary/history APIs and authorization before replacing the current balance response fields.
+- [ ] Add a player-authorized `GET` wallet summary/history API with explicit available/in-play values and strict separation of `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, operator, player, and table-escrow balances.
 - [ ] Define per-table lifetime semantics: every table has an assigned scheduled close datetime; its lifetime may vary (for example, 6 or 24 hours) based on that assignment. The weekly club settlement cutoff is an additional close boundary, not the only expiration schedule.
 - [ ] Choose the club timezone and exact boundary behavior; store the assigned deadline as an unambiguous `scheduled_close_at`, separate from `closed_at` (the actual time the table was closed), and expose/configure it through the appropriate table contract.
 - [ ] Implement an idempotent expiration worker that stops new hands, applies a policy for hands still in progress, settles or explicitly carries each seated stack, releases seats safely, and preserves hand/ledger audit history. Do not delete live seats or reset balances without accounting for in-play chips.
 - [ ] Test cutoff boundaries, delayed/retried expiration jobs, active-hand handling, and recovery when the service is unavailable at the cutoff.
 - [ ] Validate platform club owner UIDs and add request idempotency to prevent duplicate initial grants.
 - [ ] Review authorization for every REST route, WebSocket action, table, union, and administrative operation.
-- [ ] Define and test seat exit, rebuy/top-up, cash-out/refund, and reconciliation policies before treating club balances as a complete money ledger.
+- [ ] Add an idempotent player cash-out request/approval API and define/test seat exit, rebuy/top-up, external payout/refund, and reconciliation before treating club balances as a complete money ledger.
 - [ ] Add Firestore schema versions, access rules/indexes, emulator-backed transaction tests, and backup/restore drills.
 - [ ] Add per-table metrics (mailbox depth, action latency, timer drift, lease renewals), alerts, rate limits, and deployment/rollback checks.
 

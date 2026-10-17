@@ -1,0 +1,378 @@
+{
+  "project_id": "demo-cowboys-ph-poker",
+  "mode": "emulator-demo-only",
+  "documents": [
+    {
+      "path": "platform_wallets/global-playmoney-reserve",
+      "data": {
+        "demo_only": true,
+        "wallet_id": "global-playmoney-reserve",
+        "wallet_type": "PLATFORM_RESERVE",
+        "currency_type": "GLOBAL_PLAYMONEY",
+        "chip_balance": 999980000,
+        "initial_funding": 1000000000
+      }
+    },
+    {
+      "path": "platform_wallets/global-playmoney-reserve/transactions/initial-funding",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "initial-funding",
+        "type": "INITIAL_FUNDING",
+        "currency_type": "GLOBAL_PLAYMONEY",
+        "amount": 1000000000,
+        "to_wallet_id": "global-playmoney-reserve",
+        "performed_by": "demo-platform-admin",
+        "balance_after": 1000000000
+      }
+    },
+    {
+      "path": "platform_wallets/global-playmoney-reserve/transactions/demo-player-a-grant",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "demo-player-a-grant",
+        "type": "NEW_PLAYER_GRANT",
+        "currency_type": "GLOBAL_PLAYMONEY",
+        "amount": 20000,
+        "from_wallet_id": "global-playmoney-reserve",
+        "to_wallet_id": "global-wallet-demo-player-a",
+        "performed_by": "system",
+        "balance_after": 999980000
+      }
+    },
+    {
+      "path": "global_wallets/demo-player-a",
+      "data": {
+        "demo_only": true,
+        "wallet_id": "global-wallet-demo-player-a",
+        "wallet_type": "GLOBAL_PLAYMONEY",
+        "currency_type": "GLOBAL_PLAYMONEY",
+        "owner_user_id": "demo-player-a",
+        "chip_balance": 20000
+      }
+    },
+    {
+      "path": "global_wallets/demo-player-a/transactions/initial-grant",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "initial-grant",
+        "type": "NEW_PLAYER_GRANT",
+        "currency_type": "GLOBAL_PLAYMONEY",
+        "amount": 20000,
+        "from_wallet_id": "global-playmoney-reserve",
+        "to_user_id": "demo-player-a",
+        "performed_by": "system"
+      }
+    },
+    {
+      "path": "clubs/demo-club",
+      "data": {
+        "demo_only": true,
+        "club_id": "demo-club",
+        "name": "Demo Club",
+        "status": "active",
+        "owner_user_id": "demo-owner",
+        "created_by": "demo-platform-admin"
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-owner",
+      "data": {
+        "demo_only": true,
+        "user_id": "demo-owner",
+        "username": "Demo Owner",
+        "role": "OWNER",
+        "status": "active",
+        "chip_balance": 0,
+        "in_play_balance": 0
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-agent",
+      "data": {
+        "demo_only": true,
+        "user_id": "demo-agent",
+        "username": "Demo Agent",
+        "role": "AGENT",
+        "status": "active",
+        "chip_balance": 2000,
+        "in_play_balance": 0
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-player-a",
+      "data": {
+        "demo_only": true,
+        "user_id": "demo-player-a",
+        "username": "Demo Player A",
+        "role": "PLAYER",
+        "status": "active",
+        "chip_balance": 14600,
+        "in_play_balance": 600
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-player-b",
+      "data": {
+        "demo_only": true,
+        "user_id": "demo-player-b",
+        "username": "Demo Player B",
+        "role": "PLAYER",
+        "status": "active",
+        "chip_balance": 8800,
+        "in_play_balance": 400
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-player-a/transactions/demo-buy-in-a",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "demo-buy-in-a",
+        "type": "buy_in",
+        "currency_type": "CLUB_CHIPS",
+        "table_id": "demo-club-table",
+        "seat_index": 0,
+        "amount": 500,
+        "chip_balance_delta": -500,
+        "in_play_balance_delta": 500
+      }
+    },
+    {
+      "path": "clubs/demo-club/members/demo-player-b/transactions/demo-buy-in-b",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "demo-buy-in-b",
+        "type": "buy_in",
+        "currency_type": "CLUB_CHIPS",
+        "table_id": "demo-club-table",
+        "seat_index": 1,
+        "amount": 500,
+        "chip_balance_delta": -500,
+        "in_play_balance_delta": 500
+      }
+    },
+    {
+      "path": "clubs/demo-club/treasury/wallet",
+      "data": {
+        "demo_only": true,
+        "chip_balance": 10000
+      }
+    },
+    {
+      "path": "clubs/demo-club/treasury/pools",
+      "data": {
+        "demo_only": true,
+        "total_rake_collected": 0,
+        "bad_beat_jackpot_pool": 0,
+        "hand_of_the_day_pool": 0
+      }
+    },
+    {
+      "path": "clubs/demo-club/transactions/initial-funding",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "initial-funding",
+        "type": "INITIAL_GRANT",
+        "currency_type": "CLUB_CHIPS",
+        "to_club_id": "demo-club",
+        "amount": 10000,
+        "performed_by": "demo-platform-admin"
+      }
+    },
+    {
+      "path": "clubs/demo-club/transactions/demo-buy-in-a",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "demo-buy-in-a",
+        "type": "BUY_IN",
+        "currency_type": "CLUB_CHIPS",
+        "from_user_id": "demo-player-a",
+        "to_table_id": "demo-club-table",
+        "amount": 500
+      }
+    },
+    {
+      "path": "clubs/demo-club/transactions/demo-buy-in-b",
+      "data": {
+        "demo_only": true,
+        "transaction_id": "demo-buy-in-b",
+        "type": "BUY_IN",
+        "currency_type": "CLUB_CHIPS",
+        "from_user_id": "demo-player-b",
+        "to_table_id": "demo-club-table",
+        "amount": 500
+      }
+    },
+    {
+      "path": "clubs/demo-club/tables/demo-club-table",
+      "data": {
+        "demo_only": true,
+        "table_id": "demo-club-table",
+        "club_id": "demo-club",
+        "game_id": "no_limit_texas_holdem",
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "clubs/demo-club/tables/demo-club-table/seats/0",
+      "data": {
+        "demo_only": true,
+        "seat_index": 0,
+        "user_id": "demo-player-a",
+        "username": "Demo Player A",
+        "stack": 600,
+        "buy_in_id": "demo-buy-in-a",
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "clubs/demo-club/tables/demo-club-table/seats/1",
+      "data": {
+        "demo_only": true,
+        "seat_index": 1,
+        "user_id": "demo-player-b",
+        "username": "Demo Player B",
+        "stack": 400,
+        "buy_in_id": "demo-buy-in-b",
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "clubs/demo-club/tables/demo-club-table/hands/demo-hand",
+      "data": {
+        "demo_only": true,
+        "hand_id": "demo-hand",
+        "club_id": "demo-club",
+        "table_id": "demo-club-table",
+        "settlement_status": "settled",
+        "pot_total": 200,
+        "players": [
+          {"user_id": "demo-player-a", "seat": 0, "starting_stack": 500, "final_stack": 600, "net_delta": 100},
+          {"user_id": "demo-player-b", "seat": 1, "starting_stack": 500, "final_stack": 400, "net_delta": -100}
+        ]
+      }
+    },
+    {
+      "path": "unions/demo-union",
+      "data": {
+        "demo_only": true,
+        "union_id": "demo-union",
+        "name": "Demo Union",
+        "status": "active",
+        "created_by": "demo-owner"
+      }
+    },
+    {
+      "path": "unions/demo-union/admins/demo-owner",
+      "data": {
+        "demo_only": true,
+        "user_id": "demo-owner",
+        "role": "UNION_ADMIN",
+        "status": "active"
+      }
+    },
+    {
+      "path": "unions/demo-union/clubs/demo-club",
+      "data": {
+        "demo_only": true,
+        "union_id": "demo-union",
+        "club_id": "demo-club",
+        "union_name": "Demo Union",
+        "status": "active"
+      }
+    },
+    {
+      "path": "unions/demo-union/tables/demo-union-table",
+      "data": {
+        "demo_only": true,
+        "union_id": "demo-union",
+        "table_id": "demo-union-table",
+        "origin_club_id": "demo-club",
+        "game_id": "no_limit_texas_holdem",
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "unions/demo-union/tables/demo-union-table/seats/0",
+      "data": {
+        "demo_only": true,
+        "seat_index": 0,
+        "user_id": "demo-player-a",
+        "club_id": "demo-club",
+        "stack": 100,
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "unions/demo-union/tables/demo-union-table/seats/1",
+      "data": {
+        "demo_only": true,
+        "seat_index": 1,
+        "user_id": "demo-player-b",
+        "club_id": "demo-club",
+        "stack": 100,
+        "status": "demo_archive"
+      }
+    },
+    {
+      "path": "unions/demo-union/tables/demo-union-table/hands/demo-union-hand",
+      "data": {
+        "demo_only": true,
+        "union_id": "demo-union",
+        "table_id": "demo-union-table",
+        "hand_id": "demo-union-hand",
+        "settlement_status": "settled",
+        "pot_total": 0,
+        "players": [
+          {"user_id": "demo-player-a", "seat": 0, "final_stack": 100, "net_delta": 0},
+          {"user_id": "demo-player-b", "seat": 1, "final_stack": 100, "net_delta": 0}
+        ]
+      }
+    },
+    {
+      "path": "unions/demo-union/settlements/2026-10-17",
+      "data": {
+        "demo_only": true,
+        "union_id": "demo-union",
+        "settlement_date": "2026-10-17"
+      }
+    },
+    {
+      "path": "unions/demo-union/settlements/2026-10-17/hands/demo-union-hand",
+      "data": {
+        "demo_only": true,
+        "hand_id": "demo-union-hand",
+        "table_id": "demo-union-table",
+        "positions": {
+          "demo-club": {"net_delta": 0, "debt": 0, "credit": 0}
+        },
+        "rake_amount": 0
+      }
+    },
+    {
+      "path": "unions/demo-union/settlements/2026-10-17/clubs/demo-club",
+      "data": {
+        "demo_only": true,
+        "club_id": "demo-club",
+        "debt": 0,
+        "credit": 0,
+        "net_delta": 0
+      }
+    }
+  ],
+  "relationships": [
+    {"from": "platform_wallets/global-playmoney-reserve", "to": "platform_wallets/global-playmoney-reserve/transactions/demo-player-a-grant", "type": "funds grant"},
+    {"from": "platform_wallets/global-playmoney-reserve/transactions/demo-player-a-grant", "to": "global_wallets/demo-player-a", "type": "credits player wallet"},
+    {"from": "clubs/demo-club", "to": "clubs/demo-club/members/demo-owner", "type": "owned by"},
+    {"from": "clubs/demo-club", "to": "clubs/demo-club/treasury/wallet", "type": "owns treasury"},
+    {"from": "clubs/demo-club", "to": "clubs/demo-club/tables/demo-club-table", "type": "owns table"},
+    {"from": "clubs/demo-club/members/demo-player-a", "to": "clubs/demo-club/tables/demo-club-table/seats/0", "type": "sits in"},
+    {"from": "clubs/demo-club/tables/demo-club-table", "to": "clubs/demo-club/tables/demo-club-table/hands/demo-hand", "type": "records hand"},
+    {"from": "unions/demo-union", "to": "unions/demo-union/clubs/demo-club", "type": "includes club"},
+    {"from": "unions/demo-union/clubs/demo-club", "to": "clubs/demo-club", "type": "references club"},
+    {"from": "unions/demo-union", "to": "unions/demo-union/admins/demo-owner", "type": "administered by"},
+    {"from": "unions/demo-union/tables/demo-union-table", "to": "unions/demo-union/tables/demo-union-table/hands/demo-union-hand", "type": "records hand"},
+    {"from": "unions/demo-union/tables/demo-union-table/hands/demo-union-hand", "to": "unions/demo-union/settlements/2026-10-17/hands/demo-union-hand", "type": "settled as"},
+    {"from": "unions/demo-union/settlements/2026-10-17", "to": "unions/demo-union/settlements/2026-10-17/clubs/demo-club", "type": "clears club"}
+  ]
+}

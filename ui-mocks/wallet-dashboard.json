@@ -10,8 +10,26 @@
     "wallet_id": "global-wallet-user-agent-player-a",
     "wallet_type": "GLOBAL_PLAYMONEY",
     "currency_type": "GLOBAL_PLAYMONEY",
-    "balance": 250000,
+    "balance": 20000,
     "updated_at": "2026-10-16T08:00:00Z"
+  },
+  "onboarding_preview": {
+    "account_creation_grant": {
+      "wallet_type": "GLOBAL_PLAYMONEY",
+      "currency_type": "GLOBAL_PLAYMONEY",
+      "amount": 20000,
+      "status": "mock_only",
+      "trigger": "firebase_account_created",
+      "api_available": false
+    },
+    "club_creation_grant": {
+      "wallet_type": "CLUB_TREASURY",
+      "currency_type": "CLUB_CHIPS",
+      "amount": 10000,
+      "status": "live",
+      "endpoint": "POST /platform/clubs",
+      "owner_personal_balance_after_creation": 0
+    }
   },
   "club_wallets": [
     {
@@ -81,10 +99,23 @@
       "wallet_type": "GLOBAL_PLAYMONEY",
       "club_id": null,
       "type": "PLAYMONEY_GRANT",
-      "amount": 250000,
+      "amount": 20000,
       "direction": "credit",
       "status": "completed",
       "created_at": "2026-10-16T08:00:00Z"
+    }
+  ],
+  "cashout_requests": [
+    {
+      "request_id": "mock-cashout-request-001",
+      "wallet_type": "CLUB_PLAYER",
+      "club_id": "club-demo",
+      "user_id": "user-agent-player-a",
+      "amount": 600,
+      "status": "pending_mock",
+      "player_request_api_available": false,
+      "operator_fulfillment_endpoint": "POST /clubs/{club_id}/wallet/claim-back",
+      "blocked_while_in_play_balance_nonzero": true
     }
   ]
 }

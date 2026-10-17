@@ -4,7 +4,7 @@ Python 3.11+ backend built with FastAPI, first-party NLH logic, WebSockets, and 
 
 ## Architecture
 
-The live poker game protocol is websocket-first. Client actions, table state snapshots, and turn updates are exchanged over FastAPI WebSocket endpoints in `app/main.py`; gRPC is not the application protocol for gameplay.
+The live poker game protocol is websocket-first. Client actions, table state snapshots, and turn updates are exchanged over FastAPI WebSocket endpoints in the game server app, `app/main.py`; gRPC is not the application protocol for gameplay. Firestore-backed membership and wallet REST endpoints also run as a separate FastAPI app at `app/wallet_api.py` and are deployed in the `cowboys-wallet-api` Cloud Run service.
 
 The Google Cloud libraries in this repo use gRPC under the hood for Firebase and Firestore integration, but the actual game communication at the app layer is websocket-based. Keep the realtime table transport on WebSocket and treat Firestore/Firebase as infrastructure services rather than the live game protocol.
 
@@ -12,7 +12,7 @@ The selected production target is the Firebase/Firestore design in [GAME_SERVER_
 
 ## Economy Tiers
 
-The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is shown on the landing page and is not convertible to club chips. The current Firestore model has a club treasury and one `chip_balance`/`in_play_balance` pair per club member; it does not yet implement separate agent/player accounts or a persistent global wallet. Direct player cash-out, external payouts/refunds, and reconciliation are also not implemented.
+The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is not convertible to club chips. The deployed Wallet API supports persistent global-wallet reads and grants an initial 20,000 chips directly to each user; it does not yet debit the proposed shared platform reserve. Firestore still has one `chip_balance`/`in_play_balance` pair per club member rather than separate agent/player accounts. Direct player cash-out, external payouts/refunds, and reconciliation are also not implemented.
 
 ## Project Layout
 
@@ -21,7 +21,10 @@ logic/table_game_base.py    Shared table metadata, seats, and accounting
 logic/first_party_table.py  Live adapter for the first-party NLH engine
 database/                Hand-history and chip-ledger persistence
 logic/                   WebSocket connections and table runtime orchestration
-app/main.py              FastAPI app, REST routes, and WebSocket endpoint
+app/main.py              Game server FastAPI app, table REST routes, and WebSockets
+app/wallet_api.py        Standalone wallet REST API entrypoint
+app/api/wallets.py       Shared membership and wallet REST routes
+Dockerfile.wallet-api    Wallet API Cloud Run image
 tests/                   Engine and API integration tests
 ```
 
@@ -164,6 +167,42 @@ uvicorn app.main:app --reload --env-file .env
 The local `.env` is ignored by Git. Keep credentials out of it; Google Application Default Credentials are stored separately by `gcloud`. `python-dotenv` is required for Uvicorn's `--env-file` option.
 
 Health check: `http://127.0.0.1:8000/health`. Interactive API docs: `http://127.0.0.1:8000/docs`. UI integration contract: [API.md](API.md).
+
+### Run the Wallet REST API Separately
+
+The Firestore-backed membership and wallet routes can run independently of the live game server:
+
+```powershell
+$env:FIRESTORE_ENABLED = "true"
+$env:FIREBASE_PROJECT_ID = "porpavordelivery"
+uvicorn app.wallet_api:app --reload --host 127.0.0.1 --port 8001
+```
+
+The standalone service exposes only the member, club-wallet, and global-wallet REST routes plus `/health`; live table and WebSocket routes remain on `app.main:app`. The currently deployed Cloud Run service is `cowboys-wallet-api` in `asia-east1`: `https://cowboys-wallet-api-4rusyqoipa-de.a.run.app`. Its Swagger UI is at `/docs` and its OpenAPI contract at `/openapi.json`. Use separate Cloud Run services to deploy/restart these processes independently. The standalone API uses the Cloud Run service account's Firestore permissions and Firebase project ID from environment settings.
+
+For a Cloud Run image, create the Artifact Registry repository `poker-services`, then build with `gcloud builds submit --project=porpavordelivery --config=cloudbuild.wallet-api.yaml .`. Deploy the resulting `asia-east1-docker.pkg.dev/porpavordelivery/poker-services/wallet-api:latest` image as a separate service with `FIRESTORE_ENABLED=true`, `FIREBASE_PROJECT_ID=porpavordelivery`, and `GOOGLE_CLOUD_PROJECT=porpavordelivery`. Permit unauthenticated Cloud Run ingress for browser access; the wallet routes still require a valid Firebase ID token. This deploy path does not seed Firestore.
+
+### Firestore Emulator Settlement Test
+
+Install JDK 21 or newer, then run the focused settlement test against the local Firestore emulator:
+
+```powershell
+firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\Scripts\python.exe -m pytest tests\test_firestore_emulator.py -q"
+```
+
+The test uses an isolated generated club/table/hand ID and verifies uncalled-return audit data, member in-play balances, final seat settlement, and idempotent retry behavior. It skips during the regular test suite unless `FIRESTORE_EMULATOR_HOST` is set by `firebase emulators:exec`.
+
+### Firestore Demo Seed
+
+Load a connected demo dataset into the local Firestore emulator only:
+
+```powershell
+firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\Scripts\python.exe -m pytest tests\test_firestore_demo_seed.py -q"
+```
+
+The emulator test inserts the stable `demo-*` documents, reads them back, and checks the reserve/grant, club/member, union/club, and settlement/hand links. The seeder refuses non-local Firestore hosts and non-demo project IDs. The fixture covers the platform reserve/grant example, global wallet, club members and treasury, table audit, union membership/table, and settlement records. They are demo records, not live table state; the game server does not recover a playable table from seeded table documents. The platform reserve records illustrate the proposed 1,000,000,000-chip accounting model; the current global-wallet API still grants 20,000 directly and does not debit this demo reserve.
+
+To load the fixture without running the assertions, use `.venv\Scripts\python.exe -m database.seed_demo_firestore` as the command passed to `firebase emulators:exec`.
 
 Club-protected routes require valid Firebase ID tokens, active Firestore membership records, and a working Firestore connection. `POST /platform/clubs` instead requires the trusted Firebase custom claim `platform_admin: true`; it does not require membership in an existing club. Assign that claim only through a trusted Firebase Admin process. If Firestore or Firebase verification is unavailable, protected routes fail closed; automated tests use fake verifiers and repositories and need no cloud account.
 
