@@ -1,4 +1,9 @@
 from game_engine.hand_evaluator import Card, HandCategory, HandRank, evaluate_hand
+from game_engine.checkpoint import (
+	NLH_CHECKPOINT_VERSION,
+	deserialize_nlh_hand_state,
+	serialize_nlh_hand_state,
+)
 from game_engine.pots import Pot, PotBuildResult, build_side_pots, resolve_pot_awards
 from game_engine.deck import Deck, DeckExhausted
 from game_engine.dealing import deal_flop, deal_hole_cards, deal_river, deal_turn, visible_hole_cards
@@ -46,6 +51,7 @@ __all__ = [
 	"PokerGameMode",
 	"PokerTableConfig",
 	"NLHHandState",
+	"NLH_CHECKPOINT_VERSION",
 	"NLHPlayerState",
 	"NLHStreet",
 	"NLHEngine",
@@ -56,10 +62,12 @@ __all__ = [
 	"deal_river",
 	"deal_turn",
 	"evaluate_hand",
+	"deserialize_nlh_hand_state",
 	"initialize_nlh_hand",
 	"legal_nlh_actions",
 	"project_player_hand_state",
 	"resolve_pot_awards",
 	"start_nlh_hand",
+	"serialize_nlh_hand_state",
 	"visible_hole_cards",
 ]

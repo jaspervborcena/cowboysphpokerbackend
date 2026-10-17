@@ -12,7 +12,7 @@ The selected production target is the Firebase/Firestore design in [GAME_SERVER_
 
 ## Economy Tiers
 
-The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is not convertible to club chips. The deployed Wallet API supports persistent global-wallet reads and grants an initial 20,000 chips directly to each user; it does not yet debit the proposed shared platform reserve. Firestore still has one `chip_balance`/`in_play_balance` pair per club member rather than separate agent/player accounts. Direct player cash-out, external payouts/refunds, and reconciliation are also not implemented.
+The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is not convertible to club chips. The current implementation uses a platform reserve wallet as the authoritative source for initial grants: `ensure_global_wallet(...)` and `create_club(...)` debit the reserve and credit the destination wallet in one transaction, with ledger rows capturing `from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps. Browser code may read these values but must never be the authority for money creation or treasury mutations. Firestore still has one `chip_balance`/`in_play_balance` pair per club member rather than separate agent/player accounts. Direct player cash-out, external payouts/refunds, and reconciliation are still not implemented.
 
 ## Project Layout
 
@@ -74,7 +74,8 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - Firestore-backed buy-in reservation: verifies available member balance, moves the amount to in-play chips, and reserves a seat idempotently.
 - Operator-mediated club wallet send-out and claim-back transfers with role/downline checks and idempotent Firestore audit records.
 - Owner/manager treasury balance and atomic inter-club treasury transfers with paired audit records; card and PayPal funding are not enabled yet.
-- Platform-admin club provisioning creates the initial owner membership and grants 10,000 treasury chips exactly once.
+- Platform-admin club provisioning creates the initial owner membership and grants 10,000 treasury chips exactly once through the reserve-backed accounting path.
+- Reserve-backed initial grants for global play-money and club treasury are recorded with `from_wallet_id`/`to_wallet_id` audit rows and atomic balance updates.
 - Firestore transaction to save a hand audit, apply in-play balance deltas, and update seat stacks idempotently by hand ID.
 - Docker image suitable for Cloud Run, plus focused engine and WebSocket integration tests.
 
@@ -192,6 +193,8 @@ firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\
 
 The test uses an isolated generated club/table/hand ID and verifies uncalled-return audit data, member in-play balances, final seat settlement, and idempotent retry behavior. It skips during the regular test suite unless `FIRESTORE_EMULATOR_HOST` is set by `firebase emulators:exec`.
 
+The Firestore settlement and demo-seed emulator tests also run in `.github/workflows/firestore-emulator.yml` on pushes and pull requests to `main`. CI installs JDK 21 and uses the `demo-cowboys-ph-poker` project ID; it does not connect to or write the production Firestore project.
+
 ### Firestore Demo Seed
 
 Load a connected demo dataset into the local Firestore emulator only:
@@ -200,7 +203,7 @@ Load a connected demo dataset into the local Firestore emulator only:
 firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\Scripts\python.exe -m pytest tests\test_firestore_demo_seed.py -q"
 ```
 
-The emulator test inserts the stable `demo-*` documents, reads them back, and checks the reserve/grant, club/member, union/club, and settlement/hand links. The seeder refuses non-local Firestore hosts and non-demo project IDs. The fixture covers the platform reserve/grant example, global wallet, club members and treasury, table audit, union membership/table, and settlement records. They are demo records, not live table state; the game server does not recover a playable table from seeded table documents. The platform reserve records illustrate the proposed 1,000,000,000-chip accounting model; the current global-wallet API still grants 20,000 directly and does not debit this demo reserve.
+The emulator test inserts the stable `demo-*` documents, reads them back, and checks the reserve/grant, club/member, union/club, and settlement/hand links. The seeder refuses non-local Firestore hosts and non-demo project IDs. The fixture covers the platform reserve/grant example, global wallet, club members and treasury, table audit, union membership/table, and settlement records. They are demo records, not live table state; the game server does not recover a playable table from seeded table documents. The runtime reserve-backed model uses the platform reserve as the funding source for initial player and club grants and records the corresponding `from_wallet_id`/`to_wallet_id` accounting rows.
 
 To load the fixture without running the assertions, use `.venv\Scripts\python.exe -m database.seed_demo_firestore` as the command passed to `firebase emulators:exec`.
 

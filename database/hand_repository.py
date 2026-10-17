@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
+from dataclasses import dataclass
 from typing import Any
 
 from google.cloud import firestore
@@ -36,6 +39,35 @@ class WalletTransactionStatus(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
 
+class TableActionCommitStatus(StrEnum):
+    COMMITTED = "committed"
+    IDEMPOTENT_REPLAY = "idempotent_replay"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    NOT_INITIALIZED = "not_initialized"
+    FENCED = "fenced"
+    SEQUENCE_CONFLICT = "sequence_conflict"
+
+
+@dataclass(frozen=True)
+class TableActionCommitResult:
+    status: TableActionCommitStatus
+    sequence: int
+
+
+def table_action_fingerprint(
+    user_id: str,
+    action_id: str,
+    action_payload: dict[str, Any],
+) -> str:
+    canonical = json.dumps(
+        {"user_id": user_id, "action_id": action_id, "payload": action_payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class FirestoreRequiredError(RuntimeError):
     pass
 
@@ -43,6 +75,40 @@ class FirestoreRequiredError(RuntimeError):
 class NullHandRepository:
     def recover_pending_settlements(self) -> int:
         return 0
+
+    def get_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load a table checkpoint.")
+
+    def initialize_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        owner_id: str,
+        fencing_epoch: int,
+        checkpoint: dict[str, Any],
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to initialize a table checkpoint.")
+
+    def commit_table_action(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        owner_id: str,
+        fencing_epoch: int,
+        expected_sequence: int,
+        user_id: str,
+        action_id: str,
+        payload_hash: str,
+        checkpoint: dict[str, Any],
+    ) -> TableActionCommitResult:
+        raise FirestoreRequiredError("Firestore must be enabled to persist a table action.")
 
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:
         raise FirestoreRequiredError("Firestore must be enabled to provision a global wallet.")
@@ -193,9 +259,163 @@ class FirestoreHandRepository:
     def __init__(self, client: firestore.Client) -> None:
         self._client = client
 
+    def get_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> dict[str, Any] | None:
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        snapshot = state_ref.get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict() or {}
+
+    def initialize_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        owner_id: str,
+        fencing_epoch: int,
+        checkpoint: dict[str, Any],
+    ) -> bool:
+        _validate_table_checkpoint_write(
+            scope_type, scope_id, table_id, owner_id, fencing_epoch, 0, checkpoint
+        )
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            if state_ref.get(transaction=transaction).exists:
+                return False
+            transaction.set(
+                state_ref,
+                {
+                    "schema_version": 1,
+                    "scope_type": scope_type,
+                    "scope_id": scope_id,
+                    "table_id": table_id,
+                    "owner_id": owner_id,
+                    "fencing_epoch": fencing_epoch,
+                    "sequence": 0,
+                    "checkpoint": checkpoint,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return True
+
+        return commit(transaction)
+
+    def commit_table_action(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        owner_id: str,
+        fencing_epoch: int,
+        expected_sequence: int,
+        user_id: str,
+        action_id: str,
+        payload_hash: str,
+        checkpoint: dict[str, Any],
+    ) -> TableActionCommitResult:
+        _validate_table_checkpoint_write(
+            scope_type,
+            scope_id,
+            table_id,
+            owner_id,
+            fencing_epoch,
+            expected_sequence,
+            checkpoint,
+        )
+        try:
+            fingerprint_bytes = bytes.fromhex(payload_hash)
+        except ValueError as error:
+            raise ValueError("Action identity and SHA-256 payload hash are required.") from error
+        if not user_id or not action_id or len(fingerprint_bytes) != 32:
+            raise ValueError("Action identity and SHA-256 payload hash are required.")
+
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        action_key = hashlib.sha256(f"{user_id}\0{action_id}".encode("utf-8")).hexdigest()
+        action_ref = state_ref.collection("actions").document(action_key)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> TableActionCommitResult:
+            action_snapshot = action_ref.get(transaction=transaction)
+            if action_snapshot.exists:
+                existing_action = action_snapshot.to_dict() or {}
+                status = (
+                    TableActionCommitStatus.IDEMPOTENT_REPLAY
+                    if existing_action.get("payload_hash") == payload_hash
+                    else TableActionCommitStatus.IDEMPOTENCY_CONFLICT
+                )
+                return TableActionCommitResult(
+                    status,
+                    int(existing_action.get("sequence", 0)),
+                )
+
+            state_snapshot = state_ref.get(transaction=transaction)
+            if not state_snapshot.exists:
+                return TableActionCommitResult(TableActionCommitStatus.NOT_INITIALIZED, 0)
+            current = state_snapshot.to_dict() or {}
+            current_sequence = current.get("sequence", 0)
+            if current.get("owner_id") != owner_id or current.get("fencing_epoch") != fencing_epoch:
+                return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
+            if current_sequence != expected_sequence:
+                return TableActionCommitResult(
+                    TableActionCommitStatus.SEQUENCE_CONFLICT,
+                    current_sequence,
+                )
+
+            next_sequence = expected_sequence + 1
+            transaction.set(
+                state_ref,
+                {
+                    **current,
+                    "sequence": next_sequence,
+                    "checkpoint": checkpoint,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                action_ref,
+                {
+                    "user_id": user_id,
+                    "action_id": action_id,
+                    "payload_hash": payload_hash,
+                    "sequence": next_sequence,
+                    "fencing_epoch": fencing_epoch,
+                    "committed_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return TableActionCommitResult(TableActionCommitStatus.COMMITTED, next_sequence)
+
+        return commit(transaction)
+
+    def _table_runtime_state_ref(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> Any:
+        if scope_type not in {"club", "union"} or not scope_id or not table_id:
+            raise ValueError("Table scope must be club or union and IDs must be non-empty.")
+        root = self._client.collection("clubs" if scope_type == "club" else "unions")
+        return (
+            root.document(scope_id)
+            .collection("tables")
+            .document(table_id)
+            .collection("runtime")
+            .document("state")
+        )
+
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:
         wallet_ref = self._client.collection("global_wallets").document(user_id)
         grant_ref = wallet_ref.collection("transactions").document("initial-grant")
+        reserve_ref = self._client.collection("platform_wallets").document("global-playmoney-reserve")
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -205,6 +425,19 @@ class FirestoreHandRepository:
                 wallet = wallet_snapshot.to_dict() or {}
                 return wallet, False
 
+            reserve_snapshot = reserve_ref.get(transaction=transaction)
+            reserve_wallet = reserve_snapshot.to_dict() or {}
+            if not reserve_snapshot.exists:
+                reserve_wallet = {
+                    "wallet_id": "global-playmoney-reserve",
+                    "wallet_type": "PLATFORM_RESERVE",
+                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "chip_balance": 1_000_000_000,
+                }
+            reserve_balance = reserve_wallet.get("chip_balance", 0)
+            if isinstance(reserve_balance, bool) or not isinstance(reserve_balance, int) or reserve_balance < INITIAL_GLOBAL_PLAYMONEY_FUNDS:
+                raise ValueError("Platform reserve does not have enough funds for an initial player grant.")
+
             wallet = {
                 "wallet_id": f"global-wallet-{user_id}",
                 "wallet_type": "GLOBAL_PLAYMONEY",
@@ -212,6 +445,18 @@ class FirestoreHandRepository:
                 "owner_user_id": user_id,
                 "chip_balance": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
             }
+            transaction.set(
+                reserve_ref,
+                {
+                    **reserve_wallet,
+                    "wallet_id": "global-playmoney-reserve",
+                    "wallet_type": "PLATFORM_RESERVE",
+                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "chip_balance": reserve_balance - INITIAL_GLOBAL_PLAYMONEY_FUNDS,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
             transaction.set(
                 wallet_ref,
                 {
@@ -228,9 +473,16 @@ class FirestoreHandRepository:
                     "currency_type": "GLOBAL_PLAYMONEY",
                     "type": "INITIAL_GRANT",
                     "amount": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
+                    "from_wallet_id": "global-playmoney-reserve",
+                    "to_wallet_id": f"global-wallet-{user_id}",
+                    "from_wallet_type": "PLATFORM_RESERVE",
+                    "to_wallet_type": "GLOBAL_PLAYMONEY",
+                    "from_user_id": "platform",
                     "to_user_id": user_id,
                     "performed_by": "system",
                     "timestamp": firestore.SERVER_TIMESTAMP,
+                    "balance_after": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
+                    "reserve_balance_after": reserve_balance - INITIAL_GLOBAL_PLAYMONEY_FUNDS,
                 },
             )
             return wallet, True
@@ -254,6 +506,7 @@ class FirestoreHandRepository:
         owner_ref = club_ref.collection("members").document(owner_user_id)
         wallet_ref = club_ref.collection("treasury").document("wallet")
         initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
+        reserve_ref = self._client.collection("platform_wallets").document("global-playmoney-reserve")
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -261,6 +514,19 @@ class FirestoreHandRepository:
             club_snapshot = club_ref.get(transaction=transaction)
             if club_snapshot.exists:
                 return False
+
+            reserve_snapshot = reserve_ref.get(transaction=transaction)
+            reserve_wallet = reserve_snapshot.to_dict() or {}
+            if not reserve_snapshot.exists:
+                reserve_wallet = {
+                    "wallet_id": "global-playmoney-reserve",
+                    "wallet_type": "PLATFORM_RESERVE",
+                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "chip_balance": 1_000_000_000,
+                }
+            reserve_balance = reserve_wallet.get("chip_balance", 0)
+            if isinstance(reserve_balance, bool) or not isinstance(reserve_balance, int) or reserve_balance < INITIAL_CLUB_TREASURY_FUNDS:
+                raise ValueError("Platform reserve does not have enough funds for an initial club grant.")
 
             transaction.set(
                 club_ref,
@@ -285,6 +551,18 @@ class FirestoreHandRepository:
                 },
             )
             transaction.set(
+                reserve_ref,
+                {
+                    **reserve_wallet,
+                    "wallet_id": "global-playmoney-reserve",
+                    "wallet_type": "PLATFORM_RESERVE",
+                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "chip_balance": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            transaction.set(
                 wallet_ref,
                 {"chip_balance": INITIAL_CLUB_TREASURY_FUNDS},
             )
@@ -294,11 +572,16 @@ class FirestoreHandRepository:
                     "transaction_id": "initial-funding",
                     "currency_type": "CLUB_CHIPS",
                     "type": "INITIAL_GRANT",
+                    "from_wallet_id": "global-playmoney-reserve",
+                    "to_wallet_id": f"club-treasury-{club_id}",
+                    "from_wallet_type": "PLATFORM_RESERVE",
+                    "to_wallet_type": "CLUB_TREASURY",
                     "to_club_id": club_id,
                     "amount": INITIAL_CLUB_TREASURY_FUNDS,
                     "performed_by": created_by,
                     "note": "Initial club treasury funding",
                     "timestamp": firestore.SERVER_TIMESTAMP,
+                    "reserve_balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                 },
             )
             return True
@@ -1284,6 +1567,30 @@ class FirestoreHandRepository:
             return BuyInStatus.RESERVED
 
         return commit(transaction)
+
+
+def _validate_table_checkpoint_write(
+    scope_type: str,
+    scope_id: str,
+    table_id: str,
+    owner_id: str,
+    fencing_epoch: int,
+    sequence: int,
+    checkpoint: dict[str, Any],
+) -> None:
+    if scope_type not in {"club", "union"}:
+        raise ValueError("Table scope must be club or union.")
+    if not scope_id or not table_id or not owner_id:
+        raise ValueError("Table scope, ID, and owner ID must be non-empty.")
+    if isinstance(fencing_epoch, bool) or not isinstance(fencing_epoch, int) or fencing_epoch < 1:
+        raise ValueError("Fencing epoch must be a positive integer.")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("Table sequence must be a non-negative integer.")
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != 1:
+        raise ValueError("Table checkpoint must use schema version 1.")
+    table_data = checkpoint.get("table")
+    if not isinstance(table_data, dict) or table_data.get("table_id") != table_id:
+        raise ValueError("Table checkpoint ID does not match its Firestore path.")
 
 
 def create_hand_repository(enabled: bool) -> NullHandRepository | FirestoreHandRepository:

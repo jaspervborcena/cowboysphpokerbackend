@@ -6,6 +6,8 @@ This list tracks repository work, not just architecture proposals. A completed d
 
 ## Completed in the Repository
 
+- [x] Implement reserve-backed initial grants for the global play-money wallet and club treasury, with atomic reserve debit + destination credit + ledger logging.
+- [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records and keep retries idempotent.
 - [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
 - [x] Include `game_id` in table listings, snapshots, create responses, and persisted union table metadata.
@@ -39,6 +41,8 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Replace the PokerKit-based catalog and tests with the explicit first-party registry.
 - [x] Remove PokerKit imports and the `requirements.txt` dependency after a repository-wide search and full test suite pass without PokerKit.
 - [x] Add a Firestore emulator config and a focused first-party NLH settlement/idempotency integration test.
+- [x] Add versioned JSON checkpoint codecs for NLH hand/deck state and the enclosing table state, including seats, settings, button rotation, pre-actions, replay frames, engine events, and pending completed hands; persistence remains outstanding.
+- [x] Add a Firestore transaction primitive that initializes versioned table checkpoints and atomically advances a checkpoint with a user/action-ID journal record, guarded by expected sequence and fencing epoch.
 - [ ] Run the Firestore emulator settlement test before production rollout. Firebase CLI requires JDK 21; the current environment only has JDK 17.
 
 ## UI: Can Proceed Now
@@ -57,8 +61,10 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 
 ## Before Multi-Worker Live Tables
 
+- [x] Add a Firestore transaction primitive that atomically advances a table checkpoint and records the action fingerprint, guarded by expected sequence and fencing epoch.
 - [ ] Design and implement one authoritative owner per table with durable leases and fencing generations.
-- [ ] Persist accepted state transitions/checkpoints and recover table state, action deduplication, and turn deadlines after worker failure.
+- [ ] Wire checkpoint/action transactions into table creation, seating, hand start, player actions, pre-actions, and timeout actions. Stage mutations and publish/acknowledge only after commit; atomically couple buy-in debits with seat/checkpoint updates.
+- [ ] Add protected/encrypted checkpoint storage and turn-deadline recovery.
 - [ ] Add reconnect replay cursors and durable action idempotency.
 - [ ] Keep current live-table testing on one backend instance until ownership and recovery exist.
 - [ ] Add Pub/Sub only when gateway and runtime workers are separated; define command routing, event/reply routing, ordering, retries, and deduplication. Pub/Sub is backend-internal and must not own game state or balances.
@@ -68,8 +74,8 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 
 - [ ] Define Firestore wallet accounts for `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, `CLUB_AGENT`, `CLUB_PLAYER`, and table escrow, with explicit owners, scopes, and currency types.
 - [ ] Support one Firebase identity as both an `AGENT` and a `PLAYER` with separate club-scoped agent-operating and personal-player wallets/ledgers. Define role grants, transfer boundaries, idempotency, and audit rules; never merge these balances.
-- [ ] On new account creation, provision a persistent `GLOBAL_PLAYMONEY` wallet and grant exactly 20,000 play-money chips once through trusted server-side provisioning. Make it idempotent; never expose an arbitrary client-controlled grant amount or mix it with club accounts.
-- [ ] Confirm whether club creation's existing idempotent 10,000 `CLUB_TREASURY` grant is the complete owner benefit or whether a separate `CLUB_PLAYER` grant is intended. Current owner personal balance starts at zero; preserve distinct account scopes and audit records.
+- [x] On new account creation, provision a persistent `GLOBAL_PLAYMONEY` wallet and grant exactly 20,000 play-money chips once through trusted server-side provisioning. The implementation uses a reserve-backed debit and records accounting rows; never expose an arbitrary client-controlled grant amount or mix it with club accounts.
+- [x] Confirm the club treasury grant path as a reserve-backed 10,000-chip initial grant that creates club-owned treasury state without creating an owner personal balance. Preserve distinct account scopes and audit records.
 - [ ] Specify double-entry wallet movements for treasury-to-agent funding, agent-to-player distribution/claim-back, player buy-in to table escrow, hand settlement, and cash-out. Commit ledger entries and cached account balances atomically and idempotently.
 - [ ] Add a player-authorized `GET` wallet summary/history API with explicit available/in-play values and strict separation of `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, operator, player, and table-escrow balances.
 - [ ] Define per-table lifetime semantics: every table has an assigned scheduled close datetime; its lifetime may vary (for example, 6 or 24 hours) based on that assignment. The weekly club settlement cutoff is an additional close boundary, not the only expiration schedule.

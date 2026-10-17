@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from google.cloud import firestore
 
-from database import BuyInStatus, FirestoreHandRepository, WalletTransactionStatus
+from database import (
+    BuyInStatus,
+    FirestoreHandRepository,
+    TableActionCommitStatus,
+    WalletTransactionStatus,
+    table_action_fingerprint,
+)
 from database import hand_repository
 
 
@@ -162,7 +169,14 @@ def test_buy_in_debits_balance_reserves_seat_and_is_idempotent(monkeypatch) -> N
 
 def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient({
+        ("platform_wallets", "global-playmoney-reserve"): {
+            "wallet_id": "global-playmoney-reserve",
+            "wallet_type": "PLATFORM_RESERVE",
+            "currency_type": "GLOBAL_PLAYMONEY",
+            "chip_balance": 1_000_000,
+        }
+    })
     repository = FirestoreHandRepository(client)
 
     wallet, created = repository.ensure_global_wallet("new-user")
@@ -170,6 +184,7 @@ def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
 
     wallet_path = ("global_wallets", "new-user")
     grant_path = ("global_wallets", "new-user", "transactions", "initial-grant")
+    reserve_path = ("platform_wallets", "global-playmoney-reserve")
     assert created is True
     assert wallet["wallet_type"] == "GLOBAL_PLAYMONEY"
     assert wallet["currency_type"] == "GLOBAL_PLAYMONEY"
@@ -178,6 +193,134 @@ def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
     assert retried_wallet["chip_balance"] == 20_000
     assert client.documents[wallet_path]["chip_balance"] == 20_000
     assert client.documents[grant_path]["amount"] == 20_000
+    assert client.documents[grant_path]["from_wallet_id"] == "global-playmoney-reserve"
+    assert client.documents[reserve_path]["chip_balance"] == 980_000
+
+
+def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({
+        ("platform_wallets", "global-playmoney-reserve"): {
+            "wallet_id": "global-playmoney-reserve",
+            "wallet_type": "PLATFORM_RESERVE",
+            "currency_type": "GLOBAL_PLAYMONEY",
+            "chip_balance": 1_000_000,
+        }
+    })
+    repository = FirestoreHandRepository(client)
+
+    assert repository.create_club("club-42", "Test Club", "owner-1", "admin-1") is True
+
+    treasury_path = ("clubs", "club-42", "treasury", "wallet")
+    initial_grant_path = ("clubs", "club-42", "transactions", "initial-funding")
+    reserve_path = ("platform_wallets", "global-playmoney-reserve")
+    assert client.documents[treasury_path]["chip_balance"] == 10_000
+    assert client.documents[initial_grant_path]["amount"] == 10_000
+    assert client.documents[initial_grant_path]["from_wallet_id"] == "global-playmoney-reserve"
+    assert client.documents[reserve_path]["chip_balance"] == 990_000
+
+
+def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+
+    created = repository.initialize_table_checkpoint(
+        "club", "club-1", "table-1", "worker-a", 1, checkpoint
+    )
+    retry = repository.initialize_table_checkpoint(
+        "club", "club-1", "table-1", "worker-b", 2, checkpoint
+    )
+
+    state_path = ("clubs", "club-1", "tables", "table-1", "runtime", "state")
+    assert created is True
+    assert retry is False
+    assert client.documents[state_path]["sequence"] == 0
+    assert client.documents[state_path]["owner_id"] == "worker-a"
+    assert client.documents[state_path]["fencing_epoch"] == 1
+    assert repository.get_table_checkpoint("club", "club-1", "table-1")["checkpoint"] == checkpoint
+
+
+def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    initial = {"schema_version": 1, "table": {"table_id": "table-1"}, "state": "before"}
+    advanced = {"schema_version": 1, "table": {"table_id": "table-1"}, "state": "after"}
+    action = {"action": "CALL", "amount": None}
+    fingerprint = table_action_fingerprint("player-1", "action-1", action)
+    assert repository.initialize_table_checkpoint(
+        "club", "club-1", "table-1", "worker-a", 3, initial
+    )
+
+    result = repository.commit_table_action(
+        "club", "club-1", "table-1", "worker-a", 3, 0,
+        "player-1", "action-1", fingerprint, advanced,
+    )
+
+    state_path = ("clubs", "club-1", "tables", "table-1", "runtime", "state")
+    assert result.status is TableActionCommitStatus.COMMITTED
+    assert result.sequence == 1
+    assert client.documents[state_path]["checkpoint"] == advanced
+    assert client.documents[state_path]["sequence"] == 1
+
+    replay = repository.commit_table_action(
+        "club", "club-1", "table-1", "worker-a", 3, 0,
+        "player-1", "action-1", fingerprint, initial,
+    )
+    assert replay.status is TableActionCommitStatus.IDEMPOTENT_REPLAY
+    assert replay.sequence == 1
+    assert client.documents[state_path]["checkpoint"] == advanced
+
+
+def test_table_action_commit_rejects_payload_conflict_stale_epoch_and_sequence(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+    assert repository.initialize_table_checkpoint(
+        "union", "union-1", "table-1", "worker-a", 5, checkpoint
+    )
+    payload_hash = table_action_fingerprint("player-1", "action-1", {"action": "CHECK"})
+
+    committed = repository.commit_table_action(
+        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "player-1", "action-1", payload_hash, checkpoint,
+    )
+    conflict = repository.commit_table_action(
+        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "player-1", "action-1", "0" * 64, checkpoint,
+    )
+    fenced = repository.commit_table_action(
+        "union", "union-1", "table-1", "worker-old", 4, 1,
+        "player-1", "action-2", "2" * 64, checkpoint,
+    )
+    stale_sequence = repository.commit_table_action(
+        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "player-1", "action-3", "3" * 64, checkpoint,
+    )
+
+    assert committed.status is TableActionCommitStatus.COMMITTED
+    assert conflict.status is TableActionCommitStatus.IDEMPOTENCY_CONFLICT
+    assert fenced.status is TableActionCommitStatus.FENCED
+    assert stale_sequence.status is TableActionCommitStatus.SEQUENCE_CONFLICT
+
+
+def test_table_action_commit_rejects_invalid_fingerprint_without_writing(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+    repository.initialize_table_checkpoint(
+        "club", "club-1", "table-1", "worker-a", 1, checkpoint
+    )
+
+    with pytest.raises(ValueError, match="SHA-256 payload hash"):
+        repository.commit_table_action(
+            "club", "club-1", "table-1", "worker-a", 1, 0,
+            "player-1", "action-1", "not-a-hash", checkpoint,
+        )
 
 
 def test_buy_in_does_not_write_when_balance_is_insufficient(monkeypatch) -> None:

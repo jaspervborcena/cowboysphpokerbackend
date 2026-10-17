@@ -59,6 +59,35 @@ def test_draw_and_burn_are_tracked_separately() -> None:
     assert len(deck.dealt_cards) + len(deck.burned_cards) + deck.cards_remaining == 52
 
 
+def test_deck_checkpoint_round_trip_preserves_card_order_and_zones() -> None:
+    deck = Deck.for_testing(83)
+    deck.draw_many(4)
+    deck.burn()
+    checkpoint = deck.to_checkpoint()
+
+    restored = Deck.from_checkpoint(checkpoint)
+
+    assert restored.to_checkpoint() == checkpoint
+    assert restored.draw_many(5) == deck.draw_many(5)
+    assert restored.burn() == deck.burn()
+
+
+def test_deck_checkpoint_rejects_duplicate_or_missing_cards() -> None:
+    checkpoint = Deck.for_testing(84).to_checkpoint()
+    checkpoint["remaining_cards"] = checkpoint["remaining_cards"][:-1]
+
+    with pytest.raises(ValueError, match="each of the 52 cards exactly once"):
+        Deck.from_checkpoint(checkpoint)
+
+
+def test_deck_checkpoint_rejects_unknown_version() -> None:
+    checkpoint = Deck.for_testing(85).to_checkpoint()
+    checkpoint["version"] = 2
+
+    with pytest.raises(ValueError, match="Unsupported deck checkpoint version"):
+        Deck.from_checkpoint(checkpoint)
+
+
 def test_failed_bulk_draw_does_not_partially_consume_deck() -> None:
     deck = Deck.for_testing(42)
     deck.draw_many(51)

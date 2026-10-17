@@ -58,7 +58,7 @@ interface WalletSummary {
 }
 ```
 
-Use [`ui-mocks/wallet-dashboard.json`](ui-mocks/wallet-dashboard.json) as the local fixture for these surfaces. It deliberately represents one user with both `AGENT` and `PLAYER` roles and distinct wallet IDs. The `mock_only` marker is intentional: these values are not returned by a live endpoint. `in_play_balance` includes the listed table stack; do not add the table stack to the player's available balance or show it as spendable funds. Keep global play chips visually and functionally separate from all club-chip accounts.
+Use [`ui-mocks/wallet-dashboard.json`](ui-mocks/wallet-dashboard.json) as the local fixture for these surfaces. It deliberately represents one user with both `AGENT` and `PLAYER` roles and distinct wallet IDs. The demo `Cowboys Global Room` treasury is a mock `CLUB_TREASURY` with 1,000,000,000 `CLUB_CHIPS`; it is not the user's `GLOBAL_PLAYMONEY` wallet, a live club, or a balance returned by the current API. The `mock_only` marker is intentional: these values are not returned by a live endpoint. `in_play_balance` includes the listed table stack; do not add the table stack to the player's available balance or show it as spendable funds. Keep global play chips visually and functionally separate from all club-chip accounts.
 
 ## Contract Through Engine Replacement
 

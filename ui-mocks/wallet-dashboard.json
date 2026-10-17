@@ -13,6 +13,12 @@
     "balance": 20000,
     "updated_at": "2026-10-16T08:00:00Z"
   },
+  "global_club": {
+    "club_id": "cowboys-global-room",
+    "name": "Cowboys Global Room",
+    "status": "mock_only",
+    "treasury_wallet_id": "cowboys-global-room-treasury"
+  },
   "onboarding_preview": {
     "account_creation_grant": {
       "wallet_type": "GLOBAL_PLAYMONEY",
@@ -32,6 +38,17 @@
     }
   },
   "club_wallets": [
+    {
+      "wallet_id": "cowboys-global-room-treasury",
+      "wallet_type": "CLUB_TREASURY",
+      "currency_type": "CLUB_CHIPS",
+      "club_id": "cowboys-global-room",
+      "club_name": "Cowboys Global Room",
+      "owner_user_id": null,
+      "balance": 1000000000,
+      "mock_only": true,
+      "updated_at": "2026-10-17T00:00:00Z"
+    },
     {
       "wallet_id": "club-demo-treasury",
       "wallet_type": "CLUB_TREASURY",
