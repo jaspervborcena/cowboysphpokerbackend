@@ -127,7 +127,7 @@ Invalid/missing credentials return `401`; inactive or missing membership returns
 
 ### Global play-money wallet
 
-`POST /me/wallets/global-playmoney/ensure` requires a valid Firebase ID token and has no request body. It creates a `GLOBAL_PLAYMONEY` wallet for the authenticated UID with exactly 20,000 chips and an initial-grant transaction, atomically and idempotently. If the wallet already exists, it returns the existing balance without granting more chips. The client must call this endpoint after Firebase sign-up/sign-in when provisioning is needed; Firebase account creation alone does not invoke it.
+`POST /me/wallets/global-playmoney/ensure` requires a valid Firebase ID token and has no request body. It creates a `GLOBAL_PLAYMONEY` wallet for the authenticated UID with exactly 20,000 chips and an initial-grant transaction, atomically and idempotently, debiting the platform reserve. If the wallet already exists, it returns the existing balance without granting more chips. The client must call this endpoint after Firebase sign-up/sign-in when provisioning is needed; Firebase account creation alone does not invoke it.
 
 Response `200`:
 
@@ -142,7 +142,7 @@ Response `200`:
 }
 ```
 
-`created` is `false` when the wallet already existed. `GET /me/wallets/global-playmoney` reads the authenticated user's wallet without creating one; it returns the same wallet fields except `created`. Missing wallet returns `404`; invalid stored balance returns `409`; invalid/missing credentials return `401`; unavailable Firestore returns `503`. These endpoints never accept a client-supplied user ID or grant amount. Global play money cannot be converted to or transferred into club chips, and global-table gameplay is not implemented.
+`created` is `false` when the wallet already existed. `GET /me/wallets/global-playmoney` reads the authenticated user's wallet without creating one; it returns the same wallet fields except `created`. Missing wallet returns `404`; invalid stored balance returns `409`; invalid/missing credentials return `401`; unavailable Firestore returns `503`. These endpoints never accept a client-supplied user ID or grant amount. User global play money cannot be converted to or transferred into club chips, and global-table gameplay is not implemented.
 
 ### Platform club provisioning
 
@@ -168,7 +168,9 @@ The endpoint returns `201` with the generated club ID, name, owner ID, and initi
 }
 ```
 
-It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
+It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, debits the platform reserve, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
+
+Implementation note: global-wallet grants and club treasury grants currently debit the same platform-reserve record, while their destination currencies remain `GLOBAL_PLAYMONEY` and `CLUB_CHIPS`, respectively. This platform-internal funding behavior does not define a user-facing conversion rate or allow users to transfer between those wallet types.
 
 ### Club wallet transfers
 

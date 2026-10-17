@@ -20,7 +20,7 @@ Frontend work can proceed against typed API/WebSocket interfaces and fixture-bac
 
 ### Wallet API
 
-The Wallet API is deployed separately from the game server. After Firebase sign-in, call `POST /me/wallets/global-playmoney/ensure` once to provision the signed-in user's wallet, then call `GET /me/wallets/global-playmoney` on later loads. The ensure endpoint is idempotent, but it currently grants 20,000 chips directly; it does not debit the proposed platform reserve. Do not simulate or modify wallet balances in the UI.
+The Wallet API is deployed separately from the game server. After Firebase sign-in, call `POST /me/wallets/global-playmoney/ensure` once to provision the signed-in user's wallet, then call `GET /me/wallets/global-playmoney` on later loads. The ensure endpoint idempotently grants 20,000 chips from the platform reserve. Do not simulate or modify wallet balances in the UI.
 
 Use distinct labels and never add balances from different scopes together:
 
@@ -32,7 +32,7 @@ Use distinct labels and never add balances from different scopes together:
 | Selected club, owner/manager tools | `CLUB_TREASURY` | `GET /clubs/{club_id}/wallet` reads the treasury. `POST /platform/clubs` creates a club with 10,000 treasury chips; the owner's personal member balance starts at zero. |
 | Active table | `TABLE_ESCROW` / seat stack | Show the player's stack for this table; do not treat it as another spendable wallet. |
 
-All wallet routes require a Firebase ID token. Club routes additionally require an active club membership; `GET /clubs/{club_id}/wallet` and inter-club treasury transfers require `OWNER` or `MANAGER`, while member send-out and claim-back permit `OWNER`, `MANAGER`, or an assigned `AGENT`. Claim-back is rejected while the member's `in_play_balance` is nonzero. Transfer requests require an idempotency `transaction_id`.
+All wallet routes require a Firebase ID token. Club routes additionally require an active club membership; `GET /clubs/{club_id}/wallet` and inter-club treasury transfers require `OWNER` or `MANAGER`, while member send-out and claim-back permit `OWNER`, `MANAGER`, or an assigned `AGENT`. Claim-back is rejected while the member's `in_play_balance` is nonzero. Transfer requests require an idempotency `transaction_id`. `POST /platform/clubs` is a real platform-admin mutation that creates a club and reserve-funded treasury; it is not a non-authoritative proposal or draft flow.
 
 The backend does not provide a player-initiated cash-out request/approval workflow. A UI may show a clearly labeled pending mock request, but must not change balances locally. An authorized operator can fulfill a claim-back through the existing endpoint. `GET /clubs/{club_id}/members/me` returns role/profile data; use the `/wallet` route for member balances.
 
@@ -73,7 +73,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 - Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
-- Global-wallet provisioning and reads are available through the Wallet API, but reserve-backed issuance, platform top-ups, game-earned global chips, and global-play-money tables are not implemented. Do not display a club treasury or club-member balance as the global wallet.
+- Reserve-backed initial grants for global wallets and club treasuries are implemented. Platform reserve top-ups, game-earned global chips, and global-play-money tables are not implemented. Do not display a club treasury or club-member balance as the global wallet; user balances remain separate and cannot be converted between wallet types.
 
 ## Session and Permissions
 

@@ -1,6 +1,6 @@
 # Firestore Data Model
 
-This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed money economy and are separate from the intended platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend; global play-money wallets/tables, local club/table metadata, member initialization, external payouts/refunds, and live table recovery are not implemented. Club wallet cash-in and claim-back are operator-mediated transfers between member balances, not external cash payments.
+This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed money economy and are separate from the platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend. Global play-money wallets and reserve-backed initial grants are implemented; global-table gameplay, local club/table metadata, general member initialization, external payouts/refunds, and live table recovery are not. Club wallet cash-in and claim-back are operator-mediated transfers between member balances, not external cash payments.
 
 Target wallet accounts are distinct by purpose:
 
@@ -12,11 +12,14 @@ Target wallet accounts are distinct by purpose:
 
 Each account must have an explicit `wallet_type`, scope, owner, and `currency_type`. Ledger transactions must identify source and destination accounts and balance per currency; never sum or implicitly transfer across global and club currencies. Cached balances may be maintained for reads, but ledger entries and account updates must commit atomically and idempotently.
 
-These are target concepts, not current Firestore paths or implemented APIs. Today Firestore has the club treasury and a single member `chip_balance`/`in_play_balance` pair. It does not yet have separate `CLUB_AGENT`, `CLUB_PLAYER`, or `GLOBAL_PLAYMONEY` accounts. Keep the current-field descriptions below as the existing implementation until the migration is designed and shipped.
+These are the target account concepts, but not all have distinct account documents today. `GLOBAL_PLAYMONEY` has a persistent wallet document and reserve-backed initial grant. Club members still have one `chip_balance`/`in_play_balance` pair rather than separate `CLUB_AGENT`, `CLUB_PLAYER`, and `TABLE_ESCROW` accounts. Keep the current-field descriptions below as the existing club-member implementation until that account migration is designed and shipped.
 
 ## Collection Layout
 
 ```text
+platform_wallets/global-playmoney-reserve
+global_wallets/{user_id}
+  transactions/{transaction_id}
 clubs/{club_id}
   members/{user_id}
     transactions/{buy_in_id}
@@ -132,7 +135,7 @@ The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
 }
 ```
 
-For local club hands, rake and BBJ drops update these fields atomically with the hand audit and member settlement. Each contribution also gets a server-written club transaction entry keyed by hand ID and type, so a retried hand does not double-count pools. The Hand-of-the-Day field is reserved, but contributions and awards are not applied until their funding and winner rules are defined. Union-wide fee allocation remains undefined and is not applied to these club pools. Global play-money wallets and global-table buy-ins are not implemented.
+For local club hands, rake and BBJ drops update these fields atomically with the hand audit and member settlement. Each contribution also gets a server-written club transaction entry keyed by hand ID and type, so a retried hand does not double-count pools. The Hand-of-the-Day field is reserved, but contributions and awards are not applied until their funding and winner rules are defined. Union-wide fee allocation remains undefined and is not applied to these club pools. Global play-money wallets are implemented, but global-table buy-ins are not.
 
 ### Completed hand audit
 
