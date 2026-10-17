@@ -5,7 +5,9 @@ from collections import OrderedDict
 
 from database import FirestoreHandRepository, NullHandRepository
 from logic.connections import ConnectionManager
+from logic.table_checkpoint import deserialize_first_party_table
 from logic.table_game_base import TableGameBase
+from logic.table_ownership import TableLease, TableLeaseManager
 
 
 class ActionIdempotencyConflict(ValueError):
@@ -18,9 +20,10 @@ class TableRuntime:
         club_id: str,
         game: TableGameBase,
         connections: ConnectionManager,
-        repository: FirestoreHandRepository | NullHandRepository,
+        repository: FirestoreHandRepository | NullHandRepository | None,
         turn_timeout_seconds: int,
         union_id: str | None = None,
+        lease_manager: TableLeaseManager | None = None,
     ) -> None:
         self.club_id = club_id
         self.game = game
@@ -30,10 +33,71 @@ class TableRuntime:
         self.union_id = union_id
         self.connection_scope = f"union:{union_id}" if union_id else club_id
         self.lock = asyncio.Lock()
+        self.lease_manager = lease_manager or TableLeaseManager()
+        self._worker_id: str | None = None
         self._turn_task: asyncio.Task[None] | None = None
         self._recent_actions: OrderedDict[
             tuple[str, str], tuple[str, int | None]
         ] = OrderedDict()
+
+    def claim_lease(self, worker_id: str, *, force_reclaim: bool = False) -> TableLease:
+        lease = self.lease_manager.claim_lease(
+            self.game.table_id,
+            worker_id,
+            force_reclaim=force_reclaim,
+        )
+        self._worker_id = worker_id
+        return lease
+
+    def renew_lease(self, worker_id: str, fencing_generation: int) -> TableLease:
+        return self.lease_manager.renew_lease(
+            self.game.table_id,
+            worker_id,
+            fencing_generation,
+        )
+
+    def authorize_action(self, worker_id: str, fencing_generation: int) -> TableLease:
+        return self.lease_manager.authorize_action(
+            self.game.table_id,
+            worker_id,
+            fencing_generation,
+        )
+
+    def current_lease(self) -> TableLease | None:
+        return self.lease_manager._leases.get(self.game.table_id)
+
+    async def load_persisted_state(self) -> bool:
+        if self.repository is None:
+            return False
+
+        checkpoint_payload = await asyncio.to_thread(
+            self.repository.get_table_checkpoint,
+            "club",
+            self.club_id,
+            self.game.table_id,
+        )
+        if checkpoint_payload is None:
+            return False
+
+        checkpoint = checkpoint_payload.get("checkpoint")
+        if checkpoint is None:
+            return False
+
+        restored_game = deserialize_first_party_table(checkpoint)
+        self.game = restored_game
+
+        owner_id = checkpoint_payload.get("owner_id")
+        fencing_epoch = checkpoint_payload.get("fencing_epoch")
+        if owner_id is None or fencing_epoch is None:
+            return True
+
+        lease = self.lease_manager.recover_lease(
+            self.game.table_id,
+            owner_id,
+            fencing_epoch,
+        )
+        self._worker_id = owner_id
+        return lease.owner_worker_id == owner_id and lease.fencing_generation == fencing_epoch
 
     async def start_hand(self, straddle_player_id: str | None = None) -> bool:
         async with self.lock:

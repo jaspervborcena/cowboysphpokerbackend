@@ -55,6 +55,13 @@ from logic.game_catalog import (
 )
 from logic.runtime import ActionIdempotencyConflict, TableRuntime
 from logic.table_game_base import TableGameBase
+from logic.table_ownership import (
+    LeaseAlreadyHeldError,
+    LeaseExpiredError,
+    TableLeaseManager,
+    WorkerCoordinator,
+    WorkerCoordinatorRegistry,
+)
 from logic.websocket_protocol import (
     MalformedWebSocketMessage,
     PROTOCOL_VERSION,
@@ -83,6 +90,11 @@ class SeatPlayerRequest(BaseModel):
 
 class StartHandRequest(BaseModel):
     straddle_player_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class TableLeaseClaimRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    force_reclaim: bool = False
 
 
 class CreateUnionTableRequest(CreateTableRequest):
@@ -167,6 +179,10 @@ app.state.token_verifier = FirebaseTokenVerifier(
     os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
 )
 tables: dict[tuple[str, str], TableRuntime] = {}
+shared_table_lease_manager = TableLeaseManager(
+    ttl_seconds=int(os.getenv("TABLE_LEASE_TTL_SECONDS", "30"))
+)
+worker_coordinators = WorkerCoordinatorRegistry(shared_table_lease_manager)
 max_seats = int(os.getenv("MAX_SEATS", "9"))
 turn_timeout_seconds = int(os.getenv("TURN_TIMEOUT_SECONDS", "30"))
 websocket_heartbeat_interval_seconds = int(
@@ -222,6 +238,29 @@ def table_lobby_entry(game: TableGameBase) -> dict[str, Any]:
         "is_hand_running": game.is_hand_running,
         **game.table_settings.as_dict(),
     }
+
+
+def table_lease_payload(runtime: TableRuntime) -> dict[str, Any]:
+    lease = runtime.current_lease()
+    if lease is None:
+        return {
+            "table_id": runtime.game.table_id,
+            "owner_worker_id": None,
+            "fencing_generation": None,
+            "lease_expires_at": None,
+            "status": "unowned",
+        }
+    return {
+        "table_id": runtime.game.table_id,
+        "owner_worker_id": lease.owner_worker_id,
+        "fencing_generation": lease.fencing_generation,
+        "lease_expires_at": lease.lease_expires_at.isoformat(),
+        "status": lease.status,
+    }
+
+
+def get_worker_coordinator(worker_id: str) -> WorkerCoordinator:
+    return worker_coordinators.get_or_create(worker_id)
 
 
 @app.get("/health")
@@ -457,7 +496,12 @@ async def create_table(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     tables[key] = TableRuntime(
-        club_id, game, connections, repository, turn_timeout_seconds
+        club_id,
+        game,
+        connections,
+        repository,
+        turn_timeout_seconds,
+        lease_manager=shared_table_lease_manager,
     )
     return {
         "club_id": club_id,
@@ -535,6 +579,7 @@ async def create_union_table(
         repository,
         turn_timeout_seconds,
         union_id=union_id,
+        lease_manager=shared_table_lease_manager,
     )
     return {
         "union_id": union_id,
@@ -542,6 +587,115 @@ async def create_union_table(
         "game_id": game.game_id,
         "origin_club_id": request.origin_club_id,
         "status": "created",
+    }
+
+
+@app.post("/workers/{worker_id}/start")
+async def start_worker_coordinator(worker_id: str) -> dict[str, Any]:
+    coordinator = get_worker_coordinator(worker_id)
+    coordinator.start()
+    return {
+        "worker_id": worker_id,
+        "status": "started",
+        "assigned_tables": coordinator.assigned_tables(),
+    }
+
+
+@app.get("/workers/{worker_id}/tables")
+async def list_worker_tables(worker_id: str) -> dict[str, Any]:
+    coordinator = get_worker_coordinator(worker_id)
+    return {
+        "worker_id": worker_id,
+        "assigned_tables": coordinator.assigned_tables(),
+    }
+
+
+@app.post("/workers/{worker_id}/tables/{table_id}/lease")
+async def claim_worker_table_lease(
+    worker_id: str,
+    table_id: str,
+    request: TableLeaseClaimRequest | None = None,
+) -> dict[str, Any]:
+    coordinator = get_worker_coordinator(worker_id)
+    claim = request or TableLeaseClaimRequest(worker_id=worker_id)
+    force_reclaim = claim.force_reclaim
+    lease = coordinator.bind_table(table_id, force_reclaim=force_reclaim)
+    return {
+        "worker_id": worker_id,
+        "table_id": table_id,
+        "owner_worker_id": lease.owner_worker_id,
+        "fencing_generation": lease.fencing_generation,
+        "lease_expires_at": lease.lease_expires_at.isoformat(),
+        "status": lease.status,
+    }
+
+
+@app.post("/workers/{worker_id}/tables/{table_id}/heartbeat")
+async def renew_worker_table_lease(worker_id: str, table_id: str) -> dict[str, Any]:
+    coordinator = get_worker_coordinator(worker_id)
+    lease = coordinator.heartbeat(table_id)
+    return {
+        "worker_id": worker_id,
+        "table_id": table_id,
+        "owner_worker_id": lease.owner_worker_id,
+        "fencing_generation": lease.fencing_generation,
+        "lease_expires_at": lease.lease_expires_at.isoformat(),
+        "status": lease.status,
+    }
+
+
+@app.delete("/workers/{worker_id}/tables/{table_id}/lease", status_code=204)
+async def release_worker_table_lease(worker_id: str, table_id: str) -> Response:
+    coordinator = get_worker_coordinator(worker_id)
+    released = coordinator.session.release_table(table_id)
+    if not released:
+        raise HTTPException(status_code=404, detail="Worker does not own the requested table lease.")
+    return Response(status_code=204)
+
+
+@app.post("/clubs/{club_id}/tables/{table_id}/lease")
+async def claim_club_table_lease(
+    club_id: str,
+    table_id: str,
+    request: TableLeaseClaimRequest,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    runtime = get_table(club_id, table_id)
+    try:
+        lease = runtime.claim_lease(request.worker_id, force_reclaim=request.force_reclaim)
+    except LeaseAlreadyHeldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "club_id": club_id,
+        "table_id": table_id,
+        **table_lease_payload(runtime),
+        "owner_worker_id": lease.owner_worker_id,
+        "fencing_generation": lease.fencing_generation,
+    }
+
+
+@app.post("/unions/{union_id}/tables/{table_id}/lease")
+async def claim_union_table_lease(
+    union_id: str,
+    table_id: str,
+    request: TableLeaseClaimRequest,
+    membership: UnionMembership = Depends(require_union_admin()),
+) -> dict[str, Any]:
+    runtime = tables.get(union_table_key(union_id, table_id))
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="Union table not found.")
+    try:
+        lease = runtime.claim_lease(request.worker_id, force_reclaim=request.force_reclaim)
+    except LeaseAlreadyHeldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "union_id": union_id,
+        "table_id": table_id,
+        **table_lease_payload(runtime),
+        "owner_worker_id": lease.owner_worker_id,
+        "fencing_generation": lease.fencing_generation,
     }
 
 

@@ -32,6 +32,7 @@ tests/                   Engine and API integration tests
 
 The current WebSocket lifecycle, legacy and v1 message examples, and union-table behavior are documented in [websocket.md](websocket.md).
 The UI workflow, Firebase session handling, role-aware screens, v1 socket messages, retries, heartbeats, and error display guidance are in [UI_GUIDE.md](UI_GUIDE.md).
+The UI-safe/non-authoritative boundary for a second agent is documented in [AGENT_2_UI_SAFE_GUIDE.md](AGENT_2_UI_SAFE_GUIDE.md).
 
 ## Club Roles
 
