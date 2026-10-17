@@ -25,7 +25,7 @@ Use the OpenAPI JSON as the source for UI request/response types or client gener
 
 ### Internal worker coordination
 
-The game server currently exposes `/workers/{worker_id}/start`, `/workers/{worker_id}/tables`, and per-table lease claim, heartbeat, and release routes. These endpoints are not part of the browser client contract: they currently have no service authentication and use a process-local coordinator rather than the Firestore lease repository. Keep them behind trusted internal ingress and do not use them for multi-instance ownership until authentication and runtime integration are implemented.
+The game server currently exposes `/workers/{worker_id}/start`, `/workers/{worker_id}/tables`, and per-table lease claim, heartbeat, and release routes. These endpoints are not part of the browser client contract. They require an HTTP bearer token matching `WORKER_COORDINATION_TOKEN` and fail closed if it is unset; HTTP force-reclaim requests are rejected. These generic worker routes still use process-local ownership. By contrast, the club/union-scoped table lease claim routes call `TableRuntime` and use Firestore lease operations when Firestore is enabled. Neither path currently makes gameplay writes atomic with the lease fence. Restrict worker-route ingress to trusted services and manage the token as a secret.
 
 ## Error Response Standard
 

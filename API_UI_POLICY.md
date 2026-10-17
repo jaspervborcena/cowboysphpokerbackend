@@ -50,7 +50,7 @@ For this repository, the policy is:
 
 ### 1.4 Internal worker coordination
 
-The game server's `/workers/{worker_id}/...` coordination routes are not UI-safe. They currently lack service authentication and mutate only process-local worker/lease state. Do not call them from a browser or expose them through public ingress; durable lease repository operations are not yet wired into those routes.
+The game server's `/workers/{worker_id}/...` coordination routes are not UI-safe. They require the configured `WORKER_COORDINATION_TOKEN` bearer token, must reject mismatched path/payload worker IDs, and require an active worker session before claim/renew/release operations. Do not call them from a browser or expose them through public ingress; they are internal service routes and remain separate from player-facing API flows. When Firestore is enabled, the runtime can enforce the scoped lease operations through the durable repository, but cross-instance ownership and recovery remain the next hardening milestone.
 
 ---
 

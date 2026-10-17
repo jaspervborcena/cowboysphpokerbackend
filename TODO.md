@@ -4,6 +4,19 @@ Last reviewed: 2026-10-17
 
 This list tracks repository work, not just architecture proposals. A completed diagram or document does not mean its runtime components are implemented.
 
+## Next Work: Durable Multi-Worker Tables
+
+Complete these in order before running live tables across multiple backend instances:
+
+- [x] Require `WORKER_COORDINATION_TOKEN` bearer authentication on `/workers/{worker_id}/...`, fail closed when unset, reject HTTP force-reclaim requests, and reject mismatched path/payload worker IDs and unstarted sessions.
+- [ ] Restrict worker-route ingress to trusted services and manage/rotate the token through the deployment secret manager.
+- [x] Connect `TableRuntime` lease claim/renew/authorize/release methods and club/union per-table claim routes to Firestore lease operations when Firestore is enabled.
+- [ ] Replace the generic process-local `/workers/{worker_id}/...` coordinator with scope-aware durable assignment, heartbeat, release, and recovery flows.
+- [ ] Persist initial table checkpoints and restore table state, owner, and fencing generation when a runtime starts or a worker takes over.
+- [ ] Stage each authoritative mutation and atomically commit its checkpoint/action record while checking lease owner, generation, and expiry in that same transaction. Cover table lifecycle, seating/buy-in, hand start, player/pre-actions, and timeout actions.
+- [ ] Route all table commands to the single current owner; do not create a second in-memory authority on another instance. Add a broker only if the gateway/runtime split requires it.
+- [ ] Prove concurrent claims, stale-worker rejection, retries, and crash/restart recovery with Firestore-emulator tests; then load-test 100 concurrent tables and measure contention, latency, quotas, and cost before increasing worker count.
+
 ## Completed in the Repository
 
 - [x] Implement reserve-backed initial grants for the global play-money wallet and club treasury, with atomic reserve debit + destination credit + ledger logging.
@@ -45,23 +58,14 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Add a Firestore transaction primitive that initializes versioned table checkpoints and atomically advances a checkpoint with a user/action-ID journal record, guarded by expected sequence and fencing epoch.
 - [ ] Run the Firestore emulator settlement test before production rollout. Firebase CLI requires JDK 21; the current environment only has JDK 17.
 
-## UI: Can Proceed Now
+## UI Client Work
 
-- [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
-- [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
-- [ ] After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to provision the authenticated user's persistent `GLOBAL_PLAYMONEY` wallet with 20,000 chips, then load it with `GET /me/wallets/global-playmoney`. Keep it isolated from club chips and do not offer client-controlled grant amounts.
-- [ ] After club provisioning, display the live 10,000-chip `CLUB_TREASURY` grant from `POST /platform/clubs` and refresh via `GET /clubs/{club_id}/wallet`. The owner membership's personal `chip_balance` currently starts at zero; do not show the treasury grant as personal funds.
-- [ ] For club players, use the live `POST /clubs/{club_id}/wallet/send-out` flow for funding by an authorized owner, manager, or assigned agent. There is no other club-funding path for players.
-- [ ] Mock a player-initiated cash-out request as pending UI state. An authorized owner, manager, or assigned agent can fulfill it with `POST /clubs/{club_id}/wallet/claim-back`; surface the existing restriction that claim-back is unavailable while `in_play_balance` is nonzero. No request/approval API exists yet.
-- [ ] Show available and in-play member balances separately, and keep global play money, club treasury funds, operator funds, player funds, and table stacks distinct.
-- [ ] Keep the client engine-agnostic: do not calculate outcomes, alter balances, expose hidden cards, or depend on engine internals.
-- [ ] Keep the selectable game list limited to entries with `create_supported: true`; currently this is NLH only.
-
-The UI can proceed against the stable REST, WebSocket, snapshot, and replay contracts. Coordinate and version any breaking contract changes before rollout. The frontend source is not in this backend repository.
+The client implementation checklist lives in [UI_GUIDE.md](UI_GUIDE.md); API request/response contracts live in [API.md](API.md). The frontend source is maintained in the separate client repository.
 
 ## Before Multi-Worker Live Tables
 
 - [x] Add a Firestore transaction primitive that atomically advances a table checkpoint and records the action fingerprint, guarded by expected sequence and fencing epoch.
+- [x] Validate matching lease owner, fencing generation, and unexpired lease in the same Firestore transaction as a table action checkpoint commit; this repository primitive is not yet called by live gameplay.
 - [x] Add Firestore transaction-backed table lease repository operations for claim, renewal, authorization, and release; preserve fencing generations across expiry and release.
 - [ ] Wire durable leases into runtime ownership, worker claim/heartbeat/release routes, and checkpoint recovery; remove process-local lease state as the ownership source of truth.
 - [ ] Check lease owner, fencing generation, and expiry in the same Firestore transaction that commits each authoritative table mutation; a separate pre-write authorization check is not sufficient.
@@ -86,7 +90,7 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 - [ ] Test cutoff boundaries, delayed/retried expiration jobs, active-hand handling, and recovery when the service is unavailable at the cutoff.
 - [ ] Validate platform club owner UIDs and add request idempotency to prevent duplicate initial grants.
 - [ ] Review authorization for every REST route, WebSocket action, table, union, and administrative operation.
-- [ ] Add service-to-service authentication and trusted ingress restrictions for the currently unauthenticated `/workers/{worker_id}/...` coordination routes; disallow untrusted forced lease reclamation.
+- [ ] Restrict Cloud Run ingress and manage/rotate `WORKER_COORDINATION_TOKEN` through the deployment secret manager; the application bearer-token gate is implemented.
 - [ ] Add an idempotent player cash-out request/approval API and define/test seat exit, rebuy/top-up, external payout/refund, and reconciliation before treating club balances as a complete money ledger.
 - [ ] Add Firestore schema versions, access rules/indexes, emulator-backed transaction tests, and backup/restore drills.
 - [ ] Add per-table metrics (mailbox depth, action latency, timer drift, lease renewals), alerts, rate limits, and deployment/rollback checks.

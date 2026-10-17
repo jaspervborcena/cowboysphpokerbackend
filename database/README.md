@@ -48,7 +48,7 @@ unions/{union_id}
 
 `clubs`, `members`, `tables`, and `hands` are Firestore collections/subcollections. The `{...}` portions are document IDs, not literal field values.
 
-The repository provides Firestore transaction operations for `tables/{table_id}/runtime/state`, its `actions/{action_hash}` journal, and `tables/{table_id}/runtime/lease`. Checkpoints carry a schema version, sequence, owner ID, fencing epoch, and serialized state. Lease records carry owner, fencing generation, expiry, heartbeat, and status. These operations are unit-tested but are not called by table creation or `TableRuntime`; live table state and ownership remain process-local, and these documents may not exist for a running table.
+The repository provides Firestore transaction operations for `tables/{table_id}/runtime/state`, its `actions/{action_hash}` journal, and `tables/{table_id}/runtime/lease`. Checkpoints carry a schema version, sequence, owner ID, fencing epoch, and serialized state. Lease records carry owner, fencing generation, expiry, heartbeat, and status. `commit_table_action` validates checkpoint owner/epoch, the matching lease owner/generation, and lease expiry in the same transaction as the checkpoint and journal write. `TableRuntime` lease methods and scoped club/union claim routes use lease operations when Firestore is enabled, but live gameplay does not call `commit_table_action`. The generic `/workers/{worker_id}/...` coordinator also remains process-local, and the runtime table map is not durable.
 
 ## Fields Written by the Backend
 

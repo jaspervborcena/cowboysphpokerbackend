@@ -107,6 +107,7 @@ class NullHandRepository:
         ttl_seconds: int,
         *,
         force_reclaim: bool = False,
+        initial_checkpoint: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         raise FirestoreRequiredError("Firestore must be enabled to claim a table lease.")
@@ -171,6 +172,8 @@ class NullHandRepository:
         action_id: str,
         payload_hash: str,
         checkpoint: dict[str, Any],
+        *,
+        now: datetime | None = None,
     ) -> TableActionCommitResult:
         raise FirestoreRequiredError("Firestore must be enabled to persist a table action.")
 
@@ -352,6 +355,7 @@ class FirestoreHandRepository:
         ttl_seconds: int,
         *,
         force_reclaim: bool = False,
+        initial_checkpoint: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         if not worker_id or ttl_seconds < 1:
@@ -370,13 +374,53 @@ class FirestoreHandRepository:
             expires_at = current.get("lease_expires_at")
             active = owner_id is not None and expires_at is not None and expires_at > current_time
             if active and owner_id == worker_id:
+                if not state_snapshot.exists and initial_checkpoint is not None:
+                    generation = int(current["fencing_generation"])
+                    _validate_table_checkpoint_write(
+                        scope_type,
+                        scope_id,
+                        table_id,
+                        worker_id,
+                        generation,
+                        0,
+                        initial_checkpoint,
+                    )
+                    transaction.set(
+                        state_ref,
+                        {
+                            "schema_version": 1,
+                            "scope_type": scope_type,
+                            "scope_id": scope_id,
+                            "table_id": table_id,
+                            "owner_id": worker_id,
+                            "fencing_epoch": generation,
+                            "sequence": 0,
+                            "checkpoint": initial_checkpoint,
+                            "updated_at": firestore.SERVER_TIMESTAMP,
+                        },
+                    )
                 return current
             if active and not force_reclaim:
                 raise TableLeaseConflictError(
                     f"Table {table_id} is already owned by worker {owner_id}."
                 )
 
-            generation = int(current.get("fencing_generation", 0)) + 1
+            state = state_snapshot.to_dict() or {} if state_snapshot.exists else {}
+            previous_generation = max(
+                int(current.get("fencing_generation", 0)),
+                int(state.get("fencing_epoch", 0)),
+            )
+            generation = previous_generation + 1
+            if not state_snapshot.exists and initial_checkpoint is not None:
+                _validate_table_checkpoint_write(
+                    scope_type,
+                    scope_id,
+                    table_id,
+                    worker_id,
+                    generation,
+                    0,
+                    initial_checkpoint,
+                )
             lease = {
                 "scope_type": scope_type,
                 "scope_id": scope_id,
@@ -389,10 +433,24 @@ class FirestoreHandRepository:
             }
             transaction.set(lease_ref, lease)
             if state_snapshot.exists:
-                state = state_snapshot.to_dict() or {}
                 transaction.set(
                     state_ref,
                     {**state, "owner_id": worker_id, "fencing_epoch": generation},
+                )
+            elif initial_checkpoint is not None:
+                transaction.set(
+                    state_ref,
+                    {
+                        "schema_version": 1,
+                        "scope_type": scope_type,
+                        "scope_id": scope_id,
+                        "table_id": table_id,
+                        "owner_id": worker_id,
+                        "fencing_epoch": generation,
+                        "sequence": 0,
+                        "checkpoint": initial_checkpoint,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
                 )
             return lease
 
@@ -557,6 +615,8 @@ class FirestoreHandRepository:
         action_id: str,
         payload_hash: str,
         checkpoint: dict[str, Any],
+        *,
+        now: datetime | None = None,
     ) -> TableActionCommitResult:
         _validate_table_checkpoint_write(
             scope_type,
@@ -575,9 +635,11 @@ class FirestoreHandRepository:
             raise ValueError("Action identity and SHA-256 payload hash are required.")
 
         state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
         action_key = hashlib.sha256(f"{user_id}\0{action_id}".encode("utf-8")).hexdigest()
         action_ref = state_ref.collection("actions").document(action_key)
         transaction = self._client.transaction()
+        current_time = now or datetime.now(timezone.utc)
 
         @firestore.transactional
         def commit(transaction: Any) -> TableActionCommitResult:
@@ -600,6 +662,17 @@ class FirestoreHandRepository:
             current = state_snapshot.to_dict() or {}
             current_sequence = current.get("sequence", 0)
             if current.get("owner_id") != owner_id or current.get("fencing_epoch") != fencing_epoch:
+                return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
+
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            lease = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
+            expires_at = lease.get("lease_expires_at")
+            if (
+                lease.get("owner_id") != owner_id
+                or lease.get("fencing_generation") != fencing_epoch
+                or expires_at is None
+                or expires_at <= current_time
+            ):
                 return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
             if current_sequence != expected_sequence:
                 return TableActionCommitResult(

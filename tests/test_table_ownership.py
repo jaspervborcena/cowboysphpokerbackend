@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from database import FirestoreHandRepository
 from logic.connections import ConnectionManager
 from logic.first_party_table import FirstPartyNLHGame
 from logic.runtime import TableRuntime
@@ -135,6 +136,155 @@ def test_runtime_enforces_worker_lease_and_generation_fencing() -> None:
 
     active = runtime.authorize_action("worker-b", 2)
     assert active.owner_worker_id == "worker-b"
+
+
+def test_runtime_uses_durable_lease_repository_for_club_and_union_tables() -> None:
+    class LeaseRepository(FirestoreHandRepository):
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.lease: dict[str, object] | None = None
+            self.checkpoints: dict[tuple[str, str, str], dict[str, object]] = {}
+
+        def get_table_checkpoint(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            self.calls.append(("get_checkpoint", scope_type, scope_id, table_id))
+            return self.checkpoints.get((scope_type, scope_id, table_id))
+
+        def initialize_table_checkpoint(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            owner_id: str,
+            fencing_epoch: int,
+            checkpoint: dict[str, object],
+        ) -> bool:
+            self.calls.append(("initialize_checkpoint", scope_type, scope_id, table_id, fencing_epoch))
+            key = (scope_type, scope_id, table_id)
+            if key in self.checkpoints:
+                return False
+            self.checkpoints[key] = {
+                "owner_id": owner_id,
+                "fencing_epoch": fencing_epoch,
+                "sequence": 0,
+                "checkpoint": checkpoint,
+            }
+            return True
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("claim", scope_type, scope_id, table_id, worker_id, force_reclaim))
+            current = _now()
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 4,
+                "lease_expires_at": current + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current,
+                "status": "active",
+            }
+            key = (scope_type, scope_id, table_id)
+            if key not in self.checkpoints and initial_checkpoint is not None:
+                self.checkpoints[key] = {
+                    "owner_id": worker_id,
+                    "fencing_epoch": 4,
+                    "sequence": 0,
+                    "checkpoint": initial_checkpoint,
+                }
+            return self.lease
+
+        def get_table_lease(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            self.calls.append(("get", scope_type, scope_id, table_id))
+            return self.lease
+
+        def renew_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            ttl_seconds: int,
+            *,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("renew", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            return self.lease
+
+        def authorize_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            *,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("authorize", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            return self.lease
+
+        def release_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            *,
+            now: datetime | None = None,
+        ) -> bool:
+            self.calls.append(("release", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            self.lease = {**self.lease, "owner_id": None, "status": "released"}
+            return True
+
+    repository = LeaseRepository()
+    runtime = TableRuntime(
+        "club-1",
+        FirstPartyNLHGame("durable-club-table", 10, 20, 20, 1000),
+        ConnectionManager(),
+        repository,
+        turn_timeout_seconds=0,
+    )
+
+    claimed = runtime.claim_lease("worker-a")
+    assert claimed.fencing_generation == 4
+    assert runtime.current_lease().owner_worker_id == "worker-a"
+    assert runtime.renew_lease("worker-a", 4).fencing_generation == 4
+    assert runtime.authorize_action("worker-a", 4).owner_worker_id == "worker-a"
+    assert runtime.release_lease("worker-a", 4) is True
+    assert runtime.current_lease() is None
+
+    union_runtime = TableRuntime(
+        "club-1",
+        FirstPartyNLHGame("durable-union-table", 10, 20, 20, 1000),
+        ConnectionManager(),
+        repository,
+        turn_timeout_seconds=0,
+        union_id="union-1",
+    )
+    union_runtime.claim_lease("worker-b")
+
+    assert repository.calls[0] == (
+        "claim", "club", "club-1", "durable-club-table", "worker-a", False
+    )
+    assert ("claim", "union", "union-1", "durable-union-table", "worker-b", False) in repository.calls
 
 
 def test_runtime_recovers_persisted_checkpoint_and_lease() -> None:

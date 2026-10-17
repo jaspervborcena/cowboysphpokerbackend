@@ -5,12 +5,14 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from hmac import compare_digest
 from typing import Any
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError
 
 from app.api.hand_history import router as hand_history_router
@@ -189,6 +191,7 @@ websocket_heartbeat_interval_seconds = int(
     os.getenv("WEBSOCKET_HEARTBEAT_INTERVAL_SECONDS", "30")
 )
 websocket_idle_timeout_seconds = int(os.getenv("WEBSOCKET_IDLE_TIMEOUT_SECONDS", "90"))
+worker_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def requested_table_size(table_size: int | None) -> int:
@@ -261,6 +264,37 @@ def table_lease_payload(runtime: TableRuntime) -> dict[str, Any]:
 
 def get_worker_coordinator(worker_id: str) -> WorkerCoordinator:
     return worker_coordinators.get_or_create(worker_id)
+
+
+def require_worker_session_started(worker_id: str, *, allow_unstarted: bool = False) -> WorkerCoordinator:
+    coordinator = get_worker_coordinator(worker_id)
+    if not coordinator.session._active and not allow_unstarted:
+        raise HTTPException(
+            status_code=409,
+            detail="Worker session must be started before claiming or renewing table leases.",
+        )
+    return coordinator
+
+
+async def require_worker_coordination_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(worker_bearer_scheme),
+) -> None:
+    configured_token = os.getenv("WORKER_COORDINATION_TOKEN")
+    if not configured_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Worker coordination is not configured.",
+        )
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not compare_digest(credentials.credentials, configured_token)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Worker authentication is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 @app.get("/health")
@@ -591,7 +625,10 @@ async def create_union_table(
 
 
 @app.post("/workers/{worker_id}/start")
-async def start_worker_coordinator(worker_id: str) -> dict[str, Any]:
+async def start_worker_coordinator(
+    worker_id: str,
+    _: None = Depends(require_worker_coordination_token),
+) -> dict[str, Any]:
     coordinator = get_worker_coordinator(worker_id)
     coordinator.start()
     return {
@@ -602,7 +639,10 @@ async def start_worker_coordinator(worker_id: str) -> dict[str, Any]:
 
 
 @app.get("/workers/{worker_id}/tables")
-async def list_worker_tables(worker_id: str) -> dict[str, Any]:
+async def list_worker_tables(
+    worker_id: str,
+    _: None = Depends(require_worker_coordination_token),
+) -> dict[str, Any]:
     coordinator = get_worker_coordinator(worker_id)
     return {
         "worker_id": worker_id,
@@ -615,9 +655,20 @@ async def claim_worker_table_lease(
     worker_id: str,
     table_id: str,
     request: TableLeaseClaimRequest | None = None,
+    _: None = Depends(require_worker_coordination_token),
 ) -> dict[str, Any]:
-    coordinator = get_worker_coordinator(worker_id)
     claim = request or TableLeaseClaimRequest(worker_id=worker_id)
+    if claim.worker_id != worker_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Worker ID in path and payload must match.",
+        )
+    if claim.force_reclaim:
+        raise HTTPException(
+            status_code=403,
+            detail="Forced lease reclamation is disabled for worker API requests.",
+        )
+    coordinator = require_worker_session_started(worker_id)
     force_reclaim = claim.force_reclaim
     lease = coordinator.bind_table(table_id, force_reclaim=force_reclaim)
     return {
@@ -631,8 +682,12 @@ async def claim_worker_table_lease(
 
 
 @app.post("/workers/{worker_id}/tables/{table_id}/heartbeat")
-async def renew_worker_table_lease(worker_id: str, table_id: str) -> dict[str, Any]:
-    coordinator = get_worker_coordinator(worker_id)
+async def renew_worker_table_lease(
+    worker_id: str,
+    table_id: str,
+    _: None = Depends(require_worker_coordination_token),
+) -> dict[str, Any]:
+    coordinator = require_worker_session_started(worker_id)
     lease = coordinator.heartbeat(table_id)
     return {
         "worker_id": worker_id,
@@ -645,8 +700,12 @@ async def renew_worker_table_lease(worker_id: str, table_id: str) -> dict[str, A
 
 
 @app.delete("/workers/{worker_id}/tables/{table_id}/lease", status_code=204)
-async def release_worker_table_lease(worker_id: str, table_id: str) -> Response:
-    coordinator = get_worker_coordinator(worker_id)
+async def release_worker_table_lease(
+    worker_id: str,
+    table_id: str,
+    _: None = Depends(require_worker_coordination_token),
+) -> Response:
+    coordinator = require_worker_session_started(worker_id)
     released = coordinator.session.release_table(table_id)
     if not released:
         raise HTTPException(status_code=404, detail="Worker does not own the requested table lease.")

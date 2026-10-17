@@ -269,29 +269,29 @@ def test_table_lease_is_durable_fenced_and_reclaimable(monkeypatch) -> None:
         now=initial + timedelta(seconds=31),
     )
     state = repository.get_table_checkpoint("club", "club-1", "table-lease")
-    assert first["fencing_generation"] == 1
-    assert second["fencing_generation"] == 2
+    assert first["fencing_generation"] == 2
+    assert second["fencing_generation"] == 3
     assert state["owner_id"] == "worker-b"
-    assert state["fencing_epoch"] == 2
+    assert state["fencing_epoch"] == 3
 
     with pytest.raises(TableLeaseConflictError):
         repository.authorize_table_lease(
-            "club", "club-1", "table-lease", "worker-a", 1,
+            "club", "club-1", "table-lease", "worker-a", 2,
             now=initial + timedelta(seconds=32),
         )
     with pytest.raises(TableLeaseExpiredError):
         repository.authorize_table_lease(
-            "club", "club-1", "table-lease", "worker-b", 2,
+            "club", "club-1", "table-lease", "worker-b", 3,
             now=initial + timedelta(seconds=62),
         )
 
     renewed = repository.renew_table_lease(
-        "club", "club-1", "table-lease", "worker-b", 2, 30,
+        "club", "club-1", "table-lease", "worker-b", 3, 30,
         now=initial + timedelta(seconds=32),
     )
     assert renewed["lease_expires_at"] == initial + timedelta(seconds=62)
     assert repository.release_table_lease(
-        "club", "club-1", "table-lease", "worker-b", 2,
+        "club", "club-1", "table-lease", "worker-b", 3,
         now=initial + timedelta(seconds=33),
     ) is True
 
@@ -299,7 +299,25 @@ def test_table_lease_is_durable_fenced_and_reclaimable(monkeypatch) -> None:
         "club", "club-1", "table-lease", "worker-c", 30,
         now=initial + timedelta(seconds=34),
     )
-    assert third["fencing_generation"] == 3
+    assert third["fencing_generation"] == 4
+
+
+def test_table_lease_claim_advances_checkpoint_epoch_when_lease_record_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-missing-lease"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-1", "table-missing-lease", "old-worker", 7, checkpoint
+    )
+
+    claimed = repository.claim_table_lease(
+        "club", "club-1", "table-missing-lease", "new-worker", 30
+    )
+
+    state = repository.get_table_checkpoint("club", "club-1", "table-missing-lease")
+    assert claimed["fencing_generation"] == 8
+    assert state["fencing_epoch"] == 8
 
 
 def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypatch) -> None:
@@ -313,9 +331,11 @@ def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypa
     assert repository.initialize_table_checkpoint(
         "club", "club-1", "table-1", "worker-a", 3, initial
     )
+    lease = repository.claim_table_lease("club", "club-1", "table-1", "worker-a", 30)
+    fencing_generation = lease["fencing_generation"]
 
     result = repository.commit_table_action(
-        "club", "club-1", "table-1", "worker-a", 3, 0,
+        "club", "club-1", "table-1", "worker-a", fencing_generation, 0,
         "player-1", "action-1", fingerprint, advanced,
     )
 
@@ -326,7 +346,7 @@ def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypa
     assert client.documents[state_path]["sequence"] == 1
 
     replay = repository.commit_table_action(
-        "club", "club-1", "table-1", "worker-a", 3, 0,
+        "club", "club-1", "table-1", "worker-a", fencing_generation, 0,
         "player-1", "action-1", fingerprint, initial,
     )
     assert replay.status is TableActionCommitStatus.IDEMPOTENT_REPLAY
@@ -342,14 +362,16 @@ def test_table_action_commit_rejects_payload_conflict_stale_epoch_and_sequence(m
     assert repository.initialize_table_checkpoint(
         "union", "union-1", "table-1", "worker-a", 5, checkpoint
     )
+    lease = repository.claim_table_lease("union", "union-1", "table-1", "worker-a", 30)
+    fencing_generation = lease["fencing_generation"]
     payload_hash = table_action_fingerprint("player-1", "action-1", {"action": "CHECK"})
 
     committed = repository.commit_table_action(
-        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "union", "union-1", "table-1", "worker-a", fencing_generation, 0,
         "player-1", "action-1", payload_hash, checkpoint,
     )
     conflict = repository.commit_table_action(
-        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "union", "union-1", "table-1", "worker-a", fencing_generation, 0,
         "player-1", "action-1", "0" * 64, checkpoint,
     )
     fenced = repository.commit_table_action(
@@ -357,7 +379,7 @@ def test_table_action_commit_rejects_payload_conflict_stale_epoch_and_sequence(m
         "player-1", "action-2", "2" * 64, checkpoint,
     )
     stale_sequence = repository.commit_table_action(
-        "union", "union-1", "table-1", "worker-a", 5, 0,
+        "union", "union-1", "table-1", "worker-a", fencing_generation, 0,
         "player-1", "action-3", "3" * 64, checkpoint,
     )
 
@@ -365,6 +387,31 @@ def test_table_action_commit_rejects_payload_conflict_stale_epoch_and_sequence(m
     assert conflict.status is TableActionCommitStatus.IDEMPOTENCY_CONFLICT
     assert fenced.status is TableActionCommitStatus.FENCED
     assert stale_sequence.status is TableActionCommitStatus.SEQUENCE_CONFLICT
+
+
+def test_table_action_commit_rejects_expired_lease_in_transaction(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    initial = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-expired-action"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-1", "table-expired-action", "worker-a", 1, checkpoint
+    )
+    lease = repository.claim_table_lease(
+        "club", "club-1", "table-expired-action", "worker-a", 1, now=initial
+    )
+    payload_hash = table_action_fingerprint("player-1", "action-expired", {"action": "CHECK"})
+
+    result = repository.commit_table_action(
+        "club", "club-1", "table-expired-action", "worker-a",
+        lease["fencing_generation"], 0, "player-1", "action-expired", payload_hash,
+        checkpoint, now=initial + timedelta(seconds=2),
+    )
+
+    state = repository.get_table_checkpoint("club", "club-1", "table-expired-action")
+    assert result.status is TableActionCommitStatus.FENCED
+    assert state["sequence"] == 0
 
 
 def test_table_action_commit_rejects_invalid_fingerprint_without_writing(monkeypatch) -> None:

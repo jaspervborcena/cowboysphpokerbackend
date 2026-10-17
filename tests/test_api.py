@@ -1602,3 +1602,62 @@ def test_runtime_retains_completed_hand_until_repository_acknowledges_it() -> No
         assert game.peek_completed_hand() is None
 
     asyncio.run(run_test())
+
+
+def test_worker_routes_fail_closed_without_service_token(monkeypatch) -> None:
+    monkeypatch.delenv("WORKER_COORDINATION_TOKEN", raising=False)
+
+    with TestClient(app) as client:
+        response = client.post("/workers/worker-auth-test/start")
+
+    assert response.status_code == 503
+
+
+def test_worker_routes_require_valid_service_token_and_reject_forced_reclaim(monkeypatch) -> None:
+    token = "test-worker-coordination-secret"
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
+
+    with TestClient(app) as client:
+        missing_token = client.get("/workers/worker-auth-test/tables")
+        invalid_token = client.post(
+            "/workers/worker-auth-test/start",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        started = client.post(
+            "/workers/worker-auth-test/start",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        claimed = client.post(
+            "/workers/worker-auth-test/tables/table-auth-test/lease",
+            json={"worker_id": "worker-auth-test", "force_reclaim": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        forced_reclaim = client.post(
+            "/workers/worker-auth-test/tables/table-auth-test/lease",
+            json={"worker_id": "worker-auth-test", "force_reclaim": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert missing_token.status_code == 401
+    assert invalid_token.status_code == 401
+    assert started.status_code == 200
+    assert claimed.status_code == 200
+    assert forced_reclaim.status_code == 403
+
+
+def test_worker_routes_reject_mismatched_worker_id(monkeypatch) -> None:
+    token = "test-worker-coordination-secret"
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/workers/worker-a/tables/table-auth-test/lease",
+            json={"worker_id": "worker-b", "force_reclaim": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["code"] == 40002
+    assert payload["errors"][0]["message"] == "One or more fields have an invalid format."
