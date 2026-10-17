@@ -11,10 +11,11 @@ Complete these in order before running live tables across multiple backend insta
 - [x] Require `WORKER_COORDINATION_TOKEN` bearer authentication on `/workers/{worker_id}/...`, fail closed when unset, reject HTTP force-reclaim requests, and reject mismatched path/payload worker IDs and unstarted sessions.
 - [ ] Restrict worker-route ingress to trusted services and manage/rotate the token through the deployment secret manager.
 - [x] Connect `TableRuntime` lease claim/renew/authorize/release methods and club/union per-table claim routes to Firestore lease operations when Firestore is enabled.
-- [ ] Replace the generic process-local `/workers/{worker_id}/...` coordinator with scope-aware durable assignment, heartbeat, release, and recovery flows.
-- [ ] Persist initial table checkpoints and restore table state, owner, and fencing generation when a runtime starts or a worker takes over.
-- [ ] Stage each authoritative mutation and atomically commit its checkpoint/action record while checking lease owner, generation, and expiry in that same transaction. Cover table lifecycle, seating/buy-in, hand start, player/pre-actions, and timeout actions.
-- [ ] Route all table commands to the single current owner; do not create a second in-memory authority on another instance. Add a broker only if the gateway/runtime split requires it.
+- [x] Replace the Firestore-enabled `/workers/{worker_id}/...` process-local coordinator path with scope-aware durable sessions, assignment discovery, claim, heartbeat, release, and recovery; retain the in-memory coordinator only when Firestore is disabled.
+- [x] Persist initial table checkpoints and restore table state, owner, and fencing generation when a worker claims a table in a new process.
+- [ ] Finish lease-fenced checkpointing for remaining table settings/lifecycle mutations; club/union buy-ins, hand starts, player actions, pre-actions, and timeout actions are already transactionally checkpointed when Firestore is enabled.
+- [x] Add opt-in Pub/Sub/Redis routing for WebSocket player/pre-actions to the lease owner and ordered, recipient-masked snapshot fanout to active gateway instances.
+- [ ] Route REST table mutations to the current owner and complete owner-state discovery across instances; WebSocket player/pre-actions route through opt-in Pub/Sub, while REST and settings/lifecycle operations do not.
 - [ ] Prove concurrent claims, stale-worker rejection, retries, and crash/restart recovery with Firestore-emulator tests; then load-test 100 concurrent tables and measure contention, latency, quotas, and cost before increasing worker count.
 
 ## Completed in the Repository
@@ -65,15 +66,21 @@ The client implementation checklist lives in [UI_GUIDE.md](UI_GUIDE.md); API req
 ## Before Multi-Worker Live Tables
 
 - [x] Add a Firestore transaction primitive that atomically advances a table checkpoint and records the action fingerprint, guarded by expected sequence and fencing epoch.
-- [x] Validate matching lease owner, fencing generation, and unexpired lease in the same Firestore transaction as a table action checkpoint commit; this repository primitive is not yet called by live gameplay.
+- [x] Validate matching lease owner, fencing generation, and unexpired lease in the same Firestore transaction as a table action checkpoint commit.
+- [x] Commit first-party hand starts and explicit player actions through the fenced checkpoint/action transaction when Firestore is enabled.
+- [x] Commit standalone pre-action changes through the fenced checkpoint/action transaction before acknowledging them.
+- [x] Commit timeout-driven folds/checks and resulting pre-action effects through the fenced checkpoint/action transaction.
+- [x] Atomically couple club and union buy-in balance/seat/ledger writes with the lease-checked table checkpoint and action journal.
+- [x] Initialize durable generation-zero table checkpoints during club/union table creation; create union metadata and checkpoint atomically.
 - [x] Add Firestore transaction-backed table lease repository operations for claim, renewal, authorization, and release; preserve fencing generations across expiry and release.
-- [ ] Wire durable leases into runtime ownership, worker claim/heartbeat/release routes, and checkpoint recovery; remove process-local lease state as the ownership source of truth.
+- [x] Wire durable leases into runtime ownership, scoped worker claim/heartbeat/release routes, and checkpoint recovery; Firestore-backed ownership no longer relies on process-local leases.
 - [ ] Check lease owner, fencing generation, and expiry in the same Firestore transaction that commits each authoritative table mutation; a separate pre-write authorization check is not sufficient.
-- [ ] Wire checkpoint/action transactions into table creation, seating, hand start, player actions, pre-actions, and timeout actions. Stage mutations and publish/acknowledge only after commit; atomically couple buy-in debits with seat/checkpoint updates.
 - [ ] Add protected/encrypted checkpoint storage and turn-deadline recovery.
-- [ ] Add reconnect replay cursors and durable action idempotency.
-- [ ] Keep current live-table testing on one backend instance until ownership and recovery exist.
-- [ ] Add Pub/Sub only when gateway and runtime workers are separated; define command routing, event/reply routing, ordering, retries, and deduplication. Pub/Sub is backend-internal and must not own game state or balances.
+- [x] Persist Firestore-backed player-action fingerprints in the table action journal for implemented mutation paths.
+- [ ] Add reconnect replay cursors and complete replay/recovery semantics across worker deliveries.
+- [ ] Keep current live-table testing on one backend instance until REST routing, full recovery, and cross-worker validation exist.
+- [x] Define the opt-in Pub/Sub command/reply/event transport and ordering; Pub/Sub remains backend-internal and does not own game state or balances.
+- [ ] Deploy the gateway/runtime split with Redis presence, least-privilege IAM, and one stable worker ID per single-instance Cloud Run worker service; complete REST mutation routing before enabling live tables.
 - [ ] Test Firestore contention, quotas, cost, recovery, and load before claiming multi-worker or 1,000-10,000-player capacity.
 
 ## Security, Economy, and Operations
@@ -97,7 +104,7 @@ The client implementation checklist lives in [UI_GUIDE.md](UI_GUIDE.md); API req
 
 ## Later Game Scope
 
-- [ ] Add PLO/PLO5/PLO6 as validated configurations only after the NLH engine is stable; preserve Omaha's exact-two-hole/exact-three-board rule.
+- [ ] Next game-engine sequence: validate PLO4 first, then PLO5 and PLO6 as separate configurations; preserve Omaha's exact-two-hole/exact-three-board rule and keep each variant unavailable until verified.
 - [ ] Build Tongits as a separate engine with its own state, actions, meld evaluation, and scoring.
-- [ ] Add tournament registration, an authoritative tournament clock, blind-level commands, eliminations, table balancing, prize settlement, and recovery as a separate domain service.
+- [ ] Deferred until after PLO4/PLO5/PLO6: add tournament registration, an authoritative tournament clock, blind-level commands, eliminations, table balancing, prize settlement, and recovery as a separate domain service.
 - [ ] Keep unverified games unavailable even if the game catalog lists them.

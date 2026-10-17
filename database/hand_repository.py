@@ -23,6 +23,7 @@ class BuyInStatus(StrEnum):
     SEAT_OCCUPIED = "seat_occupied"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     UNION_CLUB_NOT_FOUND = "union_club_not_found"
+    TABLE_STATE_CONFLICT = "table_state_conflict"
 
 
 class WalletTransactionStatus(StrEnum):
@@ -84,6 +85,21 @@ class TableLeaseExpiredError(RuntimeError):
 class NullHandRepository:
     def recover_pending_settlements(self) -> int:
         return 0
+
+    def start_worker_session(self, worker_id: str, ttl_seconds: int) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled for durable worker sessions.")
+
+    def heartbeat_worker_session(self, worker_id: str, ttl_seconds: int) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled for durable worker sessions.")
+
+    def worker_session_is_active(self, worker_id: str) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled for durable worker sessions.")
+
+    def stop_worker_session(self, worker_id: str) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled for durable worker sessions.")
+
+    def list_worker_table_leases(self, worker_id: str) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled for durable worker sessions.")
 
     def get_table_checkpoint(
         self,
@@ -154,7 +170,7 @@ class NullHandRepository:
         scope_type: str,
         scope_id: str,
         table_id: str,
-        owner_id: str,
+        owner_id: str | None,
         fencing_epoch: int,
         checkpoint: dict[str, Any],
     ) -> bool:
@@ -267,7 +283,12 @@ class NullHandRepository:
         raise FirestoreRequiredError("Firestore must be enabled to provision a union club membership.")
 
     def create_union_table_record(
-        self, union_id: str, table_id: str, table_data: dict[str, Any]
+        self,
+        union_id: str,
+        table_id: str,
+        table_data: dict[str, Any],
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
     ) -> bool:
         raise FirestoreRequiredError("Firestore must be enabled to create a union table.")
 
@@ -287,6 +308,11 @@ class NullHandRepository:
         username: str,
         buy_in_amount: int,
         buy_in_id: str,
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        fencing_epoch: int | None = None,
+        expected_sequence: int | None = None,
     ) -> BuyInStatus:
         raise FirestoreRequiredError("Firestore must be enabled to reserve a union table seat.")
 
@@ -318,6 +344,11 @@ class NullHandRepository:
         username: str,
         buy_in_amount: int,
         buy_in_id: str,
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        fencing_epoch: int | None = None,
+        expected_sequence: int | None = None,
     ) -> BuyInStatus:
         raise FirestoreRequiredError("Firestore must be enabled to reserve a seat.")
 
@@ -325,6 +356,127 @@ class NullHandRepository:
 class FirestoreHandRepository:
     def __init__(self, client: firestore.Client) -> None:
         self._client = client
+
+    def start_worker_session(self, worker_id: str, ttl_seconds: int) -> dict[str, Any]:
+        if not worker_id or ttl_seconds < 1:
+            raise ValueError("Worker ID and a positive session TTL are required.")
+        current_time = datetime.now(timezone.utc)
+        session_ref = self._client.collection("worker_sessions").document(worker_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def start(transaction: Any) -> dict[str, Any]:
+            current_snapshot = session_ref.get(transaction=transaction)
+            current_session = current_snapshot.to_dict() or {} if current_snapshot.exists else {}
+            expires_at = current_session.get("expires_at")
+            if (
+                current_session.get("status") == "active"
+                and expires_at is not None
+                and expires_at > current_time
+            ):
+                return {
+                    **current_session,
+                    "already_active": True,
+                }
+            session = {
+                "worker_id": worker_id,
+                "status": "active",
+                "already_active": False,
+                "started_at": current_time,
+                "heartbeat_at": current_time,
+                "expires_at": current_time + timedelta(seconds=ttl_seconds),
+            }
+            transaction.set(session_ref, session)
+            return session
+
+        return start(transaction)
+
+    def heartbeat_worker_session(self, worker_id: str, ttl_seconds: int) -> bool:
+        if not worker_id or ttl_seconds < 1:
+            raise ValueError("Worker ID and a positive session TTL are required.")
+        current_time = datetime.now(timezone.utc)
+        session_ref = self._client.collection("worker_sessions").document(worker_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def heartbeat(transaction: Any) -> bool:
+            snapshot = session_ref.get(transaction=transaction)
+            session = snapshot.to_dict() or {} if snapshot.exists else {}
+            if (
+                session.get("status") != "active"
+                or session.get("expires_at") is None
+                or session["expires_at"] <= current_time
+            ):
+                return False
+            transaction.set(
+                session_ref,
+                {
+                    **session,
+                    "heartbeat_at": current_time,
+                    "expires_at": current_time + timedelta(seconds=ttl_seconds),
+                },
+            )
+            return True
+
+        return heartbeat(transaction)
+
+    def worker_session_is_active(self, worker_id: str) -> bool:
+        snapshot = self._client.collection("worker_sessions").document(worker_id).get()
+        session = snapshot.to_dict() or {} if snapshot.exists else {}
+        expires_at = session.get("expires_at")
+        return (
+            session.get("status") == "active"
+            and expires_at is not None
+            and expires_at > datetime.now(timezone.utc)
+        )
+
+    def stop_worker_session(self, worker_id: str) -> bool:
+        current_time = datetime.now(timezone.utc)
+        session_ref = self._client.collection("worker_sessions").document(worker_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def stop(transaction: Any) -> bool:
+            snapshot = session_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return False
+            session = snapshot.to_dict() or {}
+            transaction.set(
+                session_ref,
+                {
+                    **session,
+                    "status": "stopped",
+                    "stopped_at": current_time,
+                    "expires_at": current_time,
+                },
+            )
+            return True
+
+        return stop(transaction)
+
+    def list_worker_table_leases(self, worker_id: str) -> list[dict[str, Any]]:
+        current_time = datetime.now(timezone.utc)
+        snapshots = self._client.collection_group("runtime").where(
+            "owner_id", "==", worker_id
+        ).stream()
+        leases = []
+        for snapshot in snapshots:
+            record = snapshot.to_dict() or {}
+            expires_at = record.get("lease_expires_at")
+            if (
+                record.get("fencing_generation") is not None
+                and expires_at is not None
+                and expires_at > current_time
+            ):
+                leases.append(record)
+        return sorted(
+            leases,
+            key=lambda record: (
+                str(record.get("scope_type", "")),
+                str(record.get("scope_id", "")),
+                str(record.get("table_id", "")),
+            ),
+        )
 
     def get_table_checkpoint(
         self,
@@ -571,13 +723,18 @@ class FirestoreHandRepository:
         scope_type: str,
         scope_id: str,
         table_id: str,
-        owner_id: str,
+        owner_id: str | None,
         fencing_epoch: int,
         checkpoint: dict[str, Any],
     ) -> bool:
-        _validate_table_checkpoint_write(
-            scope_type, scope_id, table_id, owner_id, fencing_epoch, 0, checkpoint
-        )
+        if owner_id is None:
+            if fencing_epoch != 0:
+                raise ValueError("Unowned table checkpoints must start at fencing epoch zero.")
+            _validate_unowned_table_checkpoint(scope_type, scope_id, table_id, checkpoint)
+        else:
+            _validate_table_checkpoint_write(
+                scope_type, scope_id, table_id, owner_id, fencing_epoch, 0, checkpoint
+            )
         state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
         transaction = self._client.transaction()
 
@@ -1363,7 +1520,12 @@ class FirestoreHandRepository:
         return commit(transaction)
 
     def create_union_table_record(
-        self, union_id: str, table_id: str, table_data: dict[str, Any]
+        self,
+        union_id: str,
+        table_id: str,
+        table_data: dict[str, Any],
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
     ) -> bool:
         table_ref = (
             self._client.collection("unions")
@@ -1371,13 +1533,32 @@ class FirestoreHandRepository:
             .collection("tables")
             .document(table_id)
         )
+        state_ref = self._table_runtime_state_ref("union", union_id, table_id)
         transaction = self._client.transaction()
 
         @firestore.transactional
         def commit(transaction: Any) -> bool:
-            if table_ref.get(transaction=transaction).exists:
+            table_snapshot = table_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            if table_snapshot.exists or (runtime_checkpoint is not None and state_snapshot.exists):
                 return False
             transaction.set(table_ref, table_data)
+            if runtime_checkpoint is not None:
+                _validate_unowned_table_checkpoint("union", union_id, table_id, runtime_checkpoint)
+                transaction.set(
+                    state_ref,
+                    {
+                        "schema_version": 1,
+                        "scope_type": "union",
+                        "scope_id": union_id,
+                        "table_id": table_id,
+                        "owner_id": None,
+                        "fencing_epoch": 0,
+                        "sequence": 0,
+                        "checkpoint": runtime_checkpoint,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
             return True
 
         return commit(transaction)
@@ -1424,7 +1605,17 @@ class FirestoreHandRepository:
         username: str,
         buy_in_amount: int,
         buy_in_id: str,
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        fencing_epoch: int | None = None,
+        expected_sequence: int | None = None,
     ) -> BuyInStatus:
+        durable_values = (runtime_checkpoint, owner_id, fencing_epoch, expected_sequence)
+        if any(value is not None for value in durable_values) and any(
+            value is None for value in durable_values
+        ):
+            raise ValueError("Checkpoint and lease metadata must be provided together.")
         member_ref = (
             self._client.collection("clubs")
             .document(club_id)
@@ -1452,6 +1643,11 @@ class FirestoreHandRepository:
             .collection("transactions")
             .document(buy_in_id)
         )
+        state_ref = self._table_runtime_state_ref("union", union_id, table_id)
+        lease_ref = self._table_runtime_lease_ref("union", union_id, table_id)
+        action_key = hashlib.sha256(f"{user_id}\0{buy_in_id}".encode("utf-8")).hexdigest()
+        action_ref = state_ref.collection("actions").document(action_key)
+        current_time = datetime.now(timezone.utc)
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -1461,6 +1657,9 @@ class FirestoreHandRepository:
             union_club_snapshot = union_club_ref.get(transaction=transaction)
             buy_in_snapshot = buy_in_ref.get(transaction=transaction)
             club_transaction_snapshot = club_transaction_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
+            lease_snapshot = lease_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
+            action_snapshot = action_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
 
             if not union_club_snapshot.exists or (
                 union_club_snapshot.to_dict() or {}
@@ -1477,6 +1676,8 @@ class FirestoreHandRepository:
                     and seat.get("user_id") == user_id
                     and seat.get("buy_in_id") == buy_in_id
                 )
+                if runtime_checkpoint is not None:
+                    return BuyInStatus.TABLE_STATE_CONFLICT
                 return BuyInStatus.ALREADY_RESERVED if same_request else BuyInStatus.IDEMPOTENCY_CONFLICT
             if club_transaction_snapshot.exists:
                 return BuyInStatus.IDEMPOTENCY_CONFLICT
@@ -1491,6 +1692,49 @@ class FirestoreHandRepository:
                 return BuyInStatus.INVALID_BALANCE
             if balance < buy_in_amount:
                 return BuyInStatus.INSUFFICIENT_BALANCE
+
+            if runtime_checkpoint is not None:
+                assert owner_id is not None
+                assert fencing_epoch is not None
+                assert expected_sequence is not None
+                assert state_snapshot is not None
+                assert lease_snapshot is not None
+                assert action_snapshot is not None
+                if not state_snapshot.exists or not lease_snapshot.exists or action_snapshot.exists:
+                    return BuyInStatus.TABLE_STATE_CONFLICT
+                state = state_snapshot.to_dict() or {}
+                lease = lease_snapshot.to_dict() or {}
+                expires_at = lease.get("lease_expires_at")
+                if (
+                    state.get("owner_id") != owner_id
+                    or state.get("fencing_epoch") != fencing_epoch
+                    or state.get("sequence") != expected_sequence
+                    or lease.get("owner_id") != owner_id
+                    or lease.get("fencing_generation") != fencing_epoch
+                    or expires_at is None
+                    or expires_at <= current_time
+                ):
+                    return BuyInStatus.TABLE_STATE_CONFLICT
+                payload_hash = table_action_fingerprint(
+                    user_id,
+                    buy_in_id,
+                    {
+                        "event": "BUY_IN",
+                        "union_id": union_id,
+                        "table_id": table_id,
+                        "seat_index": seat_index,
+                        "amount": buy_in_amount,
+                    },
+                )
+                _validate_table_checkpoint_write(
+                    "union",
+                    union_id,
+                    table_id,
+                    owner_id,
+                    fencing_epoch,
+                    expected_sequence + 1,
+                    runtime_checkpoint,
+                )
 
             transaction.update(
                 member_ref,
@@ -1542,6 +1786,30 @@ class FirestoreHandRepository:
                     "timestamp": firestore.SERVER_TIMESTAMP,
                 },
             )
+            if runtime_checkpoint is not None:
+                assert owner_id is not None
+                assert fencing_epoch is not None
+                assert expected_sequence is not None
+                transaction.set(
+                    state_ref,
+                    {
+                        **(state_snapshot.to_dict() or {}),
+                        "sequence": expected_sequence + 1,
+                        "checkpoint": runtime_checkpoint,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                transaction.set(
+                    action_ref,
+                    {
+                        "user_id": user_id,
+                        "action_id": buy_in_id,
+                        "payload_hash": payload_hash,
+                        "sequence": expected_sequence + 1,
+                        "fencing_epoch": fencing_epoch,
+                        "committed_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
             return BuyInStatus.RESERVED
 
         return commit(transaction)
@@ -1786,7 +2054,17 @@ class FirestoreHandRepository:
         username: str,
         buy_in_amount: int,
         buy_in_id: str,
+        *,
+        runtime_checkpoint: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        fencing_epoch: int | None = None,
+        expected_sequence: int | None = None,
     ) -> BuyInStatus:
+        durable_values = (runtime_checkpoint, owner_id, fencing_epoch, expected_sequence)
+        if any(value is not None for value in durable_values) and any(
+            value is None for value in durable_values
+        ):
+            raise ValueError("Checkpoint and lease metadata must be provided together.")
         member_ref = (
             self._client.collection("clubs")
             .document(club_id)
@@ -1808,6 +2086,11 @@ class FirestoreHandRepository:
             .collection("transactions")
             .document(buy_in_id)
         )
+        state_ref = self._table_runtime_state_ref("club", club_id, table_id)
+        lease_ref = self._table_runtime_lease_ref("club", club_id, table_id)
+        action_key = hashlib.sha256(f"{user_id}\0{buy_in_id}".encode("utf-8")).hexdigest()
+        action_ref = state_ref.collection("actions").document(action_key)
+        current_time = datetime.now(timezone.utc)
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -1816,6 +2099,9 @@ class FirestoreHandRepository:
             seat_snapshot = seat_ref.get(transaction=transaction)
             buy_in_snapshot = buy_in_ref.get(transaction=transaction)
             club_transaction_snapshot = club_transaction_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
+            lease_snapshot = lease_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
+            action_snapshot = action_ref.get(transaction=transaction) if runtime_checkpoint is not None else None
 
             if buy_in_snapshot.exists:
                 buy_in = buy_in_snapshot.to_dict() or {}
@@ -1827,6 +2113,8 @@ class FirestoreHandRepository:
                     and seat.get("user_id") == user_id
                     and seat.get("buy_in_id") == buy_in_id
                 )
+                if runtime_checkpoint is not None:
+                    return BuyInStatus.TABLE_STATE_CONFLICT
                 return BuyInStatus.ALREADY_RESERVED if same_request else BuyInStatus.IDEMPOTENCY_CONFLICT
             if club_transaction_snapshot.exists:
                 return BuyInStatus.IDEMPOTENCY_CONFLICT
@@ -1842,6 +2130,48 @@ class FirestoreHandRepository:
                 return BuyInStatus.INVALID_BALANCE
             if balance < buy_in_amount:
                 return BuyInStatus.INSUFFICIENT_BALANCE
+
+            if runtime_checkpoint is not None:
+                assert owner_id is not None
+                assert fencing_epoch is not None
+                assert expected_sequence is not None
+                assert state_snapshot is not None
+                assert lease_snapshot is not None
+                assert action_snapshot is not None
+                if not state_snapshot.exists or not lease_snapshot.exists or action_snapshot.exists:
+                    return BuyInStatus.TABLE_STATE_CONFLICT
+                state = state_snapshot.to_dict() or {}
+                lease = lease_snapshot.to_dict() or {}
+                expires_at = lease.get("lease_expires_at")
+                if (
+                    state.get("owner_id") != owner_id
+                    or state.get("fencing_epoch") != fencing_epoch
+                    or state.get("sequence") != expected_sequence
+                    or lease.get("owner_id") != owner_id
+                    or lease.get("fencing_generation") != fencing_epoch
+                    or expires_at is None
+                    or expires_at <= current_time
+                ):
+                    return BuyInStatus.TABLE_STATE_CONFLICT
+                payload_hash = table_action_fingerprint(
+                    user_id,
+                    buy_in_id,
+                    {
+                        "event": "BUY_IN",
+                        "table_id": table_id,
+                        "seat_index": seat_index,
+                        "amount": buy_in_amount,
+                    },
+                )
+                _validate_table_checkpoint_write(
+                    "club",
+                    club_id,
+                    table_id,
+                    owner_id,
+                    fencing_epoch,
+                    expected_sequence + 1,
+                    runtime_checkpoint,
+                )
 
             transaction.update(
                 member_ref,
@@ -1891,9 +2221,48 @@ class FirestoreHandRepository:
                     "timestamp": firestore.SERVER_TIMESTAMP,
                 },
             )
+            if runtime_checkpoint is not None:
+                assert owner_id is not None
+                assert fencing_epoch is not None
+                assert expected_sequence is not None
+                transaction.set(
+                    state_ref,
+                    {
+                        **(state_snapshot.to_dict() or {}),
+                        "sequence": expected_sequence + 1,
+                        "checkpoint": runtime_checkpoint,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                transaction.set(
+                    action_ref,
+                    {
+                        "user_id": user_id,
+                        "action_id": buy_in_id,
+                        "payload_hash": payload_hash,
+                        "sequence": expected_sequence + 1,
+                        "fencing_epoch": fencing_epoch,
+                        "committed_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
             return BuyInStatus.RESERVED
 
         return commit(transaction)
+
+
+def _validate_unowned_table_checkpoint(
+    scope_type: str,
+    scope_id: str,
+    table_id: str,
+    checkpoint: dict[str, Any],
+) -> None:
+    if scope_type not in {"club", "union"} or not scope_id or not table_id:
+        raise ValueError("Table scope must be club or union and IDs must be non-empty.")
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != 1:
+        raise ValueError("Table checkpoint must use schema version 1.")
+    table_data = checkpoint.get("table")
+    if not isinstance(table_data, dict) or table_data.get("table_id") != table_id:
+        raise ValueError("Table checkpoint ID does not match its Firestore path.")
 
 
 def _validate_table_checkpoint_write(
