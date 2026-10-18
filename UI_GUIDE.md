@@ -18,6 +18,38 @@ Keep poker behavior server-authoritative: render the supplied snapshot and legal
 
 Frontend work can proceed against typed API/WebSocket interfaces and fixture-backed local mocks. Keep transport, DTOs, and screen state separate so engine internals can change without rewriting the UI.
 
+## UI Implementation Checklist
+
+### Session and lobby
+
+- [ ] Implement Firebase sign-in, token refresh, sign-out, and loading/error states. Send the Firebase ID token to protected REST routes and as the first WebSocket authentication message; never trust a client-selected UID or role.
+- [ ] Load `GET /clubs/{club_id}/members/me` and display the server-assigned role/profile. Use the role only to guide UI visibility; the server remains authoritative for permissions.
+- [ ] Build club and union lobby views from `GET /clubs/{club_id}/tables`, `GET /clubs/{club_id}/unions`, `GET /clubs/{club_id}/unions/{union_id}/tables`, and `GET /games`, including loading, empty, retry, and error states.
+
+### Wallets and funding
+
+- [ ] After sign-in, call `POST /me/wallets/global-playmoney/ensure` without a client-selected amount, then load `GET /me/wallets/global-playmoney`. Label it non-cash play money; global-play-money tables and transfers to club chips are not supported.
+- [ ] Load `GET /clubs/{club_id}/members/me/wallet` and show `available_balance` separately from `in_play_balance`. Load the separate club treasury through `GET /clubs/{club_id}/wallet` only for authorized owner/manager screens.
+- [ ] Add owner/manager or assigned-agent send-out and claim-back UI using the existing wallet routes and transaction UUIDs. Display server results as authoritative; explain that claim-back is unavailable while the member has chips in play.
+- [ ] Do not present separate agent and player balances: the backend currently has one member balance pair per club membership. Keep composite wallet fixtures marked as mock.
+- [ ] Keep `POST /platform/clubs` in a trusted platform-admin bootstrap surface only; it creates a real club and reserve-funded treasury, not a normal self-service club request.
+- [ ] A player cash-out request may appear only as clearly labeled pending/mock UI until a request/approval API exists. Do not change balances locally.
+
+### Tables and gameplay
+
+- [ ] Let active `OWNER`/`MANAGER` members create tables using `/games` entries marked `create_supported: true`; currently only NLH is supported.
+- [ ] Let a `PLAYER` buy in and choose a seat. Generate one `buy_in_id` per purchase and reuse it with the exact same request on retries; never debit or assign chips optimistically.
+- [ ] Implement the v1 WebSocket flow: authenticate, render complete player-specific snapshots, send actions with stable `action_id`s, support pre-actions and PING/PONG, map numeric errors, and replace local state with each full snapshot.
+- [ ] Add hand replay through the club/union replay APIs. Do not read raw Firestore audit data or expose hidden cards.
+- [ ] Support union table discovery, home-club selection, seat purchase, and union socket authentication for active participating members. Show each verified home club in table snapshots.
+- [ ] Expose union table create/start/delete only to `UNION_ADMIN`; rely on the server to reject deletion when a table is not empty.
+
+### Acceptance checks
+
+- [ ] Verify flows with owner/manager, player, agent, and union-admin accounts; cover auth expiry, retry IDs, rejected permissions, two-club union play, per-player card masking, reconnect snapshots, and wallet refresh.
+- [ ] Do not call `/workers/{worker_id}/...` from the client. Those routes are internal, unauthenticated, process-local, and not a supported UI contract.
+- [ ] Keep the client engine-agnostic: the server owns rules, outcomes, balances, and card visibility. Coordinate/version any breaking contract changes before rollout.
+
 ### Wallet API
 
 The Wallet API is deployed separately from the game server. After Firebase sign-in, call `POST /me/wallets/global-playmoney/ensure` once to provision the signed-in user's wallet, then call `GET /me/wallets/global-playmoney` on later loads. The ensure endpoint idempotently grants 20,000 chips from the platform reserve. Do not simulate or modify wallet balances in the UI.
@@ -72,7 +104,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 - Tournament registration, blind-level controls, eliminations, table balancing, and tournament prize views need a separately implemented tournament API and event contract.
 - Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
-- Do not call the game server's `/workers/{worker_id}/...` coordination routes from the client. They are internal, currently unauthenticated, and process-local rather than a production worker control plane.
+- Do not call the game server's `/workers/{worker_id}/...` coordination routes from the client. They require an internal bearer token and remain process-local rather than a production worker control plane.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
 - Reserve-backed initial grants for global wallets and club treasuries are implemented. Platform reserve top-ups, game-earned global chips, and global-play-money tables are not implemented. Do not display a club treasury or club-member balance as the global wallet; user balances remain separate and cannot be converted between wallet types.
 

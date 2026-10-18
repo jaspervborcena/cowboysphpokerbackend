@@ -1,14 +1,23 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app import main as api_main
 from app.main import app, tables
-from database import BuyInStatus, NullHandRepository, WalletTransactionStatus
+from database import (
+    BuyInStatus,
+    FirestoreHandRepository,
+    NullHandRepository,
+    TableLeaseConflictError,
+    WalletTransactionStatus,
+)
 from logic.connections import ConnectionManager
 from logic.first_party_table import FirstPartyNLHGame
 from logic.runtime import TableRuntime
+from logic.table_checkpoint import serialize_first_party_table
 from logic.auth import InvalidFirebaseToken
 
 
@@ -1439,6 +1448,43 @@ def test_non_admin_member_cannot_create_table(monkeypatch) -> None:
     assert response.json()["code"] == 40301
 
 
+def test_club_table_creation_initializes_unowned_durable_checkpoint(monkeypatch) -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self) -> None:
+            self.initialization: tuple[object, ...] | None = None
+
+        def initialize_table_checkpoint(self, *arguments: object) -> bool:
+            self.initialization = arguments
+            return True
+
+    async def create() -> tuple[dict[str, str], DurableRepository]:
+        repository = DurableRepository()
+        monkeypatch.setattr(api_main, "repository", repository)
+        table_id = "checkpoint-create-table"
+        response = await api_main.create_table(
+            "checkpoint-create-club",
+            table_id,
+            api_main.CreateTableRequest(
+                small_blind=10,
+                big_blind=20,
+                buy_in_min=20,
+                buy_in_max=1000,
+            ),
+        )
+        tables.pop(("checkpoint-create-club", table_id), None)
+        return response, repository
+
+    response, repository = asyncio.run(create())
+
+    assert response["status"] == "created"
+    assert repository.initialization is not None
+    scope_type, scope_id, table_id, owner_id, epoch, checkpoint = repository.initialization
+    assert (scope_type, scope_id, table_id, owner_id, epoch) == (
+        "club", "checkpoint-create-club", "checkpoint-create-table", None, 0
+    )
+    assert checkpoint["table"]["table_id"] == "checkpoint-create-table"
+
+
 def test_club_wallet_routes_require_operator_role_and_use_authenticated_identity(monkeypatch) -> None:
     repository = FakeHandRepository(
         {"club-owner": 1000, "regular-player": 500},
@@ -1602,3 +1648,448 @@ def test_runtime_retains_completed_hand_until_repository_acknowledges_it() -> No
         assert game.peek_completed_hand() is None
 
     asyncio.run(run_test())
+
+
+def test_durable_seat_helper_commits_staged_player_or_restores_on_conflict() -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self, result: BuyInStatus) -> None:
+            self.result = result
+            self.checkpoint: dict[str, object] | None = None
+            self.lease: dict[str, object] | None = None
+            self.requested_checkpoint: dict[str, object] | None = None
+            self.expected_sequence: int | None = None
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now=None,
+        ) -> dict[str, object]:
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 1,
+                "lease_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": datetime.now(timezone.utc),
+                "status": "active",
+            }
+            self.checkpoint = {
+                "owner_id": worker_id,
+                "fencing_epoch": 1,
+                "sequence": 0,
+                "checkpoint": initial_checkpoint,
+            }
+            return self.lease
+
+        def get_table_checkpoint(self, scope_type: str, scope_id: str, table_id: str):
+            return self.checkpoint
+
+        def get_table_lease(self, scope_type: str, scope_id: str, table_id: str):
+            return self.lease
+
+        def reserve_buy_in(
+            self,
+            club_id: str,
+            table_id: str,
+            seat_index: int,
+            user_id: str,
+            username: str,
+            buy_in_amount: int,
+            buy_in_id: str,
+            *,
+            runtime_checkpoint: dict[str, object],
+            owner_id: str,
+            fencing_epoch: int,
+            expected_sequence: int,
+        ) -> BuyInStatus:
+            self.requested_checkpoint = runtime_checkpoint
+            self.expected_sequence = expected_sequence
+            if self.result is BuyInStatus.RESERVED:
+                assert self.checkpoint is not None
+                self.checkpoint = {
+                    **self.checkpoint,
+                    "sequence": expected_sequence + 1,
+                    "checkpoint": runtime_checkpoint,
+                }
+            return self.result
+
+    async def verify() -> None:
+        for status, expected_seated in (
+            (BuyInStatus.RESERVED, True),
+            (BuyInStatus.TABLE_STATE_CONFLICT, False),
+        ):
+            game = FirstPartyNLHGame("durable-seat-helper-table", 10, 20, 20, 1000)
+            repository = DurableRepository(status)
+            runtime = TableRuntime(
+                "club-1", game, ConnectionManager(), repository, turn_timeout_seconds=0
+            )
+            runtime.claim_lease("worker-a")
+            before = serialize_first_party_table(runtime.game)
+
+            result, staged = await api_main.reserve_seat_buy_in(
+                runtime,
+                repository.reserve_buy_in,
+                ("club-1", "durable-seat-helper-table", 2, "player-1", "Alice", 400, "buy-in-id"),
+                2,
+                "player-1",
+                "Alice",
+                400,
+                "buy-in-id",
+                "club-1",
+                False,
+            )
+
+            assert result is status
+            assert staged is expected_seated
+            assert (2 in runtime.game.seats) is expected_seated
+            assert repository.expected_sequence == 0
+            if expected_seated:
+                assert runtime._table_sequence == 1
+                assert repository.requested_checkpoint == repository.checkpoint["checkpoint"]
+            else:
+                assert runtime._table_sequence == 0
+                assert serialize_first_party_table(runtime.game) == before
+
+    asyncio.run(verify())
+
+
+def test_worker_routes_fail_closed_without_service_token(monkeypatch) -> None:
+    monkeypatch.delenv("WORKER_COORDINATION_TOKEN", raising=False)
+
+    with TestClient(app) as client:
+        response = client.post("/workers/worker-auth-test/start")
+
+    assert response.status_code == 503
+
+
+def test_worker_routes_require_valid_service_token_and_reject_forced_reclaim(monkeypatch) -> None:
+    token = "test-worker-coordination-secret"
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
+
+    with TestClient(app) as client:
+        missing_token = client.get("/workers/worker-auth-test/tables")
+        invalid_token = client.post(
+            "/workers/worker-auth-test/start",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        started = client.post(
+            "/workers/worker-auth-test/start",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        claimed = client.post(
+            "/workers/worker-auth-test/tables/table-auth-test/lease",
+            json={"worker_id": "worker-auth-test", "force_reclaim": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        forced_reclaim = client.post(
+            "/workers/worker-auth-test/tables/table-auth-test/lease",
+            json={"worker_id": "worker-auth-test", "force_reclaim": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert missing_token.status_code == 401
+    assert invalid_token.status_code == 401
+    assert started.status_code == 200
+    assert claimed.status_code == 200
+    assert forced_reclaim.status_code == 403
+
+
+def test_worker_routes_reject_mismatched_worker_id(monkeypatch) -> None:
+    token = "test-worker-coordination-secret"
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/workers/worker-a/tables/table-auth-test/lease",
+            json={"worker_id": "worker-b", "force_reclaim": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["code"] == 40002
+    assert payload["errors"][0]["message"] == "One or more fields have an invalid format."
+
+
+def test_durable_worker_claim_recovers_runtime_and_rejects_second_owner(monkeypatch) -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self, checkpoint: dict[str, object]) -> None:
+            self.checkpoint = {
+                "owner_id": None,
+                "fencing_epoch": 0,
+                "sequence": 0,
+                "checkpoint": checkpoint,
+            }
+            self.lease: dict[str, object] | None = None
+            self.sessions: set[str] = set()
+
+        def recover_pending_settlements(self) -> int:
+            return 0
+
+        def start_worker_session(self, worker_id: str, ttl_seconds: int):
+            self.sessions.add(worker_id)
+            return {"worker_id": worker_id, "status": "active"}
+
+        def worker_session_is_active(self, worker_id: str) -> bool:
+            return worker_id in self.sessions
+
+        def heartbeat_worker_session(self, worker_id: str, ttl_seconds: int) -> bool:
+            return worker_id in self.sessions
+
+        def list_worker_table_leases(self, worker_id: str) -> list[dict[str, object]]:
+            if self.lease is None or self.lease["owner_id"] != worker_id:
+                return []
+            return [self.lease]
+
+        def get_table_checkpoint(self, scope_type: str, scope_id: str, table_id: str):
+            return self.checkpoint
+
+        def get_table_lease(self, scope_type: str, scope_id: str, table_id: str):
+            return self.lease
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now=None,
+        ) -> dict[str, object]:
+            now = datetime.now(timezone.utc)
+            if (
+                self.lease is not None
+                and self.lease["owner_id"] != worker_id
+                and self.lease["lease_expires_at"] > now
+            ):
+                raise TableLeaseConflictError("Table is already assigned to another worker.")
+            generation = int(self.checkpoint["fencing_epoch"]) + 1
+            self.lease = {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": generation,
+                "lease_expires_at": now + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": now,
+                "status": "active",
+            }
+            self.checkpoint = {
+                **self.checkpoint,
+                "owner_id": worker_id,
+                "fencing_epoch": generation,
+            }
+            return self.lease
+
+        def renew_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            ttl_seconds: int,
+            *,
+            now=None,
+        ) -> dict[str, object]:
+            assert self.lease is not None
+            assert self.lease["owner_id"] == worker_id
+            assert self.lease["fencing_generation"] == fencing_generation
+            self.lease["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+            self.lease["heartbeat_at"] = datetime.now(timezone.utc)
+            return self.lease
+
+    token = "durable-worker-secret"
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
+    table_id = "durable-worker-table"
+    scope_id = "durable-worker-club"
+    game = FirstPartyNLHGame(table_id, 10, 20, 20, 1000, origin_club_id=scope_id)
+    repository = DurableRepository(serialize_first_party_table(game))
+    monkeypatch.setattr(api_main, "repository", repository)
+    key = (scope_id, table_id)
+    tables.pop(key, None)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with TestClient(app) as client:
+        first_started = client.post("/workers/worker-a/start", headers=headers)
+        second_started = client.post("/workers/worker-b/start", headers=headers)
+        first_claim = client.post(
+            f"/workers/worker-a/tables/{table_id}/lease",
+            json={"worker_id": "worker-a", "scope_type": "club", "scope_id": scope_id},
+            headers=headers,
+        )
+        assert key in tables
+        tables.pop(key, None)
+        second_claim = client.post(
+            f"/workers/worker-b/tables/{table_id}/lease",
+            json={"worker_id": "worker-b", "scope_type": "club", "scope_id": scope_id},
+            headers=headers,
+        )
+        heartbeat = client.post(
+            f"/workers/worker-a/tables/{table_id}/heartbeat",
+            params={"scope_type": "club", "scope_id": scope_id},
+            headers=headers,
+        )
+        assignments = client.get("/workers/worker-a/tables", headers=headers)
+
+    assert first_started.status_code == second_started.status_code == 200
+    assert first_claim.status_code == 200
+    assert first_claim.json()["fencing_generation"] == 1
+    assert second_claim.status_code == 409
+    assert heartbeat.status_code == 200
+    assert assignments.status_code == 200
+    assert assignments.json()["assigned_tables"][0]["table_id"] == table_id
+    tables.pop(key, None)
+
+
+def test_gateway_command_targets_current_lease_owner_and_authenticated_user(monkeypatch) -> None:
+    class LeaseRepository(FirestoreHandRepository):
+        def get_table_lease(self, scope_type: str, scope_id: str, table_id: str):
+            assert (scope_type, scope_id, table_id) == ("club", "club-1", "table-1")
+            return {"owner_id": "worker-current", "fencing_generation": 7}
+
+    class GatewayTransport:
+        gateway_id = "gateway-a"
+
+        def __init__(self) -> None:
+            self.request: dict[str, object] | None = None
+
+        async def request_worker(self, **kwargs: object) -> dict[str, object]:
+            self.request = kwargs
+            return {"ok": True, "replayed": False}
+
+    async def route() -> tuple[dict[str, object], GatewayTransport]:
+        transport = GatewayTransport()
+        monkeypatch.setattr(api_main, "repository", LeaseRepository.__new__(LeaseRepository))
+        monkeypatch.setattr(api_main, "pubsub_transport", transport)
+        runtime = TableRuntime(
+            "club-1",
+            FirstPartyNLHGame("table-1", 10, 20, 20, 1000),
+            ConnectionManager(),
+            repository=api_main.repository,
+            turn_timeout_seconds=0,
+        )
+        result = await api_main.request_owner_command(
+            runtime,
+            "verified-player-uid",
+            {"event": "PLAYER_ACTION", "action_id": "action-1"},
+        )
+        return result, transport
+
+    result, transport = asyncio.run(route())
+
+    assert result == {"ok": True, "replayed": False}
+    assert transport.request is not None
+    assert transport.request["worker_id"] == "worker-current"
+    assert transport.request["command"]["user_id"] == "verified-player-uid"
+
+
+def test_worker_snapshot_fanout_masks_cards_per_user_and_targets_gateway(monkeypatch) -> None:
+    class Presence:
+        async def gateways_for_user(self, scope: str, table_id: str, user_id: str) -> list[str]:
+            assert (scope, table_id) == ("club-1", "masked-fanout-table")
+            return [f"gateway-{user_id}"]
+
+    class WorkerTransport:
+        worker_id = "worker-a"
+
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object], str]] = []
+
+        def publish_gateway_event(
+            self,
+            *,
+            gateway_id: str,
+            event: dict[str, object],
+            ordering_key: str,
+        ) -> None:
+            self.events.append((gateway_id, event, ordering_key))
+
+    async def publish() -> tuple[FirstPartyNLHGame, WorkerTransport]:
+        game = FirstPartyNLHGame(
+            "masked-fanout-table", 10, 20, 20, 1000, origin_club_id="club-1"
+        )
+        assert game.add_player(0, "alice", "Alice", 500)
+        assert game.add_player(1, "bob", "Bob", 500)
+        assert game.start_new_hand()
+        runtime = TableRuntime(
+            "club-1", game, ConnectionManager(), NullHandRepository(), turn_timeout_seconds=0
+        )
+        runtime._table_sequence = 7
+        transport = WorkerTransport()
+        monkeypatch.setattr(api_main, "pubsub_transport", transport)
+        monkeypatch.setattr(api_main, "redis_presence", Presence())
+
+        await api_main.publish_masked_table_snapshots(runtime)
+        return game, transport
+
+    game, transport = asyncio.run(publish())
+
+    assert len(transport.events) == 2
+    by_user = {event[1]["user_id"]: event for event in transport.events}
+    for user_id, other_id in (("alice", "bob"), ("bob", "alice")):
+        gateway_id, event, ordering_key = by_user[user_id]
+        assert gateway_id == f"gateway-{user_id}"
+        assert event["state"]["table_sequence"] == 7
+        assert ordering_key == f"club-1:masked-fanout-table:{user_id}"
+        players = {player["user_id"]: player for player in event["state"]["players"]}
+        assert players[user_id]["hole_cards"] != ["??", "??"]
+        assert players[other_id]["hole_cards"] == ["??", "??"]
+        assert event["state"] == game.get_masked_state_for_player(user_id) | {"table_sequence": 7}
+
+
+def test_gateway_runtime_refreshes_stale_local_copy_from_checkpoint(monkeypatch) -> None:
+    class CheckpointRepository(FirestoreHandRepository):
+        def __init__(self, checkpoint: dict[str, object]) -> None:
+            self.checkpoint = {
+                "owner_id": "worker-a",
+                "fencing_epoch": 3,
+                "sequence": 12,
+                "checkpoint": checkpoint,
+            }
+
+        def get_table_checkpoint(self, scope_type: str, scope_id: str, table_id: str):
+            return self.checkpoint
+
+    scope_id = "gateway-refresh-club"
+    table_id = "gateway-refresh-table"
+    persisted_game = FirstPartyNLHGame(
+        table_id, 10, 20, 20, 1000, origin_club_id=scope_id
+    )
+    assert persisted_game.add_player(0, "alice", "Alice", 500)
+    assert persisted_game.add_player(1, "bob", "Bob", 500)
+    repository = CheckpointRepository(serialize_first_party_table(persisted_game))
+    monkeypatch.setattr(api_main, "repository", repository)
+    monkeypatch.setenv("SERVICE_ROLE", "gateway")
+    local_game = FirstPartyNLHGame(
+        table_id, 10, 20, 20, 1000, origin_club_id=scope_id
+    )
+    runtime = TableRuntime(
+        scope_id, local_game, ConnectionManager(), repository, turn_timeout_seconds=0
+    )
+    key = (scope_id, table_id)
+    previous = tables.get(key)
+    tables[key] = runtime
+
+    try:
+        restored = asyncio.run(
+            api_main.get_or_restore_scoped_runtime("club", scope_id, table_id)
+        )
+        assert restored is runtime
+        assert set(player.user_id for player in runtime.game.seats.values()) == {"alice", "bob"}
+        assert runtime._table_sequence == 12
+    finally:
+        if previous is None:
+            tables.pop(key, None)
+        else:
+            tables[key] = previous
