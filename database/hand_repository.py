@@ -57,6 +57,22 @@ class TableActionCommitStatus(StrEnum):
     SEQUENCE_CONFLICT = "sequence_conflict"
 
 
+class UnionTableCloseStatus(StrEnum):
+    CLOSED = "closed"
+    ALREADY_CLOSED = "already_closed"
+    NOT_FOUND = "not_found"
+    CHECKPOINT_MISSING = "checkpoint_missing"
+    NOT_EMPTY = "not_empty"
+    ACTIVE_LEASE = "active_lease"
+
+
+class UnionRequestStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    NOT_FOUND = "not_found"
+    NOT_AUTHORIZED = "not_authorized"
+
+
 @dataclass(frozen=True)
 class TableActionCommitResult:
     status: TableActionCommitStatus
@@ -295,6 +311,11 @@ class NullHandRepository:
     def get_club_member(self, club_id: str, user_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to verify club membership.")
 
+    def list_club_player_rake_stats(
+        self, club_id: str, agent_user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled to load player rake statistics.")
+
     def get_hand_history(self, club_id: str, hand_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load hand history.")
 
@@ -303,6 +324,58 @@ class NullHandRepository:
 
     def get_union_admin(self, union_id: str, user_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to verify union membership.")
+
+    def get_union_profile(self, union_id: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load a union profile.")
+
+    def get_union_by_code(self, union_code: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to resolve a union code.")
+
+    def create_union(
+        self,
+        union_id: str,
+        union_data: dict[str, Any],
+        union_code: str,
+        creator_user_id: str,
+        founding_club_id: str,
+    ) -> bool:
+        raise FirestoreRequiredError("Firestore must be enabled to create a union.")
+
+    def get_union_representative(
+        self, union_id: str, user_id: str
+    ) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to verify union representatives.")
+
+    def request_union_representative(
+        self, union_id: str, user_id: str, club_id: str, club_role: str
+    ) -> UnionRequestStatus:
+        raise FirestoreRequiredError("Firestore must be enabled to request union representation.")
+
+    def list_union_representative_requests(self, union_id: str) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled to list union representative requests.")
+
+    def approve_union_representative(
+        self, union_id: str, user_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        raise FirestoreRequiredError("Firestore must be enabled to approve union representatives.")
+
+    def request_union_club(
+        self,
+        union_id: str,
+        club_id: str,
+        union_name: str,
+        union_code: str,
+        requested_by: str,
+    ) -> UnionRequestStatus:
+        raise FirestoreRequiredError("Firestore must be enabled to request union club membership.")
+
+    def list_union_club_requests(self, union_id: str) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled to list union club requests.")
+
+    def approve_union_club(
+        self, union_id: str, club_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        raise FirestoreRequiredError("Firestore must be enabled to approve union clubs.")
 
     def is_club_in_union(self, union_id: str, club_id: str) -> bool:
         raise FirestoreRequiredError("Firestore must be enabled to verify union club membership.")
@@ -334,10 +407,13 @@ class NullHandRepository:
         table_data: dict[str, Any],
         *,
         runtime_checkpoint: dict[str, Any] | None = None,
+        required_active_club_id: str | None = None,
     ) -> bool:
         raise FirestoreRequiredError("Firestore must be enabled to create a union table.")
 
-    def close_union_table_record(self, union_id: str, table_id: str) -> bool:
+    def close_union_table_record(
+        self, union_id: str, table_id: str
+    ) -> UnionTableCloseStatus:
         raise FirestoreRequiredError("Firestore must be enabled to close a union table.")
 
     def has_union_table_seats(self, union_id: str, table_id: str) -> bool:
@@ -560,10 +636,23 @@ class FirestoreHandRepository:
         current_time = now or datetime.now(timezone.utc)
         lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
         state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        table_ref = (
+            self._client.collection("unions")
+            .document(scope_id)
+            .collection("tables")
+            .document(table_id)
+            if scope_type == "union"
+            else None
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
         def claim(transaction: Any) -> dict[str, Any]:
+            if table_ref is not None:
+                table_snapshot = table_ref.get(transaction=transaction)
+                table_data = table_snapshot.to_dict() or {} if table_snapshot.exists else {}
+                if not table_snapshot.exists or table_data.get("status") == "closed":
+                    raise TableLeaseConflictError("Closed or missing union tables cannot be claimed.")
             lease_snapshot = lease_ref.get(transaction=transaction)
             state_snapshot = state_ref.get(transaction=transaction)
             current = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
@@ -1537,6 +1626,39 @@ class FirestoreHandRepository:
             return None
         return snapshot.to_dict()
 
+    def list_club_player_rake_stats(
+        self, club_id: str, agent_user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        stats = [
+            snapshot.to_dict() or {}
+            for snapshot in self._client.collection("clubs")
+            .document(club_id)
+            .collection("player_rake_stats")
+            .stream()
+        ]
+        if agent_user_id is not None:
+            agent_group_ids = {
+                str(group.get("agent_group_id"))
+                for snapshot in self._client.collection("agent_groups").stream()
+                if (group := snapshot.to_dict() or {}).get("club_uuid") == club_id
+                and group.get("acting_agent_user_id") == agent_user_id
+                and group.get("status") == "active"
+            }
+            assigned_user_ids = {
+                str(assignment["member_user_id"])
+                for snapshot in self._client.collection("agent_group_memberships").stream()
+                if (assignment := snapshot.to_dict() or {}).get("agent_group_id")
+                in agent_group_ids
+                and assignment.get("status") == "active"
+                and assignment.get("member_user_id")
+            }
+            stats = [
+                player_stats
+                for player_stats in stats
+                if player_stats.get("user_id") in assigned_user_ids
+            ]
+        return sorted(stats, key=lambda player_stats: str(player_stats.get("user_id", "")))
+
     def enqueue_pending_hand(
         self,
         hand_ref: Any,
@@ -1853,6 +1975,299 @@ class FirestoreHandRepository:
             return None
         return snapshot.to_dict()
 
+    def get_union_profile(self, union_id: str) -> dict[str, Any] | None:
+        snapshot = self._client.collection("unions").document(union_id).get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict()
+
+    def get_union_by_code(self, union_code: str) -> dict[str, Any] | None:
+        snapshot = self._client.collection("union_codes").document(union_code).get()
+        if not snapshot.exists:
+            return None
+        code_record = snapshot.to_dict() or {}
+        union_id = code_record.get("union_id")
+        if not isinstance(union_id, str) or not union_id:
+            return None
+        union = self.get_union_profile(union_id)
+        if union is None:
+            return None
+        return {**union, "union_code": union_code}
+
+    def create_union(
+        self,
+        union_id: str,
+        union_data: dict[str, Any],
+        union_code: str,
+        creator_user_id: str,
+        founding_club_id: str,
+    ) -> bool:
+        union_ref = self._client.collection("unions").document(union_id)
+        code_ref = self._client.collection("union_codes").document(union_code)
+        admin_ref = union_ref.collection("admins").document(creator_user_id)
+        representative_ref = union_ref.collection("representatives").document(creator_user_id)
+        club_ref = union_ref.collection("clubs").document(founding_club_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> bool:
+            union_snapshot = union_ref.get(transaction=transaction)
+            code_snapshot = code_ref.get(transaction=transaction)
+            if union_snapshot.exists or code_snapshot.exists:
+                return False
+            transaction.set(
+                union_ref,
+                {**union_data, "created_at": firestore.SERVER_TIMESTAMP},
+            )
+            transaction.set(
+                code_ref,
+                {"union_id": union_id, "union_code": union_code},
+            )
+            transaction.set(
+                admin_ref,
+                {"user_id": creator_user_id, "role": "UNION_ADMIN", "status": "active"},
+            )
+            transaction.set(
+                representative_ref,
+                {
+                    "user_id": creator_user_id,
+                    "club_id": founding_club_id,
+                    "status": "active",
+                    "created_by": creator_user_id,
+                },
+            )
+            transaction.set(
+                club_ref,
+                {
+                    "union_id": union_id,
+                    "club_id": founding_club_id,
+                    "union_name": union_data["name"],
+                    "union_code": union_code,
+                    "theme_id": union_data["theme_id"],
+                    "status": "active",
+                    "created_by": creator_user_id,
+                },
+            )
+            return True
+
+        return commit(transaction)
+
+    def get_union_representative(
+        self, union_id: str, user_id: str
+    ) -> dict[str, Any] | None:
+        snapshot = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("representatives")
+            .document(user_id)
+            .get()
+        )
+        return snapshot.to_dict() if snapshot.exists else None
+
+    def request_union_representative(
+        self, union_id: str, user_id: str, club_id: str, club_role: str
+    ) -> UnionRequestStatus:
+        union_ref = self._client.collection("unions").document(union_id)
+        representative_ref = union_ref.collection("representatives").document(user_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> UnionRequestStatus:
+            union_snapshot = union_ref.get(transaction=transaction)
+            if not union_snapshot.exists or (union_snapshot.to_dict() or {}).get("status") != "active":
+                return UnionRequestStatus.NOT_FOUND
+            representative_snapshot = representative_ref.get(transaction=transaction)
+            representative = representative_snapshot.to_dict() or {} if representative_snapshot.exists else {}
+            if representative.get("status") == "active":
+                return UnionRequestStatus.ACTIVE
+            transaction.set(
+                representative_ref,
+                {
+                    "user_id": user_id,
+                    "club_id": club_id,
+                    "club_role": club_role,
+                    "status": "pending",
+                    "requested_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return UnionRequestStatus.PENDING
+
+        return commit(transaction)
+
+    def list_union_representative_requests(self, union_id: str) -> list[dict[str, Any]]:
+        snapshots = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("representatives")
+            .stream()
+        )
+        return sorted(
+            [data for snapshot in snapshots if (data := snapshot.to_dict() or {}).get("status") == "pending"],
+            key=lambda request: str(request.get("user_id", "")),
+        )
+
+    def approve_union_representative(
+        self, union_id: str, user_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        union_ref = self._client.collection("unions").document(union_id)
+        representative_ref = union_ref.collection("representatives").document(user_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> UnionRequestStatus:
+            snapshot = representative_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return UnionRequestStatus.NOT_FOUND
+            representative = snapshot.to_dict() or {}
+            if representative.get("status") == "active":
+                return UnionRequestStatus.ACTIVE
+            if representative.get("status") != "pending":
+                return UnionRequestStatus.NOT_FOUND
+            club_id = representative.get("club_id")
+            if not isinstance(club_id, str) or not club_id:
+                return UnionRequestStatus.NOT_AUTHORIZED
+            member_ref = (
+                self._client.collection("clubs")
+                .document(club_id)
+                .collection("members")
+                .document(user_id)
+            )
+            member_snapshot = member_ref.get(transaction=transaction)
+            member = member_snapshot.to_dict() or {} if member_snapshot.exists else {}
+            if member.get("status") != "active" or member.get("role") not in {"OWNER", "MANAGER"}:
+                return UnionRequestStatus.NOT_AUTHORIZED
+            transaction.set(
+                representative_ref,
+                {"status": "active", "approved_by": approved_by, "approved_at": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+            return UnionRequestStatus.ACTIVE
+
+        return commit(transaction)
+
+    def request_union_club(
+        self,
+        union_id: str,
+        club_id: str,
+        union_name: str,
+        union_code: str,
+        requested_by: str,
+    ) -> UnionRequestStatus:
+        union_ref = self._client.collection("unions").document(union_id)
+        representative_ref = union_ref.collection("representatives").document(requested_by)
+        club_ref = union_ref.collection("clubs").document(club_id)
+        member_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("members")
+            .document(requested_by)
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> UnionRequestStatus:
+            union_snapshot = union_ref.get(transaction=transaction)
+            representative_snapshot = representative_ref.get(transaction=transaction)
+            club_snapshot = club_ref.get(transaction=transaction)
+            member_snapshot = member_ref.get(transaction=transaction)
+            if not union_snapshot.exists or (union_snapshot.to_dict() or {}).get("status") != "active":
+                return UnionRequestStatus.NOT_FOUND
+            if (
+                not representative_snapshot.exists
+                or (representative_snapshot.to_dict() or {}).get("status") != "active"
+                or (representative_snapshot.to_dict() or {}).get("club_id") != club_id
+            ):
+                return UnionRequestStatus.NOT_AUTHORIZED
+            member = member_snapshot.to_dict() or {} if member_snapshot.exists else {}
+            if member.get("status") != "active" or member.get("role") not in {"OWNER", "MANAGER"}:
+                return UnionRequestStatus.NOT_AUTHORIZED
+            if club_snapshot.exists:
+                status = (club_snapshot.to_dict() or {}).get("status")
+                if status == "active":
+                    return UnionRequestStatus.ACTIVE
+                if status == "pending":
+                    return UnionRequestStatus.PENDING
+            transaction.set(
+                club_ref,
+                {
+                    "union_id": union_id,
+                    "club_id": club_id,
+                    "union_name": union_name,
+                    "union_code": union_code,
+                    "status": "pending",
+                    "requested_by": requested_by,
+                    "requested_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            return UnionRequestStatus.PENDING
+
+        return commit(transaction)
+
+    def list_union_club_requests(self, union_id: str) -> list[dict[str, Any]]:
+        snapshots = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("clubs")
+            .stream()
+        )
+        return sorted(
+            [data for snapshot in snapshots if (data := snapshot.to_dict() or {}).get("status") == "pending"],
+            key=lambda request: str(request.get("club_id", "")),
+        )
+
+    def approve_union_club(
+        self, union_id: str, club_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        club_ref = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("clubs")
+            .document(club_id)
+        )
+        union_ref = self._client.collection("unions").document(union_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> UnionRequestStatus:
+            snapshot = club_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return UnionRequestStatus.NOT_FOUND
+            club = snapshot.to_dict() or {}
+            if club.get("status") == "active":
+                return UnionRequestStatus.ACTIVE
+            if club.get("status") != "pending":
+                return UnionRequestStatus.NOT_FOUND
+            requested_by = club.get("requested_by")
+            if not isinstance(requested_by, str) or not requested_by:
+                return UnionRequestStatus.NOT_AUTHORIZED
+            representative_ref = union_ref.collection("representatives").document(requested_by)
+            member_ref = (
+                self._client.collection("clubs")
+                .document(club_id)
+                .collection("members")
+                .document(requested_by)
+            )
+            representative_snapshot = representative_ref.get(transaction=transaction)
+            member_snapshot = member_ref.get(transaction=transaction)
+            representative = representative_snapshot.to_dict() or {} if representative_snapshot.exists else {}
+            member = member_snapshot.to_dict() or {} if member_snapshot.exists else {}
+            if (
+                representative.get("status") != "active"
+                or representative.get("club_id") != club_id
+                or member.get("status") != "active"
+                or member.get("role") not in {"OWNER", "MANAGER"}
+            ):
+                return UnionRequestStatus.NOT_AUTHORIZED
+            transaction.set(
+                club_ref,
+                {"status": "active", "approved_by": approved_by, "approved_at": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+            return UnionRequestStatus.ACTIVE
+
+        return commit(transaction)
+
     def is_club_in_union(self, union_id: str, club_id: str) -> bool:
         snapshot = (
             self._client.collection("unions")
@@ -1875,6 +2290,8 @@ class FirestoreHandRepository:
             {
                 "union_id": str(data["union_id"]),
                 "name": str(data.get("union_name") or data["union_id"]),
+                "union_code": str(data.get("union_code") or ""),
+                "theme_id": str(data.get("theme_id") or "standard"),
             }
             for snapshot in snapshots
             if (data := snapshot.to_dict() or {}).get("status") == "active"
@@ -1939,6 +2356,7 @@ class FirestoreHandRepository:
         table_data: dict[str, Any],
         *,
         runtime_checkpoint: dict[str, Any] | None = None,
+        required_active_club_id: str | None = None,
     ) -> bool:
         table_ref = (
             self._client.collection("unions")
@@ -1947,13 +2365,46 @@ class FirestoreHandRepository:
             .document(table_id)
         )
         state_ref = self._table_runtime_state_ref("union", union_id, table_id)
+        club_ref = (
+            self._client.collection("unions")
+            .document(union_id)
+            .collection("clubs")
+            .document(required_active_club_id)
+            if required_active_club_id is not None
+            else None
+        )
+        union_ref = (
+            self._client.collection("unions").document(union_id)
+            if required_active_club_id is not None
+            else None
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
         def commit(transaction: Any) -> bool:
             table_snapshot = table_ref.get(transaction=transaction)
             state_snapshot = state_ref.get(transaction=transaction)
+            club_snapshot = (
+                club_ref.get(transaction=transaction)
+                if club_ref is not None
+                else None
+            )
+            union_snapshot = (
+                union_ref.get(transaction=transaction)
+                if union_ref is not None
+                else None
+            )
             if table_snapshot.exists or (runtime_checkpoint is not None and state_snapshot.exists):
+                return False
+            if club_snapshot is not None and (
+                not club_snapshot.exists
+                or (club_snapshot.to_dict() or {}).get("status") != "active"
+            ):
+                return False
+            if union_snapshot is not None and (
+                not union_snapshot.exists
+                or (union_snapshot.to_dict() or {}).get("status") != "active"
+            ):
                 return False
             transaction.set(table_ref, table_data)
             if runtime_checkpoint is not None:
@@ -1976,25 +2427,88 @@ class FirestoreHandRepository:
 
         return commit(transaction)
 
-    def close_union_table_record(self, union_id: str, table_id: str) -> bool:
+    def close_union_table_record(
+        self,
+        union_id: str,
+        table_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> UnionTableCloseStatus:
         table_ref = (
             self._client.collection("unions")
             .document(union_id)
             .collection("tables")
             .document(table_id)
         )
+        state_ref = self._table_runtime_state_ref("union", union_id, table_id)
+        lease_ref = self._table_runtime_lease_ref("union", union_id, table_id)
         transaction = self._client.transaction()
+        current_time = now or datetime.now(timezone.utc)
 
         @firestore.transactional
-        def commit(transaction: Any) -> bool:
-            if not table_ref.get(transaction=transaction).exists:
-                return False
+        def commit(transaction: Any) -> UnionTableCloseStatus:
+            table_snapshot = table_ref.get(transaction=transaction)
+            if not table_snapshot.exists:
+                return UnionTableCloseStatus.NOT_FOUND
+            table = table_snapshot.to_dict() or {}
+            if table.get("status") == "closed":
+                return UnionTableCloseStatus.ALREADY_CLOSED
+
+            state_snapshot = state_ref.get(transaction=transaction)
+            if not state_snapshot.exists:
+                return UnionTableCloseStatus.CHECKPOINT_MISSING
+            state = state_snapshot.to_dict() or {}
+            checkpoint = state.get("checkpoint")
+            checkpoint_runtime = checkpoint.get("runtime_state") if isinstance(checkpoint, dict) else None
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("seats") != []
+                or not isinstance(checkpoint_runtime, dict)
+                or checkpoint_runtime.get("is_hand_running") is not False
+            ):
+                return UnionTableCloseStatus.NOT_EMPTY
+
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            lease = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
+            lease_expiry = lease.get("lease_expires_at")
+            if (
+                lease.get("owner_id") is not None
+                and (lease_expiry is None or lease_expiry > current_time)
+            ):
+                return UnionTableCloseStatus.ACTIVE_LEASE
+
+            next_epoch = max(
+                int(state.get("fencing_epoch", 0)),
+                int(lease.get("fencing_generation", 0)),
+            ) + 1
+            transaction.set(
+                state_ref,
+                {
+                    **state,
+                    "owner_id": None,
+                    "fencing_epoch": next_epoch,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                lease_ref,
+                {
+                    "scope_type": "union",
+                    "scope_id": union_id,
+                    "table_id": table_id,
+                    "owner_id": None,
+                    "fencing_generation": next_epoch,
+                    "lease_expires_at": current_time,
+                    "heartbeat_at": current_time,
+                    "status": "released",
+                },
+            )
             transaction.set(
                 table_ref,
                 {"status": "closed", "closed_at": firestore.SERVER_TIMESTAMP},
                 merge=True,
             )
-            return True
+            return UnionTableCloseStatus.CLOSED
 
         return commit(transaction)
 
@@ -2369,6 +2883,20 @@ class FirestoreHandRepository:
             .collection("treasury")
             .document("pools")
         )
+        rake_attributions = hand_summary.get("rake_attributions", [])
+        rake_stats_refs = {
+            str(attribution["user_id"]): self._client.collection("clubs")
+            .document(club_id)
+            .collection("player_rake_stats")
+            .document(str(attribution["user_id"]))
+            for attribution in rake_attributions
+        }
+        rake_hand_refs = {
+            str(attribution["user_id"]): rake_stats_refs[
+                str(attribution["user_id"])
+            ].collection("hands").document(str(hand_summary["hand_id"]))
+            for attribution in rake_attributions
+        }
         rake_amount = int(hand_summary.get("rake_amount", 0))
         jackpot_amount = int((hand_summary.get("jackpot") or {}).get("fee_collected", 0))
         hotd_amount = 0
@@ -2398,6 +2926,41 @@ class FirestoreHandRepository:
                     member_refs[user_id],
                     {"in_play_balance": firestore.Increment(delta)},
                     merge=True,
+                )
+            for attribution in rake_attributions:
+                user_id = str(attribution["user_id"])
+                transaction.set(
+                    rake_stats_refs[user_id],
+                    {
+                        "user_id": user_id,
+                        "username": next(
+                            (
+                                str(player.get("username", ""))
+                                for player in hand_summary["players"]
+                                if str(player["user_id"]) == user_id
+                            ),
+                            "",
+                        ),
+                        "generated_rake": firestore.Increment(
+                            int(attribution["generated_rake"])
+                        ),
+                        "hands_played": firestore.Increment(1),
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                transaction.set(
+                    rake_hand_refs[user_id],
+                    {
+                        "hand_id": hand_summary["hand_id"],
+                        "table_id": table_id,
+                        "user_id": user_id,
+                        "eligible_contribution": int(
+                            attribution["eligible_contribution"]
+                        ),
+                        "generated_rake": int(attribution["generated_rake"]),
+                        "created_at": firestore.SERVER_TIMESTAMP,
+                    },
                 )
             for player in hand_summary["players"]:
                 seat_ref = (

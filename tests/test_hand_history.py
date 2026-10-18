@@ -29,6 +29,9 @@ def test_replay_masks_all_opponents_when_hand_did_not_reach_showdown() -> None:
         ],
         "operations": [{"type": "PrivateAuditOnly"}],
         "deck_cards": ["secret-card"],
+        "rake_attributions": [
+            {"user_id": "player-a", "generated_rake": 5}
+        ],
     }
 
     replay = filter_replay_for_user(hand_data, "player-a")
@@ -37,6 +40,7 @@ def test_replay_masks_all_opponents_when_hand_did_not_reach_showdown() -> None:
     assert replay["frames"][0]["players"][1]["hole_cards"] == ["??", "??"]
     assert "operations" not in replay
     assert "deck_cards" not in replay
+    assert "rake_attributions" not in replay
     assert hand_data["frames"][0]["players"][1]["hole_cards"] == ["Kd", "Qd"]
 
 

@@ -57,7 +57,7 @@ The role panel should also state: “Your current role is PLAYER. Role assignmen
 
 All four roles require an active club membership. Role assignment itself is managed outside this API. See [API.md](API.md) for the client contract and route requirements.
 
-Union administration is separate from club roles. `UNION_ADMIN` is assigned per union and can create/start shared tables and delete empty shared tables; club `OWNER` and `MANAGER` roles do not grant those permissions. Active `PLAYER` members join shared tables through their home club, and chip balances remain in that club's ledger. See [UNIONS.md](UNIONS.md) for the domain model and current limits.
+Union administration is separate from club roles. `UNION_ADMIN` approves representatives and club membership requests. A participating club's active `OWNER`/`MANAGER` creates, configures, starts, and deletes its own union-linked tables through the club table flow; other member clubs can discover them, and players' chip balances remain in their home-club ledgers. See [UNIONS.md](UNIONS.md) for the domain model and current limits.
 
 ## Completed
 
@@ -266,7 +266,7 @@ Run tests with `python -m pytest`.
 
 ## Firestore and Cloud Run
 
-Firestore is disabled by default. To enable it, set `FIRESTORE_ENABLED=true`, set `GOOGLE_CLOUD_PROJECT`, and configure Application Default Credentials. Buy-ins use a transaction document under the member and a seat reservation under the table; hand audits are stored at `clubs/{club_id}/tables/{table_id}/hands/{hand_id}` and include private cards. Restrict these records to trusted server-side access.
+Firestore is disabled by default. To enable it, set `FIRESTORE_ENABLED=true`, set `GOOGLE_CLOUD_PROJECT`, and configure Application Default Credentials. Use `club_uuid` for Firestore paths even though current REST route templates name the value `{club_id}`. Buy-ins use a transaction document under the member and a seat reservation under the table; hand audits are stored at `clubs/{club_uuid}/tables/{table_id}/hands/{hand_id}` and include private cards. Restrict these records to trusted server-side access.
 
 See [database/README.md](database/README.md) for the collection layout, implemented and suggested document shapes, and field definitions.
 

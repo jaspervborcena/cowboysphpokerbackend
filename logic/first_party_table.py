@@ -21,6 +21,37 @@ from game_engine import (
 from logic.table_game_base import TableGameBase
 
 
+def allocate_rake_by_contribution(
+    contributions: dict[str, int],
+    uncalled_returns: dict[str, int],
+    rake_amount: int,
+) -> dict[str, int]:
+    eligible = {
+        user_id: max(0, contribution - uncalled_returns.get(user_id, 0))
+        for user_id, contribution in contributions.items()
+    }
+    total_eligible = sum(eligible.values())
+    if rake_amount < 0 or rake_amount > total_eligible:
+        raise ValueError("Rake must be between zero and eligible contributions.")
+    if total_eligible == 0:
+        return {user_id: 0 for user_id in contributions}
+
+    shares: dict[str, int] = {}
+    remainders: dict[str, int] = {}
+    for user_id, contribution in eligible.items():
+        shares[user_id], remainders[user_id] = divmod(
+            rake_amount * contribution, total_eligible
+        )
+    remainder_chips = rake_amount - sum(shares.values())
+    remainder_order = sorted(
+        eligible,
+        key=lambda user_id: (-remainders[user_id], user_id),
+    )
+    for user_id in remainder_order[:remainder_chips]:
+        shares[user_id] += 1
+    return shares
+
+
 class FirstPartyNLHGame(TableGameBase):
     """Table-facing adapter for the first-party NLH engine."""
 
@@ -240,7 +271,9 @@ class FirstPartyNLHGame(TableGameBase):
             "table_name": self.table_name,
             "is_union_table": self.union_id is not None,
             "union_id": self.union_id,
+            "union_code": self.union_code,
             "origin_club_id": self.origin_club_id,
+            "theme_id": self.theme_id,
             "hand_id": self._current_hand_id,
             "is_hand_running": self.is_hand_running,
             "street": street,
@@ -328,6 +361,17 @@ class FirstPartyNLHGame(TableGameBase):
 
         rake = self.calculate_rake_accounting(
             pot_total, dealt_flop=len(state.community_cards) >= 3
+        )
+        uncalled_returns = {
+            award.player_id: award.amount for award in outcome.uncalled_returns
+        }
+        rake_attributions = allocate_rake_by_contribution(
+            {
+                player.player_id: player.total_contribution
+                for player in state.players
+            },
+            uncalled_returns,
+            rake["rake_amount"],
         )
         jackpot = self.calculate_jackpot_accounting(
             max(pot_total - rake["rake_amount"], 0)
@@ -441,6 +485,18 @@ class FirstPartyNLHGame(TableGameBase):
             ],
             "rake_amount": rake["rake_amount"],
             "rake": rake,
+            "rake_attributions": [
+                {
+                    "user_id": user_id,
+                    "eligible_contribution": max(
+                        0,
+                        players_by_id[user_id].total_contribution
+                        - uncalled_returns.get(user_id, 0),
+                    ),
+                    "generated_rake": generated_rake,
+                }
+                for user_id, generated_rake in rake_attributions.items()
+            ],
             "jackpot": jackpot,
             "hand_of_the_day": hand_of_day,
             "settlement": {

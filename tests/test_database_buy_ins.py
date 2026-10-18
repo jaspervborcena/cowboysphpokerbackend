@@ -12,6 +12,8 @@ from database import (
     TableActionCommitStatus,
     TableLeaseConflictError,
     TableLeaseExpiredError,
+    UnionTableCloseStatus,
+    UnionRequestStatus,
     WalletTransactionStatus,
     table_action_fingerprint,
 )
@@ -265,9 +267,11 @@ def test_union_buy_in_commits_lease_checked_checkpoint_with_balance_and_seat(mon
     now = datetime.now(timezone.utc)
     member_path = ("clubs", "club-1", "members", "player-1")
     union_club_path = ("unions", "union-1", "clubs", "club-1")
+    union_table_path = ("unions", "union-1", "tables", "table-1")
     client = FakeFirestoreClient({
         member_path: {"chip_balance": 1000},
         union_club_path: {"status": "active"},
+        union_table_path: {"status": "open"},
     })
     repository = FirestoreHandRepository(client)
     lease = repository.claim_table_lease(
@@ -389,9 +393,16 @@ def test_ensure_user_profile_allocates_unique_player_id_and_is_idempotent(monkey
 
 def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient(
+        {("unions", "union-1", "tables", "table-1"): {"status": "open"}}
+    )
     repository = FirestoreHandRepository(client)
-    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+    checkpoint = {
+        "schema_version": 1,
+        "table": {"table_id": "table-1"},
+        "seats": [],
+        "runtime_state": {"is_hand_running": False},
+    }
 
     created = repository.initialize_table_checkpoint(
         "club", "club-1", "table-1", "worker-a", 1, checkpoint
@@ -411,7 +422,9 @@ def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
 
 def test_table_creation_checkpoint_starts_unowned_then_claims_generation_one(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient(
+        {("unions", "union-1", "tables", "table-1"): {"status": "open"}}
+    )
     repository = FirestoreHandRepository(client)
     checkpoint = {"schema_version": 1, "table": {"table_id": "table-created"}}
 
@@ -435,7 +448,8 @@ def test_table_creation_checkpoint_starts_unowned_then_claims_generation_one(mon
 
 def test_durable_worker_sessions_expire_and_assignments_come_from_leases(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    member_path = ("clubs", "club-b", "members", "club-manager")
+    client = FakeFirestoreClient({member_path: {"status": "active", "role": "MANAGER"}})
     repository = FirestoreHandRepository(client)
 
     session = repository.start_worker_session("worker-a", 60)
@@ -484,7 +498,10 @@ def test_durable_worker_sessions_expire_and_assignments_come_from_leases(monkeyp
 
 def test_table_lease_is_durable_fenced_and_reclaimable(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    member_path = ("clubs", "club-b", "members", "club-manager")
+    client = FakeFirestoreClient(
+        {member_path: {"status": "active", "role": "MANAGER"}}
+    )
     repository = FirestoreHandRepository(client)
     initial = datetime(2026, 10, 17, tzinfo=timezone.utc)
     checkpoint = {"schema_version": 1, "table": {"table_id": "table-lease"}}
@@ -593,9 +610,14 @@ def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypa
 
 def test_table_action_commit_rejects_payload_conflict_stale_epoch_and_sequence(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient({("unions", "union-1", "tables", "table-1"): {"status": "open"}})
     repository = FirestoreHandRepository(client)
-    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+    checkpoint = {
+        "schema_version": 1,
+        "table": {"table_id": "table-1"},
+        "seats": [],
+        "runtime_state": {"is_hand_running": False},
+    }
     assert repository.initialize_table_checkpoint(
         "union", "union-1", "table-1", "worker-a", 5, checkpoint
     )
@@ -1006,6 +1028,13 @@ def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:
         "hand_id": "hand-financial-1",
         "table_id": "table-1",
         "rake_amount": 5,
+        "rake_attributions": [
+            {
+                "user_id": "player-1",
+                "eligible_contribution": 100,
+                "generated_rake": 5,
+            }
+        ],
         "jackpot": {"fee_collected": 3},
         "hand_of_the_day": {"prize_amount": 2},
         "players": [{"seat": 0, "user_id": "player-1", "final_stack": 100}],
@@ -1018,6 +1047,61 @@ def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:
         "bad_beat_jackpot_pool": 3,
         "hand_of_the_day_pool": 0,
     }
+    assert client.documents[("clubs", "club-1", "player_rake_stats", "player-1")] == {
+        "user_id": "player-1",
+        "username": "",
+        "generated_rake": 5,
+        "hands_played": 1,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    assert client.documents[("clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-financial-1")] == {
+        "hand_id": "hand-financial-1",
+        "table_id": "table-1",
+        "user_id": "player-1",
+        "eligible_contribution": 100,
+        "generated_rake": 5,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+
+
+def test_agent_sees_only_assigned_players_rake_stats() -> None:
+    client = FakeFirestoreClient(
+        {
+            ("clubs", "club-1", "player_rake_stats", "player-1"): {
+                "user_id": "player-1",
+                "generated_rake": 40,
+                "hands_played": 10,
+            },
+            ("clubs", "club-1", "player_rake_stats", "player-2"): {
+                "user_id": "player-2",
+                "generated_rake": 20,
+                "hands_played": 5,
+            },
+            ("agent_groups", "group-1"): {
+                "agent_group_id": "group-1",
+                "club_uuid": "club-1",
+                "acting_agent_user_id": "agent-1",
+                "status": "active",
+            },
+            ("agent_group_memberships", "assignment-1"): {
+                "agent_group_id": "group-1",
+                "member_user_id": "player-1",
+                "status": "active",
+            },
+            ("agent_group_memberships", "assignment-2"): {
+                "agent_group_id": "group-2",
+                "member_user_id": "player-2",
+                "status": "active",
+            },
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    assert [
+        entry["user_id"]
+        for entry in repository.list_club_player_rake_stats("club-1", "agent-1")
+    ] == ["player-1"]
+    assert len(repository.list_club_player_rake_stats("club-1")) == 2
 
 
 def test_pending_hand_settlement_recovers_and_applies_once(monkeypatch) -> None:
@@ -1076,6 +1160,8 @@ def test_union_membership_lookup_and_club_union_discovery() -> None:
                 "union_id": "union-1",
                 "club_id": "club-1",
                 "union_name": "Pinoy Poker Alliance",
+                "union_code": "P",
+                "theme_id": "emerald",
                 "status": "active",
             },
             ("unions", "union-2", "clubs", "club-1"): {
@@ -1092,7 +1178,12 @@ def test_union_membership_lookup_and_club_union_discovery() -> None:
     assert repository.is_club_in_union("union-1", "club-1")
     assert not repository.is_club_in_union("union-2", "club-1")
     assert repository.get_unions_for_club("club-1") == [
-        {"union_id": "union-1", "name": "Pinoy Poker Alliance"}
+        {
+            "union_id": "union-1",
+            "name": "Pinoy Poker Alliance",
+            "union_code": "P",
+            "theme_id": "emerald",
+        }
     ]
 
 
@@ -1171,7 +1262,12 @@ def test_union_table_metadata_is_created_once_and_soft_closed(monkeypatch) -> No
         "origin_club_id": "club-a",
         "status": "open",
     }
-    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+    checkpoint = {
+        "schema_version": 1,
+        "table": {"table_id": "table-1"},
+        "seats": [],
+        "runtime_state": {"is_hand_running": False},
+    }
 
     assert repository.create_union_table_record(
         "union-1", "table-1", table_data, runtime_checkpoint=checkpoint
@@ -1179,12 +1275,191 @@ def test_union_table_metadata_is_created_once_and_soft_closed(monkeypatch) -> No
     assert not repository.create_union_table_record(
         "union-1", "table-1", table_data, runtime_checkpoint=checkpoint
     )
-    assert repository.close_union_table_record("union-1", "table-1")
+    assert repository.close_union_table_record("union-1", "table-1") is UnionTableCloseStatus.CLOSED
+    assert repository.close_union_table_record("union-1", "table-1") is UnionTableCloseStatus.ALREADY_CLOSED
     assert client.documents[("unions", "union-1", "tables", "table-1")]["status"] == "closed"
     state_path = ("unions", "union-1", "tables", "table-1", "runtime", "state")
     assert client.documents[state_path]["owner_id"] is None
-    assert client.documents[state_path]["fencing_epoch"] == 0
+    assert client.documents[state_path]["fencing_epoch"] == 1
     assert client.documents[state_path]["checkpoint"] == checkpoint
+    lease_path = ("unions", "union-1", "tables", "table-1", "runtime", "lease")
+    assert client.documents[lease_path]["owner_id"] is None
+    assert client.documents[lease_path]["fencing_generation"] == 1
+
+
+def test_shared_union_table_creation_requires_active_origin_club(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    table_path = ("unions", "union-1", "tables", "table-1")
+    club_path = ("unions", "union-1", "clubs", "club-a")
+    union_path = ("unions", "union-1")
+    client = FakeFirestoreClient({
+        union_path: {"status": "active"},
+        club_path: {"status": "pending"},
+    })
+    repository = FirestoreHandRepository(client)
+    table_data = {
+        "union_id": "union-1",
+        "table_id": "table-1",
+        "origin_club_id": "club-a",
+        "status": "open",
+    }
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}}
+
+    assert not repository.create_union_table_record(
+        "union-1",
+        "table-1",
+        table_data,
+        runtime_checkpoint=checkpoint,
+        required_active_club_id="club-a",
+    )
+    assert table_path not in client.documents
+
+    client.documents[club_path]["status"] = "active"
+    assert repository.create_union_table_record(
+        "union-1",
+        "table-1",
+        table_data,
+        runtime_checkpoint=checkpoint,
+        required_active_club_id="club-a",
+    )
+    assert client.documents[table_path]["origin_club_id"] == "club-a"
+
+
+def test_union_creation_representative_approval_and_club_approval(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    member_path = ("clubs", "club-b", "members", "club-manager")
+    client = FakeFirestoreClient({member_path: {"status": "active", "role": "MANAGER"}})
+    repository = FirestoreHandRepository(client)
+
+    assert repository.create_union(
+        "union-1",
+        {
+            "union_id": "union-1",
+            "name": "Northern Union",
+            "theme_id": "teal",
+            "status": "active",
+            "created_by": "founder",
+        },
+        "U",
+        "founder",
+        "club-founders",
+    )
+    assert not repository.create_union(
+        "union-2",
+        {
+            "union_id": "union-2",
+            "name": "Duplicate Code",
+            "theme_id": "teal",
+            "status": "active",
+            "created_by": "another-founder",
+        },
+        "U",
+        "another-founder",
+        "club-other",
+    )
+    assert client.documents[("union_codes", "U")] == {
+        "union_id": "union-1",
+        "union_code": "U",
+    }
+    assert client.documents[("unions", "union-1", "admins", "founder")]["role"] == "UNION_ADMIN"
+    assert client.documents[("unions", "union-1", "representatives", "founder")]["status"] == "active"
+    assert client.documents[("unions", "union-1", "clubs", "club-founders")]["status"] == "active"
+
+    requested_rep = repository.request_union_representative(
+        "union-1", "club-manager", "club-b", "MANAGER"
+    )
+    assert requested_rep is UnionRequestStatus.PENDING
+    client.documents[member_path]["role"] = "PLAYER"
+    assert repository.approve_union_representative(
+        "union-1", "club-manager", "founder"
+    ) is UnionRequestStatus.NOT_AUTHORIZED
+    assert repository.get_union_representative("union-1", "club-manager")["status"] == "pending"
+    client.documents[member_path]["role"] = "MANAGER"
+    assert repository.request_union_club(
+        "union-1", "club-b", "Northern Union", "U", "club-manager"
+    ) is UnionRequestStatus.NOT_AUTHORIZED
+    assert repository.approve_union_representative(
+        "union-1", "club-manager", "founder"
+    ) is UnionRequestStatus.ACTIVE
+    assert repository.get_union_representative("union-1", "club-manager")["status"] == "active"
+
+    assert repository.request_union_club(
+        "union-1", "club-b", "Northern Union", "U", "club-manager"
+    ) is UnionRequestStatus.PENDING
+    assert repository.list_union_club_requests("union-1")[0]["club_id"] == "club-b"
+    assert repository.is_club_in_union("union-1", "club-b") is False
+    client.documents[member_path]["role"] = "PLAYER"
+    assert repository.approve_union_club(
+        "union-1", "club-b", "founder"
+    ) is UnionRequestStatus.NOT_AUTHORIZED
+    assert repository.is_club_in_union("union-1", "club-b") is False
+    client.documents[member_path]["role"] = "MANAGER"
+    assert repository.approve_union_club("union-1", "club-b", "founder") is UnionRequestStatus.ACTIVE
+    assert repository.is_club_in_union("union-1", "club-b") is True
+
+
+def test_union_table_close_rejects_active_lease_and_nonempty_checkpoint(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 18, tzinfo=timezone.utc)
+    table_path = ("unions", "union-1", "tables", "table-1")
+    state_path = (*table_path, "runtime", "state")
+    client = FakeFirestoreClient(
+        {
+            table_path: {"status": "open"},
+            state_path: {
+                "owner_id": None,
+                "fencing_epoch": 2,
+                "sequence": 0,
+                "checkpoint": {
+                    "seats": [],
+                    "runtime_state": {"is_hand_running": False},
+                },
+            },
+        }
+    )
+    repository = FirestoreHandRepository(client)
+    lease = repository.claim_table_lease(
+        "union", "union-1", "table-1", "worker-a", 30, now=now
+    )
+
+    active_close = repository.close_union_table_record("union-1", "table-1", now=now)
+    assert active_close is UnionTableCloseStatus.ACTIVE_LEASE
+    assert client.documents[table_path]["status"] == "open"
+
+    lease_path = (*table_path, "runtime", "lease")
+    client.documents[lease_path].pop("lease_expires_at")
+    malformed_lease_close = repository.close_union_table_record(
+        "union-1", "table-1", now=now
+    )
+    assert malformed_lease_close is UnionTableCloseStatus.ACTIVE_LEASE
+    assert client.documents[table_path]["status"] == "open"
+
+    client.documents[lease_path]["lease_expires_at"] = now
+    client.documents[state_path]["checkpoint"]["seats"] = [{"seat_index": 0}]
+    nonempty_close = repository.close_union_table_record("union-1", "table-1", now=now)
+    assert nonempty_close is UnionTableCloseStatus.NOT_EMPTY
+    assert client.documents[table_path]["status"] == "open"
+    assert client.documents[state_path]["fencing_epoch"] == lease["fencing_generation"]
+
+
+def test_closed_union_table_cannot_be_claimed(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+    table_data = {"status": "open"}
+    checkpoint = {
+        "schema_version": 1,
+        "table": {"table_id": "table-1"},
+        "seats": [],
+        "runtime_state": {"is_hand_running": False},
+    }
+    assert repository.create_union_table_record(
+        "union-1", "table-1", table_data, runtime_checkpoint=checkpoint
+    )
+    assert repository.close_union_table_record("union-1", "table-1") is UnionTableCloseStatus.CLOSED
+
+    with pytest.raises(TableLeaseConflictError, match="Closed or missing union tables"):
+        repository.claim_table_lease("union", "union-1", "table-1", "worker-a", 30)
 
 
 def test_union_table_with_persisted_seat_cannot_be_treated_as_empty() -> None:

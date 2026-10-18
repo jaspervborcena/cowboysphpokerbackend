@@ -98,6 +98,8 @@ class TableGameBase:
         union_id: str | None = None,
         origin_club_id: str | None = None,
         table_name: str | None = None,
+        theme_id: str = "standard",
+        union_code: str | None = None,
         game_id: str = SUPPORTED_GAME_ID,
     ) -> None:
         if not is_game_create_supported(game_id):
@@ -119,6 +121,8 @@ class TableGameBase:
         self.union_id = union_id
         self.origin_club_id = origin_club_id
         self.table_name = table_name or table_id
+        self.theme_id = theme_id
+        self.union_code = union_code
         self.table_settings = TableSettings()
         self.jackpot_pool = 0
         self.rake_pool = 0

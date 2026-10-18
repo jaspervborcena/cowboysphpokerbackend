@@ -12,7 +12,9 @@ This is also the UI contract update plan: it tells the frontend team which names
 - Firestore subcollections are separate documents, not documents physically embedded in their parent. The current backend uses some subcollections; future flat-path changes require a deliberate backend migration.
 - `CLUB_CHIPS` are the only currency for club-table gameplay, including union tables connected to clubs. A union table does not introduce a separate playable currency; buy-ins debit the player's selected home-club balance.
 - `DIAMONDS` and `GLOBAL_PLAYMONEY` are separate from `CLUB_CHIPS` and cannot be used directly as a table stack or buy-in. Diamonds may only fund gameplay after an explicit, backend-authorized conversion to club chips.
-- Current API `user_id` is the Firebase Auth UID derived from the verified token. `player_id` is the planned 8-digit business identity for invitations, memberships, and player-facing records; the current API does not yet return or accept it for these flows. Do not fabricate `player_id` by copying `user_id`.
+- Current API `user_id` is the Firebase Auth UID derived from the verified token. `player_id` is a separate, backend-assigned 8-digit business identity returned by the profile and club membership APIs; it is not accepted as authentication or as a substitute for `user_id`.
+- Current API route templates call their club path parameter `{club_id}`, but its value is `club_uuid`, the club's UUID Firestore document ID. API response field `club_id` is the 8-digit business ID. Use the returned `club_uuid` for operational routes and local table sockets.
+- Some existing union, table, and audit documents retain a legacy field named `club_id` whose value is the UUID `club_uuid`. Do not infer identifier type from that field name alone; follow the document/path contract and API response semantics.
 - The current member API returns `username`, not `nickname`; `nickname` is planned. Use the returned username until nickname support is added, then display `nickname`, `display_name`, `username`, and generated fallback in that order.
 - Use one canonical spelling: `user_id`, `created_at`, `updated_at`, `created_by`, and `updated_by`. Do not create parallel camelCase variants such as `userId`, `createdAt`, `createAt`, `updatedAt`, `createdBy`, or `updatedBy` in new documents.
 - `nickname` is the display label used at the table; if no nickname exists, the UI should fall back to `display_name`, `username`, or a default generated name.
@@ -29,9 +31,9 @@ This is also the UI contract update plan: it tells the frontend team which names
 The most important rule is that the app uses two different identity types:
 
 - `user_id`: Firebase Auth UID, used for authentication and current API membership/member document keys
-- `player_id`: planned business identity for invitations, table seats, ownership, and player-facing business records; not currently supported by the API
+- `player_id`: backend-assigned business identity returned by profile and club membership APIs; keep it separate from Firebase `user_id`
 
-Keep these identities separate when backend support for `player_id` is added. Until then, send the signed-in Firebase ID token and let the API derive `user_id`; do not send either ID as proof of identity.
+Keep these identities separate. Send the signed-in Firebase ID token and let the API derive `user_id`; do not send either ID as proof of identity.
 
 ### User profile and ID mapping (planned)
 
@@ -60,9 +62,9 @@ The Firebase console screenshot shows a top-level `users` collection, but this b
 
 ### Current API payloads
 
-`GET /clubs/{club_id}/members/me` currently returns only `club_id`, Firebase `user_id`, `username`, and `role`. It does not return `player_id`, `nickname`, or `member_status`.
+`GET /clubs/{club_id}/members/me` returns the 8-digit business `club_id`, UUID `club_uuid`, Firebase `user_id`, backend-assigned `player_id`, `username`, and `role`. The path parameter named `{club_id}` must be populated with `club_uuid`. The response does not currently include `nickname` or `member_status`.
 
-`GET /clubs/{club_id}/members/me/wallet` returns `club_id`, Firebase `user_id`, `role`, `currency_type: "CLUB_CHIPS"`, `available_balance`, and `in_play_balance`. The API maps the stored member `chip_balance` to `available_balance`.
+`GET /clubs/{club_id}/members/me/wallet` returns the 8-digit business `club_id`, UUID `club_uuid`, Firebase `user_id`, backend-assigned `player_id`, `role`, `currency_type: "CLUB_CHIPS"`, `available_balance`, and `in_play_balance`. Its path parameter named `{club_id}` must be populated with `club_uuid`. The API maps the stored member `chip_balance` to `available_balance`.
 
 **UI contract:** use the API's `available_balance` as the player's spendable club-chip balance. Do not read Firestore `chip_balance` directly or remap it in the client. Render `in_play_balance` separately; use the seat/table snapshot's `stack` for chips at a specific table.
 
@@ -163,6 +165,12 @@ This keeps the table display friendly while preserving a reliable UI fallback.
 
 Use the wallet API for available/in-play summary and the table snapshot for a seat's current stack. Never add or substitute these fields for one another.
 
+### Rake reporting and player privacy
+
+`GET /clubs/{club_id}/rake/players` returns cumulative generated-rake statistics. The backend stores the cumulative record at `clubs/{club_uuid}/player_rake_stats/{user_id}` and per-hand entries beneath its `hands` subcollection. Local-hand rake is attributed by eligible contribution, excluding uncalled returns. These records are separate from the player's ordinary wallet summary and are never read or written directly by the UI.
+
+Only active `OWNER` and `MANAGER` members can read all club records. An active `AGENT` can read records for currently assigned players only. `PLAYER` members are denied access, and replay responses exclude rake attribution. Rakeback and agent/manager/owner share payouts are not implemented; the proposed 40%/30%/10%/20% rates are target policy only. Union-hand rake attribution and distribution are undefined.
+
 ### Status rule
 
 `status` is context-dependent by collection. Today, active club membership authorization reads the member document's `status` value (`active`). A dedicated `member_status` is planned, but not currently returned by the API. Do not assume `status` has the same meaning on a club, table, ledger, and membership record.
@@ -181,33 +189,25 @@ Normalize names in frontend types, but only populate fields the source API actua
 
 ### Canonical identity fields
 - `user_id` = Firebase Auth UID; current API identity
-- `player_id` = planned 8-digit business identity; backend support pending
-- `club_uuid` = immutable internal UUID, Firestore document ID, and operational API path parameter
-- `club_id` = planned 8-digit public/business ID for search, invitations, and display; current API support is pending
+- `player_id` = backend-assigned 8-digit business identity returned by profile and membership APIs
+- `club_uuid` = immutable internal UUID, Firestore document ID, and value required by operational API/local WebSocket paths
+- `club_id` = 8-digit business ID returned by club APIs for display; not the current operational path value
 - `table_id` = table ID
 - `union_id` = union ID
 - `wallet_id` = wallet record ID
 - `nickname` = planned table display name; current API returns `username`
 
-### Club ID migration mapping (planned; backend migration required)
+### Club identifiers and route behavior
 
-Use `club_uuid` as the Firestore document key and as the path parameter for authenticated club operations. Keep existing UUID-keyed documents and subcollections; do not rekey them. For each club, the backend should:
+The current backend keeps club documents keyed by UUID as `clubs/{club_uuid}` and returns both `club_uuid` and the 8-digit business `club_id` from club provisioning and membership responses. Existing route templates still name the path parameter `{club_id}`; its value is the UUID `club_uuid`. Use that response field for authenticated REST and local WebSocket paths. The union WebSocket's first-message field is also named `club_id` and currently expects the home club UUID. `destination_club_id` in inter-club treasury transfers likewise expects a UUID. Do not substitute the 8-digit business ID in these operational requests.
 
-1. Keep or assign the UUID as `club_uuid`, matching the `clubs/{club_uuid}` document ID.
-2. Allocate a unique 8-digit business `club_id` and store it separately on the club document.
-3. Create a flat `club_id_index/{club_id}` lookup document containing `club_id` and `club_uuid` for search and invitation resolution.
-4. Return both IDs from APIs. Use `club_uuid` in routes for authenticated operational requests, so the backend can address the club document directly without looking up the business ID.
+The 8-digit business `club_id` is intended for public search, invitations, and display. Resolving it through a flat `club_id_index/{club_id}` lookup is a future contract; do not assume that lookup is currently available. Neither ID grants access by itself; the backend must verify the authenticated user's membership and role.
 
-Before the new contract ships, frontend code must treat the current UUID-valued `club_id` as opaque. Do not parse it, relabel it as either target ID, or derive the 8-digit business ID from it. After migration, use `club_uuid` for club API/WebSocket paths and `club_id` only for search, invitation, and display flows. Neither ID grants access by itself; backend authorization must still verify membership/role.
+#### Future route naming cleanup
 
-#### Route contract (planned)
-
-- Use `/clubs/{club_uuid}/...` for operational REST routes and `/ws/table/{club_uuid}/{table_id}` for local gameplay sockets; these values directly identify `clubs/{club_uuid}`.
-- For union sockets, authenticate with the player's 8-digit home `club_id`; resolve it through `club_id_index` to `club_uuid` before membership checks. Keep `union_id` as its existing identifier.
-- `POST /platform/clubs` generates a UUID `club_uuid` and a collision-safe 8-digit `club_id`, then returns both. Club-scoped responses include both fields.
-- Public club search and invitations accept `club_id`; the backend resolves it through the index. UUIDs and 8-digit IDs are never guessed or silently interchanged.
-
-This is a proposed backend/API change, not current behavior. Current endpoints still accept UUID-valued `club_id` parameters.
+- New documentation/client variable names should use `/clubs/{club_uuid}/...` and `/ws/table/{club_uuid}/{table_id}` to make the UUID value explicit, while sending requests to the existing route templates whose parameter is named `{club_id}`.
+- If union socket authentication later accepts the 8-digit business `club_id`, the backend must resolve it to `club_uuid` before membership checks. That lookup is not part of the current behavior.
+- Keep `union_id` unchanged. Do not infer or interchange UUIDs and 8-digit business IDs.
 
 ### Canonical business fields
 - `username` / `display_name`
@@ -218,7 +218,7 @@ This is a proposed backend/API change, not current behavior. Current endpoints s
 - `membership_status` when the UI needs a broader membership lifecycle state outside the member record
 - `wallet_type`
 - `currency_type`
-- `club_uuid` (planned stable internal club reference)
+- `club_uuid` (current stable internal club reference and Firestore document ID)
 - `agent_player_id` (optional planned 8-digit agent/referral `player_id`; not the current stored `agent_id` UID)
 - `chip_balance` (stored member available balance; API maps to `available_balance`)
 - `in_play_balance`
@@ -256,7 +256,7 @@ This is the minimum alias map the UI team should implement before they rename an
 | `user_id` | `user_id` | Current API value is the Firebase Auth UID. Never reinterpret or copy it into `player_id`. |
 | `player_id` | `player_id` | Canonical business identity for membership, invites, seats, and ownership. |
 | `agent_id` (current Firestore member field) | `agent_player_id` | Current stored `agent_id` is a Firebase UID. Backend must resolve it to the agent's 8-digit `player_id`; frontend must not copy or relabel the UID. |
-| `club_id` (current UUID-valued API/path field) | Opaque legacy ID until backend migration | Frontend must not infer either target ID from it. |
+| Current route parameter `{club_id}` | `club_uuid` | Route templates keep this parameter name; pass the UUID returned in the `club_uuid` response field. |
 | Existing club document/path UUID | `club_uuid` | Preserve as the Firestore document ID and operational API path parameter. |
 | Backend-issued 8-digit business club ID | `club_id` | Read only from the migrated API/document field; never derive it client-side. |
 | `owner_user_id` | Context-dependent | Preserve the current collection/API meaning. For `POST /platform/clubs`, it is a Firebase UID; only map to `owner_player_id` when a future contract confirms it is the business player ID. |
@@ -274,7 +274,7 @@ This is the minimum alias map the UI team should implement before they rename an
 | `currency_type` | `currency_type` | Keep canonical. |
 | `from_user_id` / `to_user_id` | Preserve as user IDs | Current transfer ledger fields contain Firebase UIDs. Do not relabel them as player IDs until the backend provides business IDs. |
 | `nickname` | `nickname` | Canonical display label for tables and member chips. |
-| `club_id` | Context-dependent | Current API/path value is UUID-valued and opaque; after migration, `club_id` is the 8-digit public/business ID, while operational routes use `club_uuid`. |
+| `club_id` | Context-dependent | In API responses it is the 8-digit business ID; in current route templates `{club_id}` is a parameter name whose value must be `club_uuid`. |
 | `table_id` | `table_id` | Stable canonical field. |
 | `union_id` | `union_id` | Stable canonical field. |
 
@@ -337,7 +337,7 @@ These fields are proposals only; they are not currently returned by the API or u
 
 ### Planned club plan and capacity fields
 
-Proposed fields on `clubs/{club_id}`:
+Proposed fields on `clubs/{club_uuid}`:
 
 - `plan_id`
 - `club_star_level` (integer from 1 to 10)
@@ -360,7 +360,7 @@ Agent transfers are not a separate API or Firestore collection. The existing end
 - `POST /clubs/{club_id}/wallet/send-out`
 - `POST /clubs/{club_id}/wallet/claim-back`
 
-Agents can only send chips to or claim chips back from members assigned to them through `agent_id`. Both flows write one idempotent ledger record to `clubs/{club_id}/transactions/{transaction_id}`. Filter the ledger by `type` to show `SEND_OUT` or `CLAIM_BACK`; do not create duplicate agent-specific transfer collections.
+Agents can only send chips to or claim chips back from members assigned to them through `agent_id`. Both flows write one idempotent ledger record to `clubs/{club_uuid}/transactions/{transaction_id}`. Filter the ledger by `type` to show `SEND_OUT` or `CLAIM_BACK`; do not create duplicate agent-specific transfer collections.
 
 Current backend Firestore send-out document sample (not the API response):
 
@@ -422,7 +422,7 @@ Use these fields when returned by the current endpoints/snapshots:
 - Table seats/snapshots: `table_id`, `user_id`, `username`, `seat_index`, `stack`, `status`, `hand_id`, `pot_total`
 - Ledger transfer response: `transaction_id`, `type`, `amount`, `from_user_id`, `to_user_id`, `status`
 
-These remain planned until the backend exposes them in API responses: `player_id`, `club_uuid`, `agent_player_id`, `nickname`, `member_status`, Diamond wallet fields (`wallet_id`, `wallet_type`, `diamond_balance`), club star/plan/capacity fields, and moderation/GPS/VIP fields. `club_uuid` becomes usable only when the migrated API returns it alongside the new 8-digit `club_id`; until then, treat the current UUID-valued `club_id` as opaque. Do not make planned fields required or read them directly from Firestore as a shortcut.
+These remain planned until the backend exposes them in API responses: `nickname`, `member_status`, Diamond wallet fields (`wallet_id`, `wallet_type`, `diamond_balance`), club star/plan/capacity fields, and moderation/GPS/VIP fields. The current API already returns `player_id` and `club_uuid`; do not treat them as unavailable or substitute the 8-digit business `club_id` in operational paths.
 
 ## No-break rule for current storage
 
@@ -561,13 +561,14 @@ UI use:
 
 ## 3) Club member and wallet collections
 
-### 3.1 `clubs/{club_id}`
+### 3.1 `clubs/{club_uuid}`
 
 Sample:
 
 ```json
 {
-  "club_id": "demo-club",
+  "club_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "club_id": "87654321",
   "name": "Demo Club",
   "status": "active",
   "owner_user_id": "demo-owner",
@@ -576,6 +577,7 @@ Sample:
 ```
 
 Fields:
+- `club_uuid`
 - `club_id`
 - `name`
 - `status`
@@ -585,7 +587,7 @@ Fields:
 UI use:
 - Club identity and selected club context.
 
-### 3.2 `clubs/{club_id}/members/{user_id}`
+### 3.2 `clubs/{club_uuid}/members/{user_id}`
 
 Current demo-fixture sample; the demo IDs below are placeholders, not Firebase UIDs:
 
@@ -614,7 +616,7 @@ UI use:
 - Current API returns `username`; `nickname` support is planned, not implemented.
 - Current wallet API maps stored `chip_balance` to `available_balance` and returns `in_play_balance` separately.
 
-### 3.3 `clubs/{club_id}/members/{user_id}/transactions/{buy_in_id}`
+### 3.3 `clubs/{club_uuid}/members/{user_id}/transactions/{buy_in_id}`
 
 Sample:
 
@@ -645,7 +647,7 @@ UI use:
 - Useful for buy-in/audit log display.
 - Not a primary game state source.
 
-### 3.4 `clubs/{club_id}/transactions/{transaction_id}`
+### 3.4 `clubs/{club_uuid}/transactions/{transaction_id}`
 
 Sample:
 
@@ -675,7 +677,7 @@ UI use:
 - Audit/history display.
 - Not needed to play the table.
 
-### 3.5 `clubs/{club_id}/treasury/wallet`
+### 3.5 `clubs/{club_uuid}/treasury/wallet`
 
 Sample:
 
@@ -691,7 +693,7 @@ Fields:
 UI use:
 - Owner/manager treasury display only.
 
-### 3.6 `clubs/{club_id}/treasury/pools`
+### 3.6 `clubs/{club_uuid}/treasury/pools`
 
 Sample:
 
@@ -715,14 +717,14 @@ UI use:
 
 ## 4) Table and seat collections
 
-### 4.1 `clubs/{club_id}/tables/{table_id}`
+### 4.1 `clubs/{club_uuid}/tables/{table_id}`
 
 Sample:
 
 ```json
 {
   "table_id": "demo-club-table",
-  "club_id": "demo-club",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "game_id": "no_limit_texas_holdem",
   "status": "demo_archive"
 }
@@ -737,7 +739,7 @@ Fields:
 UI use:
 - Lobby and table list rendering.
 
-### 4.2 `clubs/{club_id}/tables/{table_id}/seats/{seat_index}`
+### 4.2 `clubs/{club_uuid}/tables/{table_id}/seats/{seat_index}`
 
 Current demo-fixture sample:
 
@@ -763,14 +765,14 @@ Fields:
 UI use:
 - Seat assignment and stack display.
 
-### 4.3 `clubs/{club_id}/tables/{table_id}/hands/{hand_id}`
+### 4.3 `clubs/{club_uuid}/tables/{table_id}/hands/{hand_id}`
 
 Current demo-fixture audit sample. Backend-only; use the replay API for UI history because it filters private card data.
 
 ```json
 {
   "hand_id": "demo-hand",
-  "club_id": "demo-club",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "table_id": "demo-club-table",
   "settlement_status": "settled",
   "pot_total": 200,
@@ -825,7 +827,7 @@ UI use:
 
 These are backend-internal and are present when Firestore is enabled.
 
-### 5.1 `clubs/{club_id}/tables/{table_id}/runtime/state`
+### 5.1 `clubs/{club_uuid}/tables/{table_id}/runtime/state`
 
 Sample:
 
@@ -857,7 +859,7 @@ Fields:
 UI use:
 - None. Backend only.
 
-### 5.2 `clubs/{club_id}/tables/{table_id}/runtime/state/actions/{action_hash}`
+### 5.2 `clubs/{club_uuid}/tables/{table_id}/runtime/state/actions/{action_hash}`
 
 Sample:
 
@@ -883,7 +885,7 @@ Fields:
 UI use:
 - None. Backend only.
 
-### 5.3 `clubs/{club_id}/tables/{table_id}/runtime/lease`
+### 5.3 `clubs/{club_uuid}/tables/{table_id}/runtime/lease`
 
 Sample:
 
@@ -925,6 +927,8 @@ Sample:
 {
   "union_id": "demo-union",
   "name": "Demo Union",
+  "union_code": "D",
+  "theme_id": "standard",
   "status": "active",
   "created_by": "demo-owner"
 }
@@ -933,6 +937,8 @@ Sample:
 Fields:
 - `union_id`
 - `name`
+- `union_code` (unique one-letter code)
+- `theme_id` (shared default table theme)
 - `status`
 - `created_by`
 
@@ -959,15 +965,33 @@ Fields:
 UI use:
 - UI can display union-admin-only controls, but permission is server-authoritative.
 
-### 6.3 `unions/{union_id}/clubs/{club_id}`
+### 6.2.1 `unions/{union_id}/representatives/{user_id}`
+
+Sample:
+
+```json
+{
+  "user_id": "demo-manager",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
+  "club_role": "MANAGER",
+  "status": "pending",
+  "requested_at": "server timestamp"
+}
+```
+
+Representative access is requested by an active club `OWNER`/`MANAGER` and approved by a union admin. Only an active representative can request union membership for the same club recorded on this document. The union creator is provisioned as an active representative for the founding club.
+
+### 6.3 `unions/{union_id}/clubs/{club_uuid}`
 
 Sample:
 
 ```json
 {
   "union_id": "demo-union",
-  "club_id": "demo-club",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "union_name": "Demo Union",
+  "union_code": "D",
+  "theme_id": "standard",
   "status": "active"
 }
 ```
@@ -976,7 +1000,10 @@ Fields:
 - `union_id`
 - `club_id`
 - `union_name`
-- `status`
+- `union_code`
+- `theme_id`
+- `status` (`pending` until a union admin approves; `active` for shared discovery/play)
+- `requested_by` / `approved_by` and server timestamps when applicable
 
 UI use:
 - Determine if a club is participating in a union table lobby.
@@ -989,8 +1016,10 @@ Sample:
 {
   "union_id": "demo-union",
   "table_id": "demo-union-table",
-  "origin_club_id": "demo-club",
+  "origin_club_id": "550e8400-e29b-41d4-a716-446655440000",
   "game_id": "no_limit_texas_holdem",
+  "union_code": "D",
+  "theme_id": "standard",
   "status": "demo_archive"
 }
 ```
@@ -1000,10 +1029,24 @@ Fields:
 - `table_id`
 - `origin_club_id`
 - `game_id`
+- `union_code`
+- `theme_id`
+- `table_name`
 - `status`
 
 UI use:
 - Shared table list and route selection.
+
+## Union code lookup index
+
+`union_codes/{union_code}` reserves a unique, normalized union letter and resolves it to the stable `union_id`:
+
+```json
+{
+  "union_code": "D",
+  "union_id": "demo-union"
+}
+```
 
 ### 6.5 `unions/{union_id}/tables/{table_id}/seats/{seat_index}`
 
@@ -1013,7 +1056,7 @@ Sample:
 {
   "seat_index": 0,
   "user_id": "demo-player-a",
-  "club_id": "demo-club",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "stack": 100,
   "status": "demo_archive"
 }
@@ -1073,13 +1116,13 @@ Fields:
 - `union_id`
 - `settlement_date`
 
-### 6.8 `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_id}`
+### 6.8 `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_uuid}`
 
 Sample:
 
 ```json
 {
-  "club_id": "demo-club",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "debt": 0,
   "credit": 0,
   "net_delta": 0

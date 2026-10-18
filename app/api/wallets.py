@@ -103,6 +103,13 @@ class ClubWalletSummaryResponse(BaseModel):
     in_play_balance: int = Field(ge=0)
 
 
+class ClubPlayerRakeStatResponse(BaseModel):
+    user_id: str
+    username: str
+    generated_rake: int = Field(ge=0)
+    hands_played: int = Field(ge=0)
+
+
 class GlobalWalletResponse(BaseModel):
     wallet_id: str
     wallet_type: Literal["GLOBAL_PLAYMONEY"]
@@ -328,6 +335,41 @@ async def get_my_club_wallet_summary(
         "available_balance": available,
         "in_play_balance": in_play,
     }
+
+
+@router.get(
+    "/clubs/{club_id}/rake/players",
+    tags=["Club wallets"],
+    summary="List player rake statistics",
+    description="Returns club player rake statistics to active OWNER and MANAGER members, or to an AGENT for players assigned to that agent. PLAYER members are denied access.",
+    response_model=list[ClubPlayerRakeStatResponse],
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("An active OWNER, MANAGER, or AGENT membership is required."),
+        503: error_response("Player rake statistics are unavailable."),
+    },
+)
+async def list_club_player_rake_stats(
+    request: Request,
+    club_id: str,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> list[dict[str, Any]]:
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER, ClubRole.AGENT}:
+        raise HTTPException(
+            status_code=403,
+            detail="An OWNER, MANAGER, or AGENT membership is required.",
+        )
+    agent_user_id = (
+        membership.user.uid if membership.role is ClubRole.AGENT else None
+    )
+    try:
+        return await asyncio.to_thread(
+            request.app.state.repository.list_club_player_rake_stats,
+            club_id,
+            agent_user_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Player rake statistics are unavailable.") from error
 
 
 @router.post(

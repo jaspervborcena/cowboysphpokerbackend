@@ -4,6 +4,8 @@
 
 This document evaluates the proposed topic-based game and chat WebSocket design against the current Cowboys PH Poker backend. The proposal is a possible direction for future scaling; its sample code is not a drop-in replacement for the current protocol.
 
+Current club route templates call the path parameter `{club_id}`, but its value must be the UUID (`club_uuid`) returned by the membership API. The union socket's authentication field is also named `club_id` and currently expects the home-club UUID, not the 8-digit business ID.
+
 ## Current Backend
 
 The current implementation is a single-process, authoritative table flow:
@@ -44,7 +46,7 @@ Starting a hand broadcasts to players already connected. If a player connects af
 The existing protocol remains supported. Authenticate using the Firebase token in the first message; for a union table, include the player's home club:
 
 ```json
-{"type":"authenticate","id_token":"<Firebase ID token>","club_id":"club-a"}
+{"type":"authenticate","id_token":"<Firebase ID token>","club_id":"550e8400-e29b-41d4-a716-446655440000"}
 ```
 
 The server responds with `{"type":"authenticated","user_id":"..."}` and then a raw table-state snapshot. A game action is sent as:
@@ -67,7 +69,7 @@ For a union table, the first message opts the connection into the v1 envelope. T
     "correlation_id": "auth-1",
     "payload": {
         "id_token": "<Firebase ID token>",
-        "club_id": "club-a"
+        "club_id": "550e8400-e29b-41d4-a716-446655440000"
     }
 }
 ```
@@ -94,14 +96,14 @@ The server sends an `AUTHENTICATED` envelope and then a `TABLE_SNAPSHOT` envelop
             {
                 "seat": 0,
                 "user_id": "player-a",
-                "club_id": "club-a",
+                "club_id": "550e8400-e29b-41d4-a716-446655440000",
                 "stack": 450,
                 "hole_cards": ["As", "Ad"]
             },
             {
                 "seat": 1,
                 "user_id": "player-b",
-                "club_id": "club-b",
+                "club_id": "550e8400-e29b-41d4-a716-446655440001",
                 "stack": 400,
                 "hole_cards": ["??", "??"]
             }
@@ -184,7 +186,7 @@ The first-party NLH engine remains in-process and authoritative for legal action
 
 A versioned JSON codec round-trips the first-party table state: configuration/settings, seats and stacks, button rotation, pending pre-actions, replay frames, engine events, pending completed-hand audit, the complete `NLHHandState`, and 52-card deck order. Firestore checkpoints now persist this private payload for table creation and implemented mutations; it must not be exposed to clients. It does not include connection objects, active timeout tasks, or the runtime's recent action cache. Encryption, access controls, checkpoint cadence for all mutations, and turn-deadline recovery remain open.
 
-The repository defines transaction primitives for `clubs/{club_id}/tables/{table_id}/runtime/state` and `unions/{union_id}/tables/{table_id}/runtime/state`. The state carries a schema version, sequence, owner ID, fencing epoch, and checkpoint; `state/actions/{sha256(user_id + action_id)}` stores an accepted action fingerprint and sequence. `commit_table_action` checks the expected sequence, checkpoint owner/epoch, and matching unexpired lease owner/generation in one Firestore transaction before writing the checkpoint and action record. The repository also defines transactional lease claim, renewal, authorization, and release operations under `runtime/lease`, including fencing-generation updates. With Firestore enabled, `TableRuntime` commits first-party hand starts, explicit player actions, standalone pre-actions, and timeout actions through this transaction; club/union buy-ins atomically couple balance, seat, ledger, checkpoint, and action-journal writes under the lease. Table creation initializes a generation-zero unowned checkpoint, with union metadata and checkpoint written atomically. Firestore worker sessions and scope-aware worker routes use durable assignment and lease records, and worker claims restore absent runtimes from their checkpoints. In opt-in gateway/worker mode, Pub/Sub forwards player/pre-action commands to the lease owner and returns user-masked snapshots to gateways using Redis socket presence. REST table mutations, settings/lifecycle persistence, secure checkpoint storage, and full cross-worker retry/recovery validation remain outstanding.
+The repository defines transaction primitives for `clubs/{club_uuid}/tables/{table_id}/runtime/state` and `unions/{union_id}/tables/{table_id}/runtime/state`. The state carries a schema version, sequence, owner ID, fencing epoch, and checkpoint; `state/actions/{sha256(user_id + action_id)}` stores an accepted action fingerprint and sequence. `commit_table_action` checks the expected sequence, checkpoint owner/epoch, and matching unexpired lease owner/generation in one Firestore transaction before writing the checkpoint and action record. The repository also defines transactional lease claim, renewal, authorization, and release operations under `runtime/lease`, including fencing-generation updates. With Firestore enabled, `TableRuntime` commits first-party hand starts, explicit player actions, standalone pre-actions, and timeout actions through this transaction; club/union buy-ins atomically couple balance, seat, ledger, checkpoint, and action-journal writes under the lease. Table creation initializes a generation-zero unowned checkpoint, with union metadata and checkpoint written atomically. Firestore worker sessions and scope-aware worker routes use durable assignment and lease records, and worker claims restore absent runtimes from their checkpoints. In opt-in gateway/worker mode, Pub/Sub forwards player/pre-action commands to the lease owner and returns user-masked snapshots to gateways using Redis socket presence. REST table mutations, settings/lifecycle persistence, secure checkpoint storage, and full cross-worker retry/recovery validation remain outstanding.
 
 The current runtime delegates completed-hand persistence and balance updates to the repository, which uses pending settlement records and idempotent Firestore operations. Keep this as one logical settlement workflow. Do not assume that it is one gRPC write: Firestore's internal transport and transaction behavior are not the WebSocket protocol, and the repository owns those details.
 

@@ -46,9 +46,13 @@ from database import (
     BuyInStatus,
     FirestoreHandRepository,
     FirestoreRequiredError,
+    TableActionCommitStatus,
     TableLeaseConflictError,
     TableLeaseExpiredError,
+    UnionRequestStatus,
+    UnionTableCloseStatus,
     create_hand_repository,
+    table_action_fingerprint,
 )
 from logic.auth import FirebaseTokenVerifier
 from logic.connections import ConnectionManager
@@ -87,6 +91,9 @@ class CreateTableRequest(BaseModel):
     buy_in_min: int = Field(gt=0)
     buy_in_max: int = Field(gt=0)
     table_size: int | None = Field(default=None, ge=2)
+    union_id: str | None = Field(default=None, min_length=1, max_length=128)
+    table_name: str | None = Field(default=None, min_length=1, max_length=100)
+    theme_id: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class SeatPlayerRequest(BaseModel):
@@ -107,12 +114,8 @@ class TableLeaseClaimRequest(BaseModel):
     scope_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
-class CreateUnionTableRequest(CreateTableRequest):
-    origin_club_id: str = Field(min_length=1)
-    table_name: str = Field(min_length=1, max_length=100)
-
-
 class UpdateTableSettingsRequest(BaseModel):
+    settings_update_id: UUID
     jackpot_enabled: bool | None = None
     jackpot_fee: int | None = Field(default=None, ge=0)
     jackpot_min_pot: int | None = Field(default=None, ge=0)
@@ -131,9 +134,10 @@ class UnionAdminProvisionRequest(BaseModel):
     status: str = Field(default="active", min_length=1, max_length=32)
 
 
-class UnionClubProvisionRequest(BaseModel):
-    union_name: str = Field(min_length=1, max_length=200)
-    status: str = Field(default="active", min_length=1, max_length=32)
+class CreateUnionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    union_code: str = Field(pattern=r"^[A-Z]$")
+    theme_id: str = Field(default="standard", min_length=1, max_length=40)
 
 
 class PlayerAction(BaseModel):
@@ -386,6 +390,90 @@ async def reserve_seat_buy_in(
     return status, False
 
 
+async def update_runtime_table_settings(
+    runtime: TableRuntime,
+    user_id: str,
+    request: UpdateTableSettingsRequest,
+) -> dict[str, Any]:
+    async with runtime.lock:
+        durable_repository = (
+            runtime.repository
+            if isinstance(runtime.repository, FirestoreHandRepository)
+            else None
+        )
+        before_checkpoint = None
+        lease = None
+        if durable_repository is not None:
+            if not isinstance(runtime.game, FirstPartyNLHGame):
+                raise HTTPException(status_code=409, detail="This table cannot be checkpointed.")
+            lease = runtime.current_lease()
+            if lease is None or runtime._worker_id != lease.owner_worker_id:
+                raise HTTPException(status_code=409, detail="This runtime does not own the table lease.")
+            before_checkpoint = serialize_first_party_table(runtime.game)
+
+        settings = request.model_dump(
+            mode="json",
+            exclude={"settings_update_id"},
+            exclude_none=True,
+        )
+        try:
+            payload = runtime.game.update_table_settings(**settings)
+        except ValueError as error:
+            if before_checkpoint is not None:
+                runtime.game = deserialize_first_party_table(before_checkpoint)
+            raise HTTPException(status_code=422, detail="Table settings are invalid.") from error
+
+        if durable_repository is None:
+            return payload
+
+        assert lease is not None
+        action_id = str(request.settings_update_id)
+        payload_hash = table_action_fingerprint(
+            user_id,
+            action_id,
+            {
+                "event": "UPDATE_TABLE_SETTINGS",
+                "table_id": runtime.game.table_id,
+                "settings": settings,
+            },
+        )
+        try:
+            result = await asyncio.to_thread(
+                durable_repository.commit_table_action,
+                *runtime._lease_scope(),
+                runtime.game.table_id,
+                lease.owner_worker_id,
+                lease.fencing_generation,
+                runtime._table_sequence,
+                user_id,
+                action_id,
+                payload_hash,
+                serialize_first_party_table(runtime.game),
+            )
+        except Exception:
+            assert before_checkpoint is not None
+            runtime.game = deserialize_first_party_table(before_checkpoint)
+            raise
+
+        if result.status is TableActionCommitStatus.COMMITTED:
+            runtime._table_sequence = result.sequence
+            return payload
+        if result.status is TableActionCommitStatus.IDEMPOTENT_REPLAY:
+            await runtime._restore_persisted_checkpoint()
+            return runtime.game.table_settings.as_dict()
+
+        await runtime._restore_persisted_checkpoint()
+        if result.status is TableActionCommitStatus.IDEMPOTENCY_CONFLICT:
+            raise HTTPException(
+                status_code=409,
+                detail="settings_update_id was already used with different settings.",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="The table lease or state changed before settings were committed.",
+        )
+
+
 def union_table_key(union_id: str, table_id: str) -> tuple[str, str]:
     return (f"union:{union_id}", table_id)
 
@@ -397,7 +485,9 @@ def table_lobby_entry(game: TableGameBase) -> dict[str, Any]:
         "table_name": game.table_name,
         "is_union_table": game.union_id is not None,
         "union_id": game.union_id,
+        "union_code": game.union_code,
         "origin_club_id": game.origin_club_id,
+        "theme_id": game.theme_id,
         "small_blind": game.small_blind,
         "big_blind": game.big_blind,
         "buy_in_min": game.buy_in_min,
@@ -407,6 +497,29 @@ def table_lobby_entry(game: TableGameBase) -> dict[str, Any]:
         "is_hand_running": game.is_hand_running,
         **game.table_settings.as_dict(),
     }
+
+
+async def require_union_table_origin_operator(
+    runtime: TableRuntime,
+    current_user: AuthenticatedUser,
+) -> ClubMembership:
+    origin_club_id = runtime.game.origin_club_id
+    if runtime.union_id is None or origin_club_id is None:
+        raise HTTPException(status_code=409, detail="Union table has no valid origin club.")
+    membership = await load_active_club_member(repository, origin_club_id, current_user)
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER}:
+        raise HTTPException(status_code=403, detail="The origin club owner or manager is required.")
+    try:
+        is_active_union_member = await asyncio.to_thread(
+            repository.is_club_in_union,
+            runtime.union_id,
+            origin_club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union membership could not be verified.") from error
+    if not is_active_union_member:
+        raise HTTPException(status_code=403, detail="The origin club is no longer an active union member.")
+    return membership
 
 
 def table_lease_payload(runtime: TableRuntime) -> dict[str, Any]:
@@ -742,6 +855,186 @@ async def list_club_unions(
         raise HTTPException(status_code=503, detail="Club union list is unavailable.") from error
 
 
+@app.get("/unions/code/{union_code}")
+async def get_union_by_code(
+    union_code: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    try:
+        union = await asyncio.to_thread(repository.get_union_by_code, union_code.upper())
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union lookup is unavailable.") from error
+    if union is None or union.get("status") != "active":
+        raise HTTPException(status_code=404, detail="Union not found.")
+    return {
+        "union_id": str(union["union_id"]),
+        "union_code": str(union.get("union_code") or union_code.upper()),
+        "name": str(union.get("name") or ""),
+        "theme_id": str(union.get("theme_id") or "standard"),
+        "status": "active",
+    }
+
+
+@app.post("/clubs/{club_id}/unions", status_code=201)
+async def create_union(
+    club_id: str,
+    request: CreateUnionRequest,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, str]:
+    union_id = str(uuid4())
+    union_data = {
+        "union_id": union_id,
+        "name": request.name,
+        "union_code": request.union_code,
+        "theme_id": request.theme_id,
+        "status": "active",
+        "created_by": membership.user.uid,
+    }
+    try:
+        created = await asyncio.to_thread(
+            repository.create_union,
+            union_id,
+            union_data,
+            request.union_code,
+            membership.user.uid,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union could not be created.") from error
+    if not created:
+        raise HTTPException(status_code=409, detail="Union code is already in use.")
+    return {
+        "union_id": union_id,
+        "union_code": request.union_code,
+        "name": request.name,
+        "theme_id": request.theme_id,
+        "founding_club_id": club_id,
+        "status": "active",
+    }
+
+
+@app.post("/clubs/{club_id}/unions/{union_id}/representative-requests", status_code=202)
+async def request_union_representative(
+    club_id: str,
+    union_id: str,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, str]:
+    try:
+        status = await asyncio.to_thread(
+            repository.request_union_representative,
+            union_id,
+            membership.user.uid,
+            club_id,
+            membership.role.value,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union representative request failed.") from error
+    if status is UnionRequestStatus.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Union not found or inactive.")
+    return {"union_id": union_id, "user_id": membership.user.uid, "status": status.value}
+
+
+@app.get("/unions/{union_id}/representative-requests")
+async def list_union_representative_requests(
+    union_id: str,
+    membership: UnionMembership = Depends(require_union_admin()),
+) -> list[dict[str, Any]]:
+    try:
+        return await asyncio.to_thread(repository.list_union_representative_requests, union_id)
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union requests are unavailable.") from error
+
+
+@app.post("/unions/{union_id}/representatives/{user_id}/approve")
+async def approve_union_representative(
+    union_id: str,
+    user_id: str,
+    membership: UnionMembership = Depends(require_union_admin()),
+) -> dict[str, str]:
+    try:
+        status = await asyncio.to_thread(
+            repository.approve_union_representative,
+            union_id,
+            user_id,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union representative could not be approved.") from error
+    if status is UnionRequestStatus.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Pending representative request not found.")
+    if status is UnionRequestStatus.NOT_AUTHORIZED:
+        raise HTTPException(status_code=403, detail="Representative is no longer an active club owner or manager.")
+    return {"union_id": union_id, "user_id": user_id, "status": status.value}
+
+
+@app.post("/clubs/{club_id}/unions/{union_id}/requests", status_code=202)
+async def request_union_club_membership(
+    club_id: str,
+    union_id: str,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, str]:
+    try:
+        union_profile = await asyncio.to_thread(repository.get_union_profile, union_id)
+        if union_profile is None or union_profile.get("status") != "active":
+            raise HTTPException(status_code=404, detail="Union not found or inactive.")
+        status = await asyncio.to_thread(
+            repository.request_union_club,
+            union_id,
+            club_id,
+            str(union_profile.get("name") or union_id),
+            str(union_profile.get("union_code") or ""),
+            membership.user.uid,
+        )
+    except HTTPException:
+        raise
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union club request failed.") from error
+    if status is UnionRequestStatus.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Union not found or inactive.")
+    if status is UnionRequestStatus.NOT_AUTHORIZED:
+        raise HTTPException(status_code=403, detail="An approved union representative for this club is required.")
+    return {"union_id": union_id, "club_id": club_id, "status": status.value}
+
+
+@app.get("/unions/{union_id}/club-requests")
+async def list_union_club_requests(
+    union_id: str,
+    membership: UnionMembership = Depends(require_union_admin()),
+) -> list[dict[str, Any]]:
+    try:
+        return await asyncio.to_thread(repository.list_union_club_requests, union_id)
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union club requests are unavailable.") from error
+
+
+@app.post("/unions/{union_id}/clubs/{club_id}/approve")
+async def approve_union_club_membership(
+    union_id: str,
+    club_id: str,
+    membership: UnionMembership = Depends(require_union_admin()),
+) -> dict[str, str]:
+    try:
+        status = await asyncio.to_thread(
+            repository.approve_union_club,
+            union_id,
+            club_id,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Union club could not be approved.") from error
+    if status is UnionRequestStatus.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Pending union club request not found.")
+    if status is UnionRequestStatus.NOT_AUTHORIZED:
+        raise HTTPException(status_code=403, detail="The requesting representative is no longer authorized for this club.")
+    return {"union_id": union_id, "club_id": club_id, "status": status.value}
+
+
 @app.get("/clubs/{club_id}/unions/{union_id}/tables")
 async def list_union_tables(
     club_id: str,
@@ -814,30 +1107,12 @@ async def provision_union_admin(
 async def provision_union_club(
     union_id: str,
     club_id: str,
-    request: UnionClubProvisionRequest,
-    membership: UnionMembership = Depends(require_union_admin()),
-) -> dict[str, str]:
-    club_payload = {
-        "union_id": union_id,
-        "club_id": club_id,
-        "union_name": request.union_name,
-        "status": request.status,
-    }
-    try:
-        await asyncio.to_thread(
-            repository.add_union_club,
-            union_id,
-            club_id,
-            club_payload,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Union club membership could not be provisioned.") from error
-    return {
-        "union_id": union_id,
-        "club_id": club_id,
-        "union_name": request.union_name,
-        "status": request.status,
-    }
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail="Clubs must request union membership and wait for approval.",
+    )
 
 
 @app.patch("/clubs/{club_id}/tables/{table_id}/settings")
@@ -850,22 +1125,11 @@ async def update_club_table_settings(
     ),
 ) -> dict[str, Any]:
     runtime = get_table(club_id, table_id)
-    payload = runtime.game.update_table_settings(
-        jackpot_enabled=request.jackpot_enabled,
-        jackpot_fee=request.jackpot_fee,
-        jackpot_min_pot=request.jackpot_min_pot,
-        jackpot_qualifying_hand=request.jackpot_qualifying_hand,
-        rake_rate=request.rake_rate,
-        rake_cap=request.rake_cap,
-        rake_min_pot=request.rake_min_pot,
-        no_flop_no_drop=request.no_flop_no_drop,
-        hand_of_day_enabled=request.hand_of_day_enabled,
-        hand_of_day_target=request.hand_of_day_target,
-        hand_of_day_prize=request.hand_of_day_prize,
-    )
+    payload = await update_runtime_table_settings(runtime, membership.user.uid, request)
     return {
         "table_id": table_id,
         "table_name": runtime.game.table_name,
+        "settings_update_id": str(request.settings_update_id),
         **payload,
     }
 
@@ -875,28 +1139,18 @@ async def update_union_table_settings(
     union_id: str,
     table_id: str,
     request: UpdateTableSettingsRequest,
-    membership: UnionMembership = Depends(require_union_admin()),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     runtime = tables.get(union_table_key(union_id, table_id))
     if runtime is None:
         raise HTTPException(status_code=404, detail="Union table not found.")
-    payload = runtime.game.update_table_settings(
-        jackpot_enabled=request.jackpot_enabled,
-        jackpot_fee=request.jackpot_fee,
-        jackpot_min_pot=request.jackpot_min_pot,
-        jackpot_qualifying_hand=request.jackpot_qualifying_hand,
-        rake_rate=request.rake_rate,
-        rake_cap=request.rake_cap,
-        rake_min_pot=request.rake_min_pot,
-        no_flop_no_drop=request.no_flop_no_drop,
-        hand_of_day_enabled=request.hand_of_day_enabled,
-        hand_of_day_target=request.hand_of_day_target,
-        hand_of_day_prize=request.hand_of_day_prize,
-    )
+    membership = await require_union_table_origin_operator(runtime, current_user)
+    payload = await update_runtime_table_settings(runtime, membership.user.uid, request)
     return {
         "union_id": union_id,
         "table_id": table_id,
         "table_name": runtime.game.table_name,
+        "settings_update_id": str(request.settings_update_id),
         **payload,
     }
 
@@ -909,79 +1163,39 @@ async def create_table(
     membership: ClubMembership = Depends(
         require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
     ),
-) -> dict[str, str]:
-    key = (club_id, table_id)
+) -> dict[str, Any]:
+    union_id = request.union_id
+    key = union_table_key(union_id, table_id) if union_id else (club_id, table_id)
     if key in tables:
         raise HTTPException(status_code=409, detail="Table already exists.")
     game_id = requested_game_id(request.game_id)
     seat_capacity = requested_table_size(request.table_size)
-    try:
-        game = FirstPartyNLHGame(
-            table_id,
-            request.small_blind,
-            request.big_blind,
-            request.buy_in_min,
-            request.buy_in_max,
-            seat_capacity,
-            origin_club_id=club_id,
-            game_id=game_id,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    if isinstance(repository, FirestoreHandRepository):
+    union_profile = None
+    if union_id is not None:
         try:
-            checkpoint_initialized = await asyncio.to_thread(
-                repository.initialize_table_checkpoint,
-                "club",
+            union_profile = await asyncio.to_thread(repository.get_union_profile, union_id)
+            club_is_member = await asyncio.to_thread(
+                repository.is_club_in_union,
+                union_id,
                 club_id,
-                table_id,
-                None,
-                0,
-                serialize_first_party_table(game),
             )
         except (FirestoreRequiredError, GoogleAPICallError) as error:
-            raise HTTPException(status_code=503, detail="Table checkpoint could not be initialized.") from error
-        if not checkpoint_initialized:
-            raise HTTPException(status_code=409, detail="Table already exists.")
-    tables[key] = TableRuntime(
-        club_id,
-        game,
-        connections,
-        repository,
-        turn_timeout_seconds,
-        lease_manager=shared_table_lease_manager,
+            raise HTTPException(status_code=503, detail="Union membership could not be verified.") from error
+        if union_profile is None or union_profile.get("status") != "active":
+            raise HTTPException(status_code=404, detail="Union not found.")
+        if not club_is_member:
+            raise HTTPException(status_code=403, detail="The club is not an active member of this union.")
+    table_name = request.table_name or (
+        f"Table {table_id} - Union {union_code}"
+        if union_id
+        else table_id
     )
-    return {
-        "club_id": club_id,
-        "table_id": table_id,
-        "game_id": game.game_id,
-        "status": "created",
-    }
-
-
-@app.post("/unions/{union_id}/tables/{table_id}", status_code=201)
-async def create_union_table(
-    union_id: str,
-    table_id: str,
-    request: CreateUnionTableRequest,
-    membership: UnionMembership = Depends(require_union_admin()),
-) -> dict[str, str]:
-    key = union_table_key(union_id, table_id)
-    if key in tables:
-        raise HTTPException(status_code=409, detail="Union table already exists.")
-    game_id = requested_game_id(request.game_id)
-    try:
-        is_origin_club = await asyncio.to_thread(
-            repository.is_club_in_union,
-            union_id,
-            request.origin_club_id,
-        )
-    except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Union club lookup is unavailable.") from error
-    if not is_origin_club:
-        raise HTTPException(status_code=403, detail="The origin club is not an active union member.")
-
-    seat_capacity = requested_table_size(request.table_size)
+    theme_id = (
+        str(union_profile.get("theme_id") or "standard")
+        if union_profile is not None
+        else request.theme_id or "standard"
+    )
+    union_code = (union_profile or {}).get("union_code")
     try:
         game = FirstPartyNLHGame(
             table_id,
@@ -991,47 +1205,65 @@ async def create_union_table(
             request.buy_in_max,
             seat_capacity,
             union_id=union_id,
-            origin_club_id=request.origin_club_id,
-            table_name=request.table_name,
+            origin_club_id=club_id,
+            table_name=table_name,
             game_id=game_id,
+            theme_id=theme_id,
+            union_code=union_code,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    table_data = {
-        "union_id": union_id,
-        "table_id": table_id,
-        "game_id": game.game_id,
-        "table_name": request.table_name,
-        "origin_club_id": request.origin_club_id,
-        "small_blind": request.small_blind,
-        "big_blind": request.big_blind,
-        "buy_in_min": request.buy_in_min,
-        "buy_in_max": request.buy_in_max,
-        "max_seats": seat_capacity,
-        "status": "open",
-    }
     try:
-        if isinstance(repository, FirestoreHandRepository):
-            table_created = await asyncio.to_thread(
-                repository.create_union_table_record,
-                union_id,
+        if union_id is not None:
+            table_data = {
+                "union_id": union_id,
+                "table_id": table_id,
+                "game_id": game.game_id,
+                "table_name": table_name,
+                "origin_club_id": club_id,
+                "union_code": union_code,
+                "theme_id": theme_id,
+                "small_blind": game.small_blind,
+                "big_blind": game.big_blind,
+                "buy_in_min": game.buy_in_min,
+                "buy_in_max": game.buy_in_max,
+                "max_seats": game.max_seats,
+                "status": "open",
+            }
+            if isinstance(repository, FirestoreHandRepository):
+                table_created = await asyncio.to_thread(
+                    repository.create_union_table_record,
+                    union_id,
+                    table_id,
+                    table_data,
+                    runtime_checkpoint=serialize_first_party_table(game),
+                    required_active_club_id=club_id,
+                )
+            else:
+                table_created = await asyncio.to_thread(
+                    repository.create_union_table_record,
+                    union_id,
+                    table_id,
+                    table_data,
+                )
+            if not table_created:
+                raise HTTPException(status_code=409, detail="Table already exists.")
+        elif isinstance(repository, FirestoreHandRepository):
+            checkpoint_initialized = await asyncio.to_thread(
+                repository.initialize_table_checkpoint,
+                "club",
+                club_id,
                 table_id,
-                table_data,
-                runtime_checkpoint=serialize_first_party_table(game),
+                None,
+                0,
+                serialize_first_party_table(game),
             )
-        else:
-            table_created = await asyncio.to_thread(
-                repository.create_union_table_record,
-                union_id,
-                table_id,
-                table_data,
-            )
+            if not checkpoint_initialized:
+                raise HTTPException(status_code=409, detail="Table already exists.")
     except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Union table could not be persisted.") from error
-    if not table_created:
-        raise HTTPException(status_code=409, detail="Union table already exists.")
+        raise HTTPException(status_code=503, detail="Table could not be persisted.") from error
     tables[key] = TableRuntime(
-        request.origin_club_id,
+        club_id,
         game,
         connections,
         repository,
@@ -1040,12 +1272,26 @@ async def create_union_table(
         lease_manager=shared_table_lease_manager,
     )
     return {
-        "union_id": union_id,
+        "club_id": club_id,
         "table_id": table_id,
         "game_id": game.game_id,
-        "origin_club_id": request.origin_club_id,
+        "union_id": union_id,
+        "table_name": game.table_name,
+        "theme_id": game.theme_id,
         "status": "created",
     }
+
+
+@app.post("/unions/{union_id}/tables/{table_id}")
+async def create_union_table(
+    union_id: str,
+    table_id: str,
+    membership: AuthenticatedUser = Depends(get_current_user),
+) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail="Create the table through its club route and include union_id to share it.",
+    )
 
 
 @app.post("/workers/{worker_id}/start")
@@ -1275,12 +1521,13 @@ async def claim_union_table_lease(
 async def delete_union_table(
     union_id: str,
     table_id: str,
-    membership: UnionMembership = Depends(require_union_admin()),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> Response:
     key = union_table_key(union_id, table_id)
     runtime = tables.get(key)
     if runtime is None:
         raise HTTPException(status_code=404, detail="Union table not found.")
+    await require_union_table_origin_operator(runtime, current_user)
     if runtime.game.is_hand_running or runtime.game.seats:
         raise HTTPException(
             status_code=409,
@@ -1297,15 +1544,20 @@ async def delete_union_table(
                 status_code=409,
                 detail="Union table has persisted seats; settle or cash out players before deletion.",
             )
-        table_closed = await asyncio.to_thread(
+        close_status = await asyncio.to_thread(
             repository.close_union_table_record,
             union_id,
             table_id,
         )
     except (FirestoreRequiredError, GoogleAPICallError) as error:
         raise HTTPException(status_code=503, detail="Union table could not be closed.") from error
-    if not table_closed:
+    if close_status is UnionTableCloseStatus.NOT_FOUND:
         raise HTTPException(status_code=404, detail="Union table metadata not found.")
+    if close_status not in {
+        UnionTableCloseStatus.CLOSED,
+        UnionTableCloseStatus.ALREADY_CLOSED,
+    }:
+        raise HTTPException(status_code=409, detail="Union table cannot be closed in its current state.")
     tables.pop(key, None)
     return Response(status_code=204)
 
@@ -1515,11 +1767,12 @@ async def start_union_hand(
     union_id: str,
     table_id: str,
     request: StartHandRequest = StartHandRequest(),
-    membership: UnionMembership = Depends(require_union_admin()),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     runtime = tables.get(union_table_key(union_id, table_id))
     if runtime is None:
         raise HTTPException(status_code=404, detail="Union table not found.")
+    await require_union_table_origin_operator(runtime, current_user)
     try:
         started = await runtime.start_hand(request.straddle_player_id)
     except ValueError as error:

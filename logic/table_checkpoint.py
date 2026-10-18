@@ -29,6 +29,8 @@ def serialize_first_party_table(game: FirstPartyNLHGame) -> dict[str, Any]:
             "union_id": game.union_id,
             "origin_club_id": game.origin_club_id,
             "table_name": game.table_name,
+            "theme_id": game.theme_id,
+            "union_code": game.union_code,
         },
         "settings": game.table_settings.as_dict(),
         "pools": {
@@ -91,6 +93,8 @@ def deserialize_first_party_table(checkpoint: object) -> FirstPartyNLHGame:
         union_id=_optional_string(table.get("union_id"), "table.union_id"),
         origin_club_id=_optional_string(table.get("origin_club_id"), "table.origin_club_id"),
         table_name=_string(table.get("table_name"), "table.table_name"),
+        theme_id=_optional_string(table.get("theme_id"), "table.theme_id") or "standard",
+        union_code=_optional_string(table.get("union_code"), "table.union_code"),
         game_id=game_id,
     )
     game.table_settings = _deserialize_settings(root.get("settings"))

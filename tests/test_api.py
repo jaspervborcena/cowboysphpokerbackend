@@ -11,7 +11,11 @@ from database import (
     BuyInStatus,
     FirestoreHandRepository,
     NullHandRepository,
+    TableActionCommitResult,
+    TableActionCommitStatus,
     TableLeaseConflictError,
+    UnionRequestStatus,
+    UnionTableCloseStatus,
     WalletTransactionStatus,
 )
 from logic.connections import ConnectionManager
@@ -42,7 +46,10 @@ class FakeHandRepository:
         self.hands: dict[tuple[str, str], dict[str, object]] = {}
         self.union_hands: dict[tuple[str, str], dict[str, object]] = {}
         self.union_admins: dict[tuple[str, str], dict[str, str]] = {}
+        self.unions: dict[str, dict[str, object]] = {}
+        self.union_representatives: dict[tuple[str, str], dict[str, object]] = {}
         self.union_clubs: set[tuple[str, str]] = set()
+        self.union_club_records: dict[tuple[str, str], dict[str, object]] = {}
         self.union_table_records: dict[tuple[str, str], dict[str, object]] = {}
         self.union_hand_summaries: list[dict[str, object]] = []
         self.wallet_calls: list[tuple[object, ...]] = []
@@ -301,12 +308,139 @@ class FakeHandRepository:
     def get_union_admin(self, union_id: str, user_id: str) -> dict[str, str] | None:
         return self.union_admins.get((union_id, user_id))
 
+    def get_union_profile(self, union_id: str) -> dict[str, object] | None:
+        return self.unions.get(union_id)
+
+    def get_union_by_code(self, union_code: str) -> dict[str, object] | None:
+        return next(
+            (
+                union
+                for union in self.unions.values()
+                if union.get("union_code") == union_code
+            ),
+            None,
+        )
+
+    def create_union(
+        self,
+        union_id: str,
+        union_data: dict[str, object],
+        union_code: str,
+        creator_user_id: str,
+        founding_club_id: str,
+    ) -> bool:
+        if union_code in {str(union.get("union_code")) for union in self.unions.values()}:
+            return False
+        self.unions[union_id] = union_data
+        self.union_admins[(union_id, creator_user_id)] = {
+            "role": "UNION_ADMIN",
+            "status": "active",
+        }
+        self.union_representatives[(union_id, creator_user_id)] = {
+            "user_id": creator_user_id,
+            "club_id": founding_club_id,
+            "status": "active",
+        }
+        self.union_clubs.add((union_id, founding_club_id))
+        self.union_club_records[(union_id, founding_club_id)] = {
+            "union_id": union_id,
+            "club_id": founding_club_id,
+            "union_name": str(union_data["name"]),
+            "union_code": union_code,
+            "theme_id": str(union_data["theme_id"]),
+            "status": "active",
+        }
+        return True
+
+    def get_union_representative(
+        self, union_id: str, user_id: str
+    ) -> dict[str, object] | None:
+        return self.union_representatives.get((union_id, user_id))
+
+    def request_union_representative(
+        self, union_id: str, user_id: str, club_id: str, club_role: str
+    ) -> UnionRequestStatus:
+        if union_id not in self.unions:
+            return UnionRequestStatus.NOT_FOUND
+        current = self.union_representatives.get((union_id, user_id))
+        if current and current.get("status") == "active":
+            return UnionRequestStatus.ACTIVE
+        self.union_representatives[(union_id, user_id)] = {
+            "user_id": user_id,
+            "club_id": club_id,
+            "club_role": club_role,
+            "status": "pending",
+        }
+        return UnionRequestStatus.PENDING
+
+    def list_union_representative_requests(self, union_id: str) -> list[dict[str, object]]:
+        return [
+            representative
+            for (request_union_id, _), representative in self.union_representatives.items()
+            if request_union_id == union_id and representative.get("status") == "pending"
+        ]
+
+    def approve_union_representative(
+        self, union_id: str, user_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        representative = self.union_representatives.get((union_id, user_id))
+        if representative is None:
+            return UnionRequestStatus.NOT_FOUND
+        representative["status"] = "active"
+        representative["approved_by"] = approved_by
+        return UnionRequestStatus.ACTIVE
+
+    def request_union_club(
+        self,
+        union_id: str,
+        club_id: str,
+        union_name: str,
+        union_code: str,
+        requested_by: str,
+    ) -> UnionRequestStatus:
+        representative = self.union_representatives.get((union_id, requested_by))
+        if not representative or representative.get("status") != "active" or representative.get("club_id") != club_id:
+            return UnionRequestStatus.NOT_AUTHORIZED
+        if (union_id, club_id) in self.union_clubs:
+            return UnionRequestStatus.ACTIVE
+        self.union_club_records[(union_id, club_id)] = {
+            "union_id": union_id,
+            "club_id": club_id,
+            "union_name": union_name,
+            "union_code": union_code,
+            "status": "pending",
+        }
+        return UnionRequestStatus.PENDING
+
+    def list_union_club_requests(self, union_id: str) -> list[dict[str, object]]:
+        return [
+            club
+            for (request_union_id, _), club in self.union_club_records.items()
+            if request_union_id == union_id and club.get("status") == "pending"
+        ]
+
+    def approve_union_club(
+        self, union_id: str, club_id: str, approved_by: str
+    ) -> UnionRequestStatus:
+        club = self.union_club_records.get((union_id, club_id))
+        if club is None:
+            return UnionRequestStatus.NOT_FOUND
+        club["status"] = "active"
+        club["approved_by"] = approved_by
+        self.union_clubs.add((union_id, club_id))
+        return UnionRequestStatus.ACTIVE
+
     def is_club_in_union(self, union_id: str, club_id: str) -> bool:
         return (union_id, club_id) in self.union_clubs
 
     def get_unions_for_club(self, club_id: str) -> list[dict[str, str]]:
         return [
-            {"union_id": union_id, "name": f"Union {union_id}"}
+            {
+                "union_id": union_id,
+                "name": str(self.unions.get(union_id, {}).get("name") or f"Union {union_id}"),
+                "union_code": str(self.unions.get(union_id, {}).get("union_code") or ""),
+                "theme_id": str(self.unions.get(union_id, {}).get("theme_id") or "standard"),
+            }
             for union_id, member_club_id in sorted(self.union_clubs)
             if member_club_id == club_id
         ]
@@ -331,20 +465,29 @@ class FakeHandRepository:
         return True
 
     def create_union_table_record(
-        self, union_id: str, table_id: str, table_data: dict[str, object]
+        self,
+        union_id: str,
+        table_id: str,
+        table_data: dict[str, object],
+        *,
+        required_active_club_id: str | None = None,
     ) -> bool:
+        if required_active_club_id and (union_id, required_active_club_id) not in self.union_clubs:
+            return False
         key = (union_id, table_id)
         if key in self.union_table_records:
             return False
         self.union_table_records[key] = table_data
         return True
 
-    def close_union_table_record(self, union_id: str, table_id: str) -> bool:
+    def close_union_table_record(
+        self, union_id: str, table_id: str
+    ) -> UnionTableCloseStatus:
         record = self.union_table_records.get((union_id, table_id))
         if record is None:
-            return False
+            return UnionTableCloseStatus.NOT_FOUND
         record["status"] = "closed"
-        return True
+        return UnionTableCloseStatus.CLOSED
 
     def has_union_table_seats(self, union_id: str, table_id: str) -> bool:
         scope = f"union:{union_id}"
@@ -1020,7 +1163,7 @@ def test_versioned_websocket_envelopes_preserve_auth_and_private_snapshots(monke
     tables.pop(table_key, None)
 
 
-def test_provision_union_admin_and_club_membership(monkeypatch) -> None:
+def test_provision_union_admin_and_reject_direct_union_club_link(monkeypatch) -> None:
     repository = FakeHandRepository(
         {"union-admin": 1000, "club-owner": 1000},
         {"union-admin": "PLAYER", "club-owner": "OWNER"},
@@ -1052,8 +1195,104 @@ def test_provision_union_admin_and_club_membership(monkeypatch) -> None:
             },
             headers={"Authorization": "Bearer valid:union-admin"},
         )
-        assert response.status_code == 201
-        assert ("union-42", "club-b") in repository.union_clubs
+        assert response.status_code == 409
+        assert ("union-42", "club-b") not in repository.union_clubs
+
+
+def test_club_representative_union_approval_and_shared_table_flow(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"founder": 1000, "manager-b": 1000},
+        {"founder": "OWNER", "manager-b": "MANAGER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+    table_key = ("union:union-flow-id", "table-123")
+
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/clubs/club-a/unions",
+                json={"name": "Northern Union", "union_code": "N", "theme_id": "emerald"},
+                headers={"Authorization": "Bearer valid:founder"},
+            )
+            assert created.status_code == 201
+            union_id = created.json()["union_id"]
+            assert repository.is_club_in_union(union_id, "club-a")
+            lookup = client.get(
+                "/unions/code/n",
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert lookup.status_code == 200
+            assert lookup.json()["union_id"] == union_id
+            assert lookup.json()["theme_id"] == "emerald"
+
+            rep_request = client.post(
+                f"/clubs/club-b/unions/{union_id}/representative-requests",
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert rep_request.status_code == 202
+            assert rep_request.json()["status"] == "pending"
+
+            before_approval = client.post(
+                f"/clubs/club-b/unions/{union_id}/requests",
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert before_approval.status_code == 403
+
+            approved_rep = client.post(
+                f"/unions/{union_id}/representatives/manager-b/approve",
+                headers={"Authorization": "Bearer valid:founder"},
+            )
+            assert approved_rep.status_code == 200
+            assert approved_rep.json()["status"] == "active"
+
+            requested_club = client.post(
+                f"/clubs/club-b/unions/{union_id}/requests",
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert requested_club.status_code == 202
+            assert requested_club.json()["status"] == "pending"
+            assert not repository.is_club_in_union(union_id, "club-b")
+
+            approved_club = client.post(
+                f"/unions/{union_id}/clubs/club-b/approve",
+                headers={"Authorization": "Bearer valid:founder"},
+            )
+            assert approved_club.status_code == 200
+            assert repository.is_club_in_union(union_id, "club-b")
+
+            created_table = client.post(
+                "/clubs/club-b/tables/table-123",
+                json={
+                    "small_blind": 10,
+                    "big_blind": 20,
+                    "buy_in_min": 20,
+                    "buy_in_max": 1000,
+                    "union_id": union_id,
+                    "table_name": "Table 123 - Union N",
+                    "theme_id": "custom-overrides-are-ignored",
+                },
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert created_table.status_code == 201
+            assert created_table.json()["union_id"] == union_id
+            assert created_table.json()["theme_id"] == "emerald"
+
+            visible_from_founding_club = client.get(
+                f"/clubs/club-a/unions/{union_id}/tables",
+                headers={"Authorization": "Bearer valid:founder"},
+            )
+            assert visible_from_founding_club.status_code == 200
+            assert visible_from_founding_club.json()[0]["table_name"] == "Table 123 - Union N"
+            assert visible_from_founding_club.json()[0]["theme_id"] == "emerald"
+
+            local_tables = client.get(
+                "/clubs/club-b/tables",
+                headers={"Authorization": "Bearer valid:manager-b"},
+            )
+            assert local_tables.status_code == 200
+            assert local_tables.json() == []
+    finally:
+        tables.pop(table_key, None)
 
 
 def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
@@ -1079,6 +1318,7 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
         response = client.patch(
             "/clubs/demo/tables/table-settings/settings",
             json={
+                "settings_update_id": "8755a216-c867-41e7-a162-cc1cbc430d29",
                 "jackpot_enabled": True,
                 "jackpot_fee": 25,
                 "jackpot_min_pot": 200,
@@ -1102,6 +1342,7 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
         assert response.json()["hand_of_day_enabled"] is True
         assert response.json()["hand_of_day_target"] == 500
         assert response.json()["hand_of_day_prize"] == 100
+        assert response.json()["settings_update_id"] == "8755a216-c867-41e7-a162-cc1cbc430d29"
 
         response = client.get(
             "/clubs/demo/tables/table-settings",
@@ -1118,6 +1359,166 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
         assert entry["hand_of_day_enabled"] is True
         assert entry["hand_of_day_target"] == 500
         assert entry["hand_of_day_prize"] == 100
+
+
+@pytest.mark.parametrize(
+    ("commit_status", "expected_status", "expected_setting"),
+    [
+        (TableActionCommitStatus.COMMITTED, 200, True),
+        (TableActionCommitStatus.FENCED, 409, False),
+    ],
+)
+def test_durable_table_settings_commit_is_lease_fenced(
+    monkeypatch,
+    commit_status: TableActionCommitStatus,
+    expected_status: int,
+    expected_setting: bool,
+) -> None:
+    class DurableSettingsRepository(FirestoreHandRepository):
+        def __init__(self, initial_checkpoint: dict[str, object]) -> None:
+            self.checkpoint = initial_checkpoint
+            self.sequence = 0
+            self.commit_arguments: tuple[object, ...] | None = None
+
+        def get_table_lease(self, scope_type: str, scope_id: str, table_id: str):
+            now = datetime.now(timezone.utc)
+            return {
+                "table_id": table_id,
+                "owner_id": "worker-settings",
+                "fencing_generation": 7,
+                "lease_expires_at": now + timedelta(seconds=30),
+                "heartbeat_at": now,
+                "status": "active",
+            }
+
+        def get_table_checkpoint(self, scope_type: str, scope_id: str, table_id: str):
+            return {
+                "owner_id": "worker-settings",
+                "fencing_epoch": 7,
+                "sequence": self.sequence,
+                "checkpoint": self.checkpoint,
+            }
+
+        def commit_table_action(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            owner_id: str,
+            fencing_epoch: int,
+            expected_sequence: int,
+            user_id: str,
+            action_id: str,
+            payload_hash: str,
+            checkpoint: dict[str, object],
+        ) -> TableActionCommitResult:
+            self.commit_arguments = (
+                scope_type,
+                scope_id,
+                table_id,
+                owner_id,
+                fencing_epoch,
+                expected_sequence,
+                user_id,
+                action_id,
+                payload_hash,
+                checkpoint,
+            )
+            if commit_status is TableActionCommitStatus.COMMITTED:
+                self.checkpoint = checkpoint
+                self.sequence = expected_sequence + 1
+                return TableActionCommitResult(commit_status, self.sequence)
+            return TableActionCommitResult(commit_status, self.sequence)
+
+    auth_repository = FakeHandRepository({"settings-admin": 0}, {"settings-admin": "MANAGER"})
+    configure_test_dependencies(monkeypatch, auth_repository)
+    game = FirstPartyNLHGame("durable-settings", 10, 20, 20, 1000, origin_club_id="demo")
+    durable_repository = DurableSettingsRepository(serialize_first_party_table(game))
+    runtime = TableRuntime("demo", game, ConnectionManager(), durable_repository, 30)
+    runtime._worker_id = "worker-settings"
+    tables[("demo", "durable-settings")] = runtime
+
+    try:
+        with TestClient(app) as client:
+            response = client.patch(
+                "/clubs/demo/tables/durable-settings/settings",
+                json={
+                    "settings_update_id": "8755a216-c867-41e7-a162-cc1cbc430d29",
+                    "jackpot_enabled": True,
+                },
+                headers={"Authorization": "Bearer valid:settings-admin"},
+            )
+
+        assert response.status_code == expected_status
+        assert runtime.game.table_settings.jackpot_enabled is expected_setting
+        assert durable_repository.commit_arguments is not None
+        assert durable_repository.commit_arguments[4] == 7
+        assert durable_repository.commit_arguments[5] == 0
+        if expected_status == 200:
+            assert runtime._table_sequence == 1
+            assert durable_repository.checkpoint["settings"]["jackpot_enabled"] is True
+    finally:
+        tables.pop(("demo", "durable-settings"), None)
+
+
+def test_union_table_delete_keeps_runtime_when_checkpoint_close_is_rejected(monkeypatch) -> None:
+    repository = FakeHandRepository({"club-owner": 0}, {"club-owner": "OWNER"})
+    repository.union_clubs.add(("union-delete", "club-a"))
+    configure_test_dependencies(monkeypatch, repository)
+    game = FirstPartyNLHGame(
+        "union-delete-table", 10, 20, 20, 1000,
+        union_id="union-delete", origin_club_id="club-a",
+    )
+    key = ("union:union-delete", "union-delete-table")
+    tables[key] = TableRuntime("club-a", game, ConnectionManager(), repository, 30, union_id="union-delete")
+    repository.union_table_records[("union-delete", "union-delete-table")] = {
+        "status": "open"
+    }
+    monkeypatch.setattr(
+        repository,
+        "close_union_table_record",
+        lambda union_id, table_id: UnionTableCloseStatus.ACTIVE_LEASE,
+    )
+
+    try:
+        with TestClient(app) as client:
+            response = client.delete(
+                "/unions/union-delete/tables/union-delete-table",
+                headers={"Authorization": "Bearer valid:club-owner"},
+            )
+
+        assert response.status_code == 409
+        assert key in tables
+    finally:
+        tables.pop(key, None)
+
+
+def test_union_table_delete_closes_empty_table_and_removes_runtime(monkeypatch) -> None:
+    repository = FakeHandRepository({"club-owner": 0}, {"club-owner": "OWNER"})
+    repository.union_clubs.add(("union-delete", "club-a"))
+    repository.union_table_records[("union-delete", "union-delete-table")] = {
+        "status": "open"
+    }
+    configure_test_dependencies(monkeypatch, repository)
+    game = FirstPartyNLHGame(
+        "union-delete-table", 10, 20, 20, 1000,
+        union_id="union-delete", origin_club_id="club-a",
+    )
+    key = ("union:union-delete", "union-delete-table")
+    tables[key] = TableRuntime("club-a", game, ConnectionManager(), repository, 30, union_id="union-delete")
+
+    try:
+        with TestClient(app) as client:
+            response = client.delete(
+                "/unions/union-delete/tables/union-delete-table",
+                headers={"Authorization": "Bearer valid:club-owner"},
+            )
+
+        assert response.status_code == 204
+        assert key not in tables
+        assert repository.union_table_records[("union-delete", "union-delete-table")]["status"] == "closed"
+    finally:
+        tables.pop(key, None)
 
 
 def test_current_membership_returns_authoritative_role(monkeypatch) -> None:
@@ -1344,7 +1745,7 @@ def test_local_angular_origin_can_make_authorized_cors_requests() -> None:
     assert response.headers["access-control-allow-origin"] == "http://localhost:4200"
 
 
-def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch) -> None:
+def test_club_created_union_table_is_shared_across_member_clubs(monkeypatch) -> None:
     union_id = "union-1"
     table_id = "shared-table"
     table_key = (f"union:{union_id}", table_id)
@@ -1361,10 +1762,17 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
         "role": "UNION_ADMIN",
     }
     repository.union_clubs.update({(union_id, "club-a"), (union_id, "club-b")})
+    repository.unions[union_id] = {
+        "union_id": union_id,
+        "name": "Union One",
+        "union_code": "U",
+        "theme_id": "emerald",
+        "status": "active",
+    }
     configure_test_dependencies(monkeypatch, repository)
 
     table_config = {
-        "origin_club_id": "club-a",
+        "union_id": union_id,
         "table_name": "Union Main",
         "small_blind": 10,
         "big_blind": 20,
@@ -1374,44 +1782,51 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
         "game_id": "no_limit_texas_holdem",
     }
     with TestClient(app) as client:
-        owner_response = client.post(
-            f"/unions/{union_id}/tables/{table_id}",
+        created = client.post(
+            f"/clubs/club-a/tables/{table_id}",
             json=table_config,
             headers={"Authorization": "Bearer valid:club-owner"},
         )
-        assert owner_response.status_code == 403
+        assert created.status_code == 201
 
-        created = client.post(
+        legacy_create = client.post(
             f"/unions/{union_id}/tables/{table_id}",
             json=table_config,
             headers={"Authorization": "Bearer valid:union-admin"},
         )
-        assert created.status_code == 201
+        assert legacy_create.status_code == 409
         assert created.json()["game_id"] == "no_limit_texas_holdem"
+        assert created.json()["union_id"] == union_id
+        assert created.json()["theme_id"] == "emerald"
         assert tables[table_key].game.max_seats == 6
         assert repository.union_table_records[(union_id, table_id)]["max_seats"] == 6
         assert repository.union_table_records[(union_id, table_id)]["game_id"] == "no_limit_texas_holdem"
         empty_table = client.post(
-            f"/unions/{union_id}/tables/empty-table",
+            "/clubs/club-a/tables/empty-table",
             json=table_config,
-            headers={"Authorization": "Bearer valid:union-admin"},
-        )
-        assert empty_table.status_code == 201
-        owner_delete = client.delete(
-            f"/unions/{union_id}/tables/empty-table",
             headers={"Authorization": "Bearer valid:club-owner"},
         )
+        assert empty_table.status_code == 201
         admin_delete = client.delete(
             f"/unions/{union_id}/tables/empty-table",
             headers={"Authorization": "Bearer valid:union-admin"},
         )
-        assert owner_delete.status_code == 403
-        assert admin_delete.status_code == 204
+        owner_delete = client.delete(
+            f"/unions/{union_id}/tables/empty-table",
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+        assert admin_delete.status_code == 403
+        assert owner_delete.status_code == 204
         unions_response = client.get(
             "/clubs/club-a/unions",
             headers={"Authorization": "Bearer valid:union-player-a"},
         )
-        assert unions_response.json() == [{"union_id": union_id, "name": f"Union {union_id}"}]
+        assert unions_response.json() == [{
+            "union_id": union_id,
+            "name": "Union One",
+            "union_code": "U",
+            "theme_id": "emerald",
+        }]
         tables_response = client.get(
             f"/clubs/club-b/unions/{union_id}/tables",
             headers={"Authorization": "Bearer valid:union-player-b"},
@@ -1438,7 +1853,7 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
 
         occupied_delete = client.delete(
             f"/unions/{union_id}/tables/{table_id}",
-            headers={"Authorization": "Bearer valid:union-admin"},
+            headers={"Authorization": "Bearer valid:club-owner"},
         )
         assert occupied_delete.status_code == 409
 
@@ -1482,7 +1897,7 @@ def test_union_table_is_admin_created_and_shared_across_member_clubs(monkeypatch
 
                 start = client.post(
                     f"/unions/{union_id}/tables/{table_id}/hands",
-                    headers={"Authorization": "Bearer valid:union-admin"},
+                    headers={"Authorization": "Bearer valid:club-owner"},
                 )
                 assert start.status_code == 201
                 started_a = socket_a.receive_json()

@@ -25,6 +25,8 @@ Frontend work can proceed against typed API/WebSocket interfaces and fixture-bac
 - [ ] Implement Firebase sign-in, token refresh, sign-out, and loading/error states. Send the Firebase ID token to protected REST routes and as the first WebSocket authentication message; never trust a client-selected UID or role.
 - [ ] Load `GET /clubs/{club_id}/members/me` and display the server-assigned role/profile. Use the role only to guide UI visibility; the server remains authoritative for permissions.
 - [ ] Build club and union lobby views from `GET /clubs/{club_id}/tables`, `GET /clubs/{club_id}/unions`, `GET /clubs/{club_id}/unions/{union_id}/tables`, and `GET /games`, including loading, empty, retry, and error states.
+- [ ] Build club and union lobby views from `GET /clubs/{club_id}/tables`, `GET /clubs/{club_id}/unions`, `GET /clubs/{club_id}/unions/{union_id}/tables`, and `GET /games`, including loading, empty, retry, and error states. Union tables appear only for active union member clubs.
+- [ ] Add the two-step union flow: club owner/manager looks up the union by letter, requests representative approval, then requests club membership after approval; union admins review and approve both queues.
 
 ### Wallets and funding
 
@@ -38,11 +40,14 @@ Frontend work can proceed against typed API/WebSocket interfaces and fixture-bac
 ### Tables and gameplay
 
 - [ ] Let active `OWNER`/`MANAGER` members create tables using `/games` entries marked `create_supported: true`; currently only NLH is supported.
+- [ ] For authorized table-settings controls, call `PATCH /clubs/{club_id}/tables/{table_id}/settings` as `OWNER`/`MANAGER` or `PATCH /unions/{union_id}/tables/{table_id}/settings` as `UNION_ADMIN`. Include a fresh `settings_update_id` UUID and reuse it with the identical settings only when retrying that update.
+- [ ] For authorized table-settings controls, call `PATCH /clubs/{club_id}/tables/{table_id}/settings` as `OWNER`/`MANAGER` or the union equivalent as an `OWNER`/`MANAGER` of the table's origin club. Include a fresh `settings_update_id` UUID and reuse it with the identical settings only when retrying that update.
 - [ ] Let a `PLAYER` buy in and choose a seat. Generate one `buy_in_id` per purchase and reuse it with the exact same request on retries; never debit or assign chips optimistically.
 - [ ] Implement the v1 WebSocket flow: authenticate, render complete player-specific snapshots, send actions with stable `action_id`s, support pre-actions and PING/PONG, map numeric errors, and replace local state with each full snapshot.
 - [ ] Add hand replay through the club/union replay APIs. Do not read raw Firestore audit data or expose hidden cards.
 - [ ] Support union table discovery, home-club selection, seat purchase, and union socket authentication for active participating members. Show each verified home club in table snapshots.
 - [ ] Expose union table create/start/delete only to `UNION_ADMIN`; rely on the server to reject deletion when a table is not empty.
+- [ ] Create union-linked tables through `POST /clubs/{club_id}/tables/{table_id}` with an approved `union_id`; use the union's theme and show its code in the title. Origin-club owners/managers start or delete those tables; union admins approve representatives and clubs, but do not automatically control other clubs' tables.
 
 ### Acceptance checks
 
@@ -59,7 +64,7 @@ Use distinct labels and never add balances from different scopes together:
 | Surface | Wallet to show | UI behavior |
 | --- | --- | --- |
 | Landing page | `GLOBAL_PLAYMONEY` | Load from `GET /me/wallets/global-playmoney`; provision with the `ensure` endpoint if needed. This wallet is separate from club chips. |
-| Selected club, player view | Current member balance | Load `GET /clubs/{club_id}/members/me/wallet`. Requires an active membership document at `clubs/{club_id}/members/{uid}`. Show `available_balance` and `in_play_balance` separately; render the current table stack from the game snapshot. |
+| Selected club, player view | Current member balance | Load `GET /clubs/{club_id}/members/me/wallet`. Use the returned `club_uuid` in `{club_id}` paths; the Firestore membership record is at `clubs/{club_uuid}/members/{uid}`. Show `available_balance` and `in_play_balance` separately; render the current table stack from the game snapshot. |
 | Selected club, agent tools | Current member balance | No separate `CLUB_AGENT` account exists. `POST /clubs/{club_id}/wallet/send-out` and `/claim-back` support authorized transfers against the same member balance. |
 | Selected club, owner/manager tools | `CLUB_TREASURY` | `GET /clubs/{club_id}/wallet` reads the treasury. `POST /platform/clubs` creates a club with 10,000 treasury chips; the owner's personal member balance starts at zero. |
 | Active table | `TABLE_ESCROW` / seat stack | Show the player's stack for this table; do not treat it as another spendable wallet. |
@@ -133,7 +138,7 @@ Roles currently used by the UI:
 | `OWNER`, `MANAGER` | Create local tables, start local hands, manage permitted club wallet operations. |
 | `AGENT` | Manage permitted transfers to and from assigned downline members. |
 | `PLAYER` | Buy in, take a seat, and play. |
-| `UNION_ADMIN` | Create, start, or delete eligible shared union tables. This is union-scoped, not a club role. |
+| `UNION_ADMIN` | Approve union representatives and club membership requests. This is union-scoped, not a club role. |
 
 ## Lobby and Table Flow
 
@@ -149,7 +154,7 @@ For a local table:
 4. Connect each seated player's client to `/ws/table/{club_id}/{table_id}` and authenticate it as described below.
 5. An `OWNER` or `MANAGER` starts a hand through `POST /clubs/{club_id}/tables/{table_id}/hands`. Render gameplay from the WebSocket snapshot, not the REST start response.
 
-For a union table, an active `UNION_ADMIN` creates and starts it through the union endpoints. Each player buys in through `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` using their own active home club, then connects to `/ws/union/{union_id}/{table_id}` and includes that home `club_id` in authentication. The union table is shared; players do not connect to their clubs' separate local tables. Use each snapshot player's `club_id` when displaying club affiliation.
+For a union table, the origin club's active `OWNER`/`MANAGER` creates it through `POST /clubs/{club_id}/tables/{table_id}` with `union_id` set to an approved union. The union code and theme come from the union; the owner/manager can choose the table name. Each player buys in through `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` using their own active home club, then connects to `/ws/union/{union_id}/{table_id}` and includes that home `club_id` in authentication. Players in any active member club can see the table. Use each snapshot player's `club_id` when displaying club affiliation.
 
 `table_size` sets the capacity for local and union tables. It must be at least `2` and cannot exceed the backend's `MAX_SEATS` setting (default `9`). If omitted by an older client, the server uses `MAX_SEATS`. Mode, fees, restrictions, and other advanced template settings are not yet supported by the create endpoints. Catalog entries not marked create-supported must not be offered as playable variants.
 
@@ -167,14 +172,14 @@ Send the authentication envelope as the first frame after `open`. Do not put the
 ```json
 {
   "version": "1.0",
-  "topic": "clubs/demo/tables/table-1/game",
+  "topic": "clubs/550e8400-e29b-41d4-a716-446655440000/tables/table-1/game",
   "event": "AUTHENTICATE",
   "correlation_id": "auth-<uuid>",
   "payload": {"id_token": "<Firebase ID token>"}
 }
 ```
 
-For union sockets, include `"club_id": "<player home club>"` in `payload`. On success, expect `AUTHENTICATED`, then `TABLE_SNAPSHOT`. Initial authentication failures return a standardized error body and close the socket. The server verifies the Firebase token, active membership, `PLAYER` role, selected home club for union play, and seat before registering the connection.
+For union sockets, include `"club_id": "<player home club UUID>"` in `payload`; this field name is retained by the protocol, but its current value must be `club_uuid`, not the 8-digit business ID. On success, expect `AUTHENTICATED`, then `TABLE_SNAPSHOT`. Initial authentication failures return a standardized error body and close the socket. The server verifies the Firebase token, active membership, `PLAYER` role, selected home club for union play, and seat before registering the connection.
 
 Every `TABLE_SNAPSHOT` payload is a complete state. Replace the UI's current table state with it; do not merge it as a partial update. The server masks opponents' private cards per recipient. Render `"??"` as hidden cards and never infer or reveal another player's cards. The REST hand-start response does not contain player-private cards.
 
@@ -185,7 +190,7 @@ Send each intentional game action as `PLAYER_ACTION`. `correlation_id` identifie
 ```json
 {
   "version": "1.0",
-  "topic": "clubs/demo/tables/table-1/game",
+  "topic": "clubs/550e8400-e29b-41d4-a716-446655440000/tables/table-1/game",
   "event": "PLAYER_ACTION",
   "correlation_id": "message-<uuid>",
   "payload": {"action": "RAISE", "amount": 300, "action_id": "action-<uuid>"}
@@ -205,7 +210,7 @@ The server sends a `PING` periodically. Reply with `PONG` using the same `correl
 ```json
 {
   "version": "1.0",
-  "topic": "clubs/demo/tables/table-1/game",
+  "topic": "clubs/550e8400-e29b-41d4-a716-446655440000/tables/table-1/game",
   "event": "PONG",
   "correlation_id": "<correlation_id from PING>",
   "payload": {}

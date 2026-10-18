@@ -1,4 +1,4 @@
-from logic.first_party_table import FirstPartyNLHGame
+from logic.first_party_table import FirstPartyNLHGame, allocate_rake_by_contribution
 
 
 def make_game() -> FirstPartyNLHGame:
@@ -291,6 +291,25 @@ def test_hand_summary_applies_rake_and_jackpot_before_player_payouts() -> None:
     assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 35
     assert sum(player["net_delta"] for player in summary["players"]) == -35
     assert sum(player["final_stack"] for player in summary["players"]) == 965
+
+
+def test_rake_attribution_uses_eligible_contributions_and_conserves_rake() -> None:
+    shares = allocate_rake_by_contribution(
+        {"player-a": 500, "player-b": 300, "player-c": 200},
+        {"player-a": 100},
+        9,
+    )
+
+    assert shares == {"player-a": 4, "player-b": 3, "player-c": 2}
+    assert sum(shares.values()) == 9
+
+
+def test_rake_attribution_rounding_is_deterministic() -> None:
+    shares = allocate_rake_by_contribution(
+        {"player-c": 1, "player-a": 1, "player-b": 1}, {}, 2
+    )
+
+    assert shares == {"player-c": 0, "player-a": 1, "player-b": 1}
 
 
 def test_rake_and_jackpot_drops_never_exceed_the_completed_pot() -> None:

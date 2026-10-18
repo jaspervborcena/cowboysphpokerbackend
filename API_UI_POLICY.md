@@ -24,6 +24,8 @@ The frontend may only call routes that do the following:
 
 These routes are allowed in the browser when the authenticated Firebase user is valid and the request is otherwise authorized.
 
+**Club ID parameter note:** Current route templates use the `{club_id}` placeholder, but the value must be the club's UUID (`club_uuid`), which is also its Firestore document ID. Use the `club_uuid` returned by the membership/provisioning APIs in club REST paths and local table WebSocket paths; do not use the 8-digit business `club_id` returned for display. For `POST /clubs/{club_id}/wallet/transfers`, `destination_club_id` must also be the destination club's UUID. Member `user_id` values are Firebase Auth UIDs, not player IDs.
+
 ### 1.2 Server-authoritative routes
 
 Routes that change club funds, create club-wide treasury state, or create canonical business records are server-authoritative. The browser must not be allowed to invent or calculate those mutations.
@@ -64,6 +66,7 @@ These are UI-safe reads and flows when authenticated:
 - `GET /me/wallets/global-playmoney`
 - `GET /clubs/{club_id}/members/me`
 - `GET /clubs/{club_id}/members/me/wallet`
+- `GET /clubs/{club_id}/rake/players` for active club owners/managers and assigned agents only
 - `GET /clubs/{club_id}/tables`
 - `GET /clubs/{club_id}/unions`
 - `GET /clubs/{club_id}/unions/{union_id}/tables`

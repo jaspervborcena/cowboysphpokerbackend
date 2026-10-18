@@ -20,12 +20,14 @@ These are the target account concepts, but not all have distinct account documen
 platform_wallets/global-playmoney-reserve
 global_wallets/{user_id}
   transactions/{transaction_id}
-clubs/{club_id}
+clubs/{club_uuid}
   members/{user_id}
     transactions/{buy_in_id}
   transactions/{transaction_id}
   treasury/wallet
   treasury/pools
+  player_rake_stats/{user_id}
+    hands/{hand_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
@@ -34,7 +36,7 @@ clubs/{club_id}
     runtime/lease
 unions/{union_id}
   admins/{user_id}
-  clubs/{club_id}
+  clubs/{club_uuid}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
@@ -42,7 +44,7 @@ unions/{union_id}
       actions/{action_hash}
     runtime/lease
   settlements/{YYYY-MM-DD}
-    clubs/{club_id}
+    clubs/{club_uuid}
     hands/{hand_id}
 ```
 
@@ -50,11 +52,13 @@ unions/{union_id}
 
 The repository provides Firestore transaction operations for `tables/{table_id}/runtime/state`, its `actions/{action_hash}` journal, and `tables/{table_id}/runtime/lease`. Checkpoints carry a schema version, sequence, owner ID, fencing epoch, and serialized state. Lease records carry owner, fencing generation, expiry, heartbeat, and status. `commit_table_action` validates checkpoint owner/epoch, the matching lease owner/generation, and lease expiry in the same transaction as the checkpoint and journal write. With Firestore enabled, `TableRuntime` commits first-party hand starts, explicit player actions, standalone pre-actions, and timeout actions through this transaction. Club and union buy-in transactions also validate the lease and sequence and atomically write the staged seat checkpoint/action with member balances, seat reservation, and ledger records. Table creation initializes an unowned generation-zero checkpoint; union metadata and checkpoint are initialized atomically. The generic `/workers/{worker_id}/...` coordinator remains process-local, and the runtime table map is not durable.
 
+Firestore path placeholders use `{club_uuid}` for the UUID document ID. Existing HTTP route templates still use `{club_id}` as the parameter name, but callers must pass that same UUID value.
+
 ## Fields Written by the Backend
 
 ### Member ledger
 
-Path: `clubs/{club_id}/members/{user_id}`
+Path: `clubs/{club_uuid}/members/{user_id}`
 
 `chip_balance` is the member's available off-table balance. `in_play_balance` tracks chips currently held at tables. A buy-in decreases `chip_balance` and increases `in_play_balance`; hand settlement applies `net_delta` only to `in_play_balance`. The sample includes profile metadata for context; the current repository changes the two balance fields but does not create or initialize member accounts.
 
@@ -84,7 +88,7 @@ Current limitation: a club member has one `role` and one `chip_balance`/`in_play
 
 One Firestore transaction verifies the member exists, confirms sufficient available balance, checks the seat is free, debits the member, and creates both records below. The request's `buy_in_id` is the transaction document ID and makes a retry of the same purchase idempotent.
 
-Transaction path: `clubs/{club_id}/members/{user_id}/transactions/{buy_in_id}`
+Transaction path: `clubs/{club_uuid}/members/{user_id}/transactions/{buy_in_id}`
 
 ```json
 {
@@ -99,7 +103,7 @@ Transaction path: `clubs/{club_id}/members/{user_id}/transactions/{buy_in_id}`
 }
 ```
 
-Seat path: `clubs/{club_id}/tables/{table_id}/seats/{seat_index}`
+Seat path: `clubs/{club_uuid}/tables/{table_id}/seats/{seat_index}`
 
 ```json
 {
@@ -115,13 +119,13 @@ Seat path: `clubs/{club_id}/tables/{table_id}/seats/{seat_index}`
 
 The seat document stores the reserved stack and the idempotency key. Hand settlement updates this seat document's `stack` to the hand's final stack. Full table recovery and seat cash-out/removal are not implemented yet.
 
-The same Firestore transaction also creates a club-wide audit entry at `clubs/{club_id}/transactions/{buy_in_id}` with `currency_type: "CLUB_CHIPS"` and `type: "BUY_IN"`. Send-out and claim-back use this collection for double-entry transfer records. Club transaction writes are server-only.
+The same Firestore transaction also creates a club-wide audit entry at `clubs/{club_uuid}/transactions/{buy_in_id}` with `currency_type: "CLUB_CHIPS"` and `type: "BUY_IN"`. Send-out and claim-back use this collection for double-entry transfer records. Club transaction writes are server-only.
 
 ### Club wallet and treasury
 
-`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update both member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back is rejected if the member's `in_play_balance` is nonzero.
+`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update both member balances and write an idempotent audit entry at `clubs/{club_uuid}/transactions/{transaction_id}`. The route's `{club_id}` value is the `club_uuid`. Agents can only transact with members assigned to them by `agent_id`. Claim-back is rejected if the member's `in_play_balance` is nonzero.
 
-The shared club treasury wallet is stored separately at `clubs/{club_id}/treasury/wallet`:
+The shared club treasury wallet is stored separately at `clubs/{club_uuid}/treasury/wallet`:
 
 ```json
 {
@@ -129,11 +133,11 @@ The shared club treasury wallet is stored separately at `clubs/{club_id}/treasur
 }
 ```
 
-Platform provisioning through `POST /platform/clubs` creates the club root document, its initial active owner membership, this wallet with `chip_balance: 10000`, and `clubs/{club_id}/transactions/initial-funding` with `type: "INITIAL_GRANT"` in one Firestore transaction. Only Firebase users carrying the trusted `platform_admin: true` custom claim may create clubs. The supplied `owner_user_id` is not checked against Firebase Auth, so the caller must use a valid UID. Existing clubs are not automatically credited. The endpoint generates a new club ID for each request and has no request idempotency key; retrying an ambiguous request may create a second club and grant.
+Platform provisioning through `POST /platform/clubs` creates the club root document, its initial active owner membership, this wallet with `chip_balance: 10000`, and `clubs/{club_uuid}/transactions/initial-funding` with `type: "INITIAL_GRANT"` in one Firestore transaction. Only Firebase users carrying the trusted `platform_admin: true` custom claim may create clubs. The supplied `owner_user_id` is not checked against Firebase Auth, so the caller must use a valid UID. Existing clubs are not automatically credited. The endpoint generates a new club ID for each request and has no request idempotency key; retrying an ambiguous request may create a second club and grant.
 
 `GET /clubs/{club_id}/wallet` exposes this balance to active owners and managers. `POST /clubs/{club_id}/wallet/transfers` transfers funds from this wallet to another existing club's wallet. The source operator must be an active `OWNER` or `MANAGER`; the transaction checks the role and both club documents, debits and credits balances atomically, and writes matching `INTER_CLUB_SEND_OUT` / `INTER_CLUB_RECEIVE` records under each club's `transactions` collection. Newly provisioned clubs receive the initial 10,000 balance; older clubs are not automatically funded. Debit/credit card and PayPal funding are deferred; no client-supplied payment result can credit this balance.
 
-The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
+The treasury aggregate is stored at `clubs/{club_uuid}/treasury/pools`:
 
 ```json
 {
@@ -145,16 +149,26 @@ The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
 
 For local club hands, rake and BBJ drops update these fields atomically with the hand audit and member settlement. Each contribution also gets a server-written club transaction entry keyed by hand ID and type, so a retried hand does not double-count pools. The Hand-of-the-Day field is reserved, but contributions and awards are not applied until their funding and winner rules are defined. Union-wide fee allocation remains undefined and is not applied to these club pools. Global play-money wallets are implemented, but global-table buy-ins are not.
 
+### Player rake records
+
+Local club-hand settlement now attributes rake to each participating player in proportion to eligible contributions. Uncalled returns are excluded, and integer rounding remainders are allocated deterministically so the per-player amounts sum exactly to the hand rake. The raw hand audit stores the per-hand attribution; replay responses do not include it.
+
+Each player's cumulative record is stored at `clubs/{club_uuid}/player_rake_stats/{user_id}` with `generated_rake`, `hands_played`, `user_id`, and `username`. Individual hand entries are stored below `hands/{hand_id}`. Both records are written in the same idempotent Firestore transaction as the hand settlement. A player with zero rake attributed in a completed hand still has `hands_played` incremented.
+
+`GET /clubs/{club_id}/rake/players` returns these cumulative records to active `OWNER` and `MANAGER` members. An active `AGENT` receives only records for currently assigned players; `PLAYER` members are denied access. The endpoint does not expose per-hand audit records.
+
+The current rake amount still increments `treasury/pools.total_rake_collected`; rakeback/agent/manager/owner shares are not yet paid or accrued, and the treasury wallet is not credited by this settlement path. The previously proposed 40%/30%/10%/20% split remains a target policy only. Union-hand rake attribution and distribution remain undefined.
+
 ### Completed hand audit
 
-Path: `clubs/{club_id}/tables/{table_id}/hands/{hand_id}`
+Path: `clubs/{club_uuid}/tables/{table_id}/hands/{hand_id}`
 
 The document ID is the generated `hand_id`. This raw audit is server-only: it includes private hole cards, remaining/burn/mucked deck cards, first-party engine events, and timestamped replay frames. Never expose this document directly to a client. Player replay clients must use `GET /clubs/{club_id}/hands/{hand_id}/replay`, which masks cards for the requesting user.
 
 ```json
 {
   "hand_id": "bfb74a70-1dad-4d8a-bf76-e192d23b50ee",
-  "club_id": "demo",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "table_id": "table-1",
   "started_at": "2026-10-14T10:00:00+00:00",
   "timestamp": "2026-10-14T10:00:30+00:00",
@@ -273,12 +287,12 @@ Union admin path: `unions/{union_id}/admins/{user_id}`
 {"role":"UNION_ADMIN","status":"active"}
 ```
 
-Participating club path: `unions/{union_id}/clubs/{club_id}`
+Participating club path: `unions/{union_id}/clubs/{club_uuid}`. In current union records, the stored field named `club_id` also contains this UUID; retain that legacy field name until an explicit schema migration.
 
 ```json
 {
   "union_id": "union-1",
-  "club_id": "club-a",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "union_name": "Pinoy Poker Alliance",
   "status": "active"
 }
@@ -304,7 +318,7 @@ Example shared table metadata at `unions/union-1/tables/final-table`:
   "table_id": "final-table",
   "game_id": "no_limit_texas_holdem",
   "table_name": "Alliance Main",
-  "origin_club_id": "club-a",
+  "origin_club_id": "550e8400-e29b-41d4-a716-446655440000",
   "small_blind": 10,
   "big_blind": 20,
   "buy_in_min": 100,
@@ -320,7 +334,7 @@ Example seat records at `unions/union-1/tables/final-table/seats/{seat_index}` s
 {
   "seat_index": 0,
   "user_id": "player-a",
-  "club_id": "club-a",
+  "club_id": "550e8400-e29b-41d4-a716-446655440000",
   "username": "Alice",
   "stack": 500,
   "buy_in_id": "00000000-0000-0000-0000-000000000101",
@@ -333,7 +347,7 @@ Example seat records at `unions/union-1/tables/final-table/seats/{seat_index}` s
 {
   "seat_index": 1,
   "user_id": "player-b",
-  "club_id": "club-b",
+  "club_id": "550e8400-e29b-41d4-a716-446655440001",
   "username": "Bob",
   "stack": 500,
   "buy_in_id": "00000000-0000-0000-0000-000000000102",
@@ -354,7 +368,7 @@ At settlement, the restricted hand document at `unions/union-1/tables/final-tabl
     {
       "seat": 0,
       "user_id": "player-a",
-      "club_id": "club-a",
+      "club_id": "550e8400-e29b-41d4-a716-446655440000",
       "starting_stack": 500,
       "final_stack": 650,
       "net_delta": 150,
@@ -363,7 +377,7 @@ At settlement, the restricted hand document at `unions/union-1/tables/final-tabl
     {
       "seat": 1,
       "user_id": "player-b",
-      "club_id": "club-b",
+      "club_id": "550e8400-e29b-41d4-a716-446655440001",
       "starting_stack": 500,
       "final_stack": 350,
       "net_delta": -150,
@@ -381,7 +395,7 @@ Union hand audits live at `unions/{union_id}/tables/{table_id}/hands/{hand_id}`.
 
 Daily aggregate paths are:
 
-- `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_id}` with integer `debt` and `credit` totals.
+- `unions/{union_id}/settlements/{YYYY-MM-DD}/clubs/{club_uuid}` with integer `debt` and `credit` totals.
 - `unions/{union_id}/settlements/{YYYY-MM-DD}/hands/{hand_id}` with the per-club net deltas and debt/credit positions.
 
 For each club, `net_delta` is the sum of that club's players' hand results. Negative net delta increments `debt` by its absolute value; positive net delta increments `credit`. Current union settlement does not allocate a software fee or traffic-based rake split.
@@ -394,7 +408,7 @@ The following document shapes are recommendations for future club/table CRUD and
 
 ### Club
 
-Path: `clubs/{club_id}`
+Path: `clubs/{club_uuid}`
 
 ```json
 {
@@ -407,7 +421,7 @@ Path: `clubs/{club_id}`
 
 ### Table
 
-Path: `clubs/{club_id}/tables/{table_id}`
+Path: `clubs/{club_uuid}/tables/{table_id}`
 
 ```json
 {
