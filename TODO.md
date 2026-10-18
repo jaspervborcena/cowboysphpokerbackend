@@ -10,6 +10,8 @@ Complete these in order before running live tables across multiple backend insta
 
 - [x] Require `WORKER_COORDINATION_TOKEN` bearer authentication on `/workers/{worker_id}/...`, fail closed when unset, reject HTTP force-reclaim requests, and reject mismatched path/payload worker IDs and unstarted sessions.
 - [ ] Restrict worker-route ingress to trusted services and manage/rotate the token through the deployment secret manager.
+- [x] Hide worker coordination routes from gateway-role instances and support a separate coordination-token header for Cloud Run IAM callers.
+- [ ] Deploy worker coordination behind internal Cloud Run ingress with IAM invoker allowlisting and Secret Manager injection/rotation; keep the token off gateway services.
 - [x] Connect `TableRuntime` lease claim/renew/authorize/release methods and club/union per-table claim routes to Firestore lease operations when Firestore is enabled.
 - [x] Replace the Firestore-enabled `/workers/{worker_id}/...` process-local coordinator path with scope-aware durable sessions, assignment discovery, claim, heartbeat, release, and recovery; retain the in-memory coordinator only when Firestore is disabled.
 - [x] Persist initial table checkpoints and restore table state, owner, and fencing generation when a worker claims a table in a new process.

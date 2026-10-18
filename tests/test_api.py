@@ -1962,6 +1962,7 @@ def test_durable_seat_helper_commits_staged_player_or_restores_on_conflict() -> 
 
 
 def test_worker_routes_fail_closed_without_service_token(monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_ROLE", "worker")
     monkeypatch.delenv("WORKER_COORDINATION_TOKEN", raising=False)
 
     with TestClient(app) as client:
@@ -1972,6 +1973,7 @@ def test_worker_routes_fail_closed_without_service_token(monkeypatch) -> None:
 
 def test_worker_routes_require_valid_service_token_and_reject_forced_reclaim(monkeypatch) -> None:
     token = "test-worker-coordination-secret"
+    monkeypatch.setenv("SERVICE_ROLE", "worker")
     monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
 
     with TestClient(app) as client:
@@ -1989,6 +1991,10 @@ def test_worker_routes_require_valid_service_token_and_reject_forced_reclaim(mon
             json={"worker_id": "worker-auth-test", "force_reclaim": False},
             headers={"Authorization": f"Bearer {token}"},
         )
+        custom_header_auth = client.get(
+            "/workers/worker-auth-test/tables",
+            headers={"X-Worker-Coordination-Token": token},
+        )
         forced_reclaim = client.post(
             "/workers/worker-auth-test/tables/table-auth-test/lease",
             json={"worker_id": "worker-auth-test", "force_reclaim": True},
@@ -1999,11 +2005,26 @@ def test_worker_routes_require_valid_service_token_and_reject_forced_reclaim(mon
     assert invalid_token.status_code == 401
     assert started.status_code == 200
     assert claimed.status_code == 200
+    assert custom_header_auth.status_code == 200
     assert forced_reclaim.status_code == 403
+
+
+def test_worker_routes_are_hidden_from_gateway_role(monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_ROLE", "gateway")
+    monkeypatch.setenv("WORKER_COORDINATION_TOKEN", "test-worker-coordination-secret")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/workers/worker-a/tables",
+            headers={"X-Worker-Coordination-Token": "test-worker-coordination-secret"},
+        )
+
+    assert response.status_code == 404
 
 
 def test_worker_routes_reject_mismatched_worker_id(monkeypatch) -> None:
     token = "test-worker-coordination-secret"
+    monkeypatch.setenv("SERVICE_ROLE", "worker")
     monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
 
     with TestClient(app) as client:
@@ -2112,6 +2133,7 @@ def test_durable_worker_claim_recovers_runtime_and_rejects_second_owner(monkeypa
             return self.lease
 
     token = "durable-worker-secret"
+    monkeypatch.setenv("SERVICE_ROLE", "worker")
     monkeypatch.setenv("WORKER_COORDINATION_TOKEN", token)
     table_id = "durable-worker-table"
     scope_id = "durable-worker-club"

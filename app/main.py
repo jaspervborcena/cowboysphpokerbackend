@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError
@@ -672,17 +672,22 @@ async def request_owner_command(
 
 async def require_worker_coordination_token(
     credentials: HTTPAuthorizationCredentials | None = Depends(worker_bearer_scheme),
+    coordination_token: str | None = Header(default=None, alias="X-Worker-Coordination-Token"),
 ) -> None:
+    if os.getenv("SERVICE_ROLE", "gateway") != "worker":
+        raise HTTPException(status_code=404, detail="Not found.")
     configured_token = os.getenv("WORKER_COORDINATION_TOKEN")
     if not configured_token:
         raise HTTPException(
             status_code=503,
             detail="Worker coordination is not configured.",
         )
+    supplied_token = coordination_token
+    if supplied_token is None and credentials is not None and credentials.scheme.lower() == "bearer":
+        supplied_token = credentials.credentials
     if (
-        credentials is None
-        or credentials.scheme.lower() != "bearer"
-        or not compare_digest(credentials.credentials, configured_token)
+        supplied_token is None
+        or not compare_digest(supplied_token, configured_token)
     ):
         raise HTTPException(
             status_code=401,
