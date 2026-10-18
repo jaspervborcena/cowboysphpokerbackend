@@ -11,6 +11,8 @@ from google.cloud import firestore
 
 INITIAL_CLUB_TREASURY_FUNDS = 10_000
 INITIAL_GLOBAL_PLAYMONEY_FUNDS = 20_000
+CLUB_CHIP_GIVEAWAY_RESERVE_ID = "club-chip-giveaway-reserve"
+INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE = 1_000_000_000
 
 
 class BuyInStatus(StrEnum):
@@ -506,7 +508,12 @@ class FirestoreHandRepository:
         owner_ref = club_ref.collection("members").document(owner_user_id)
         wallet_ref = club_ref.collection("treasury").document("wallet")
         initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
-        reserve_ref = self._client.collection("platform_wallets").document("global-playmoney-reserve")
+        reserve_ref = self._client.collection("platform_wallets").document(
+            CLUB_CHIP_GIVEAWAY_RESERVE_ID
+        )
+        reserve_transaction_ref = reserve_ref.collection("transactions").document(
+            f"club-{club_id}-initial-grant"
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -516,17 +523,12 @@ class FirestoreHandRepository:
                 return False
 
             reserve_snapshot = reserve_ref.get(transaction=transaction)
-            reserve_wallet = reserve_snapshot.to_dict() or {}
             if not reserve_snapshot.exists:
-                reserve_wallet = {
-                    "wallet_id": "global-playmoney-reserve",
-                    "wallet_type": "PLATFORM_RESERVE",
-                    "currency_type": "GLOBAL_PLAYMONEY",
-                    "chip_balance": 1_000_000_000,
-                }
+                raise FirestoreRequiredError("Club chip giveaway reserve is not provisioned.")
+            reserve_wallet = reserve_snapshot.to_dict() or {}
             reserve_balance = reserve_wallet.get("chip_balance", 0)
             if isinstance(reserve_balance, bool) or not isinstance(reserve_balance, int) or reserve_balance < INITIAL_CLUB_TREASURY_FUNDS:
-                raise ValueError("Platform reserve does not have enough funds for an initial club grant.")
+                raise ValueError("Club chip giveaway reserve does not have enough funds for an initial grant.")
 
             transaction.set(
                 club_ref,
@@ -554,9 +556,9 @@ class FirestoreHandRepository:
                 reserve_ref,
                 {
                     **reserve_wallet,
-                    "wallet_id": "global-playmoney-reserve",
-                    "wallet_type": "PLATFORM_RESERVE",
-                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
+                    "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+                    "currency_type": "CLUB_CHIPS",
                     "chip_balance": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 },
@@ -572,9 +574,9 @@ class FirestoreHandRepository:
                     "transaction_id": "initial-funding",
                     "currency_type": "CLUB_CHIPS",
                     "type": "INITIAL_GRANT",
-                    "from_wallet_id": "global-playmoney-reserve",
+                    "from_wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
                     "to_wallet_id": f"club-treasury-{club_id}",
-                    "from_wallet_type": "PLATFORM_RESERVE",
+                    "from_wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
                     "to_wallet_type": "CLUB_TREASURY",
                     "to_club_id": club_id,
                     "amount": INITIAL_CLUB_TREASURY_FUNDS,
@@ -582,6 +584,24 @@ class FirestoreHandRepository:
                     "note": "Initial club treasury funding",
                     "timestamp": firestore.SERVER_TIMESTAMP,
                     "reserve_balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
+                },
+            )
+            transaction.set(
+                reserve_transaction_ref,
+                {
+                    "transaction_id": f"club-{club_id}-initial-grant",
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "INITIAL_GRANT",
+                    "from_wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
+                    "to_wallet_id": f"club-treasury-{club_id}",
+                    "from_wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+                    "to_wallet_type": "CLUB_TREASURY",
+                    "to_club_id": club_id,
+                    "amount": INITIAL_CLUB_TREASURY_FUNDS,
+                    "performed_by": created_by,
+                    "note": "Initial club treasury funding",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                    "balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                 },
             )
             return True

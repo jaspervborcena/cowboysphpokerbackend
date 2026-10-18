@@ -42,6 +42,9 @@ class ClubTreasuryTransferRequest(BaseModel):
 
 class CreateClubRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+
+
+class PlatformCreateClubRequest(CreateClubRequest):
     owner_user_id: str = Field(min_length=1, max_length=128)
 
 
@@ -285,6 +288,45 @@ async def get_my_global_playmoney_wallet(
 
 
 @router.post(
+    "/clubs",
+    status_code=201,
+    tags=["Club provisioning"],
+    summary="Create a club",
+    description="Creates a club, grants 10,000 CLUB_CHIPS from the club giveaway reserve, and makes the authenticated Firebase user its OWNER.",
+    response_model=ClubProvisionResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        409: error_response("The generated club ID conflicts with an existing club."),
+        503: error_response("Club storage is unavailable."),
+    },
+)
+async def create_self_service_club(
+    request: Request,
+    create_request: CreateClubRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    club_id = str(uuid4())
+    try:
+        created = await asyncio.to_thread(
+            request.app.state.repository.create_club,
+            club_id,
+            create_request.name,
+            current_user.uid,
+            current_user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Club creation is unavailable.") from error
+    if not created:
+        raise HTTPException(status_code=409, detail="Club ID already exists; retry the request.")
+    return {
+        "club_id": club_id,
+        "name": create_request.name,
+        "owner_user_id": current_user.uid,
+        "treasury_balance": INITIAL_CLUB_TREASURY_FUNDS,
+    }
+
+
+@router.post(
     "/platform/clubs",
     status_code=201,
     tags=["Club provisioning"],
@@ -300,7 +342,7 @@ async def get_my_global_playmoney_wallet(
 )
 async def create_club(
     request: Request,
-    create_request: CreateClubRequest,
+    create_request: PlatformCreateClubRequest,
     platform_admin: AuthenticatedUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     if not platform_admin.platform_admin:

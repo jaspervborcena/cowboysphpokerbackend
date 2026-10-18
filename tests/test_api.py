@@ -1503,6 +1503,27 @@ def test_platform_admin_creates_club_with_initial_treasury_funds(monkeypatch) ->
     )
 
 
+def test_authenticated_user_creates_funded_club_as_owner(monkeypatch) -> None:
+    repository = FakeHandRepository({})
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/clubs",
+            json={"name": "Player Club", "owner_user_id": "somebody-else"},
+            headers={"Authorization": "Bearer valid:regular-player"},
+        )
+
+    assert created.status_code == 201
+    assert created.json()["owner_user_id"] == "regular-player"
+    assert created.json()["treasury_balance"] == 10000
+    assert repository.created_clubs[0][1:] == (
+        "Player Club",
+        "regular-player",
+        "regular-player",
+    )
+
+
 def test_inter_club_wallet_routes_are_limited_to_owners_and_managers(monkeypatch) -> None:
     repository = FakeHandRepository(
         {"owner-1": 0, "manager-1": 0, "agent-1": 0, "player-1": 0},

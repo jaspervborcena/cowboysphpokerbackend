@@ -1,13 +1,15 @@
 # Project TODO
 
-Last reviewed: 2026-10-17
+Last reviewed: 2026-10-18
 
 This list tracks repository work, not just architecture proposals. A completed diagram or document does not mean its runtime components are implemented.
 
 ## Completed in the Repository
 
-- [x] Implement reserve-backed initial grants for the global play-money wallet and club treasury, with atomic reserve debit + destination credit + ledger logging.
-- [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records and keep retries idempotent.
+- [x] Implement separate currency-scoped reserves for global play-money grants and 10,000-chip club-creation giveaways, with atomic debit, destination credit, and ledger logging.
+- [x] Add self-service `POST /clubs`: derive the owner from the Firebase UID and grant 10,000 `CLUB_CHIPS` from the pre-provisioned giveaway reserve.
+- [x] Provision the production `CLUB_CHIPS` giveaway reserve with a 1,000,000,000-chip opening allocation and audit record.
+- [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records; operations with stable transaction IDs are retry-idempotent.
 - [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
 - [x] Include `game_id` in table listings, snapshots, create responses, and persisted union table metadata.
@@ -50,7 +52,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
 - [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
 - [ ] After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to provision the authenticated user's persistent `GLOBAL_PLAYMONEY` wallet with 20,000 chips, then load it with `GET /me/wallets/global-playmoney`. Keep it isolated from club chips and do not offer client-controlled grant amounts.
-- [ ] After club provisioning, display the live 10,000-chip `CLUB_TREASURY` grant from `POST /platform/clubs` and refresh via `GET /clubs/{club_id}/wallet`. The owner membership's personal `chip_balance` currently starts at zero; do not show the treasury grant as personal funds.
+- [ ] For player-created clubs, call `POST /clubs` with the club name and signed-in user's Firebase ID token. Use the response's `club_id` and `treasury_balance` (10,000 `CLUB_CHIPS`) for initial UI state, then refresh with `GET /clubs/{club_id}/wallet`. Prevent duplicate submits; the create route has no idempotency key. Do not display the treasury grant as the owner's personal member balance.
 - [ ] For club players, use the live `POST /clubs/{club_id}/wallet/send-out` flow for funding by an authorized owner, manager, or assigned agent. There is no other club-funding path for players.
 - [ ] Mock a player-initiated cash-out request as pending UI state. An authorized owner, manager, or assigned agent can fulfill it with `POST /clubs/{club_id}/wallet/claim-back`; surface the existing restriction that claim-back is unavailable while `in_play_balance` is nonzero. No request/approval API exists yet.
 - [ ] Show available and in-play member balances separately, and keep global play money, club treasury funds, operator funds, player funds, and table stacks distinct.

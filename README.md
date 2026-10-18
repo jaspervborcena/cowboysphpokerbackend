@@ -12,7 +12,7 @@ The selected production target is the Firebase/Firestore design in [GAME_SERVER_
 
 ## Economy Tiers
 
-The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is not convertible to club chips. The current implementation uses a platform reserve wallet as the authoritative source for initial grants: `ensure_global_wallet(...)` and `create_club(...)` debit the reserve and credit the destination wallet in one transaction, with ledger rows capturing `from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps. Browser code may read these values but must never be the authority for money creation or treasury mutations. Firestore still has one `chip_balance`/`in_play_balance` pair per club member rather than separate agent/player accounts. Direct player cash-out, external payouts/refunds, and reconciliation are still not implemented.
+The target has separate wallet accounts for platform/global play-money, the club treasury, an agent's club operating balance, and a player's club balance. A user who is both an agent and a player has distinct agent and player accounts. Table stacks are separately tracked as in-play/escrow value. The global wallet is not convertible to club chips. Initial grants use separate currency-scoped reserves: `ensure_global_wallet(...)` debits the `GLOBAL_PLAYMONEY` reserve, while club creation debits `platform_wallets/club-chip-giveaway-reserve` (`CLUB_CHIPS`). Each grant and destination credit are written atomically with ledger rows capturing `from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps. Browser code may read these values but must never be the authority for money creation or treasury mutations. Firestore still has one `chip_balance`/`in_play_balance` pair per club member rather than separate agent/player accounts. Direct player cash-out, external payouts/refunds, and reconciliation are still not implemented.
 
 ## Project Layout
 
@@ -76,7 +76,8 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - Operator-mediated club wallet send-out and claim-back transfers with role/downline checks and idempotent Firestore audit records.
 - Owner/manager treasury balance and atomic inter-club treasury transfers with paired audit records; card and PayPal funding are not enabled yet.
 - Platform-admin club provisioning creates the initial owner membership and grants 10,000 treasury chips exactly once through the reserve-backed accounting path.
-- Reserve-backed initial grants for global play-money and club treasury are recorded with `from_wallet_id`/`to_wallet_id` audit rows and atomic balance updates.
+- Self-service `POST /clubs` creates the authenticated user as club `OWNER` and grants 10,000 `CLUB_CHIPS` from the dedicated club-chip giveaway reserve; the platform-admin endpoint remains for provisioning on another user's behalf.
+- Separate reserve-backed initial grants for global play-money and club treasury are recorded with `from_wallet_id`/`to_wallet_id` audit rows and atomic balance updates.
 - Firestore transaction to save a hand audit, apply in-play balance deltas, and update seat stacks idempotently by hand ID.
 - Docker image suitable for Cloud Run, plus focused engine and WebSocket integration tests.
 
@@ -204,13 +205,44 @@ Load a connected demo dataset into the local Firestore emulator only:
 firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\Scripts\python.exe -m pytest tests\test_firestore_demo_seed.py -q"
 ```
 
-The emulator test inserts the stable `demo-*` documents, reads them back, and checks the reserve/grant, club/member, union/club, and settlement/hand links. The seeder refuses non-local Firestore hosts and non-demo project IDs. The fixture covers the platform reserve/grant example, global wallet, club members and treasury, table audit, union membership/table, and settlement records. They are demo records, not live table state; the game server does not recover a playable table from seeded table documents. The runtime reserve-backed model uses the platform reserve as the funding source for initial player and club grants and records the corresponding `from_wallet_id`/`to_wallet_id` accounting rows.
+The emulator test inserts the stable `demo-*` documents, reads them back, and checks the reserve/grant, club/member, union/club, and settlement/hand links. The seeder refuses non-local Firestore hosts and non-demo project IDs. The fixture covers the global play-money reserve/grant example, global wallet, club members and treasury, table audit, union membership/table, and settlement records. They are demo records, not live table state; the game server does not recover a playable table from seeded table documents. Runtime global-play-money grants debit the `GLOBAL_PLAYMONEY` reserve; club-creation giveaways debit the separate `CLUB_CHIPS` giveaway reserve. Both record their `from_wallet_id`/`to_wallet_id` accounting entries.
 
 To load the fixture without running the assertions, use `.venv\Scripts\python.exe -m database.seed_demo_firestore` as the command passed to `firebase emulators:exec`.
 
-Club-protected routes require valid Firebase ID tokens, active Firestore membership records, and a working Firestore connection. `POST /platform/clubs` instead requires the trusted Firebase custom claim `platform_admin: true`; it does not require membership in an existing club. Assign that claim only through a trusted Firebase Admin process. If Firestore or Firebase verification is unavailable, protected routes fail closed; automated tests use fake verifiers and repositories and need no cloud account.
+Club-protected routes require valid Firebase ID tokens, active Firestore membership records, and a working Firestore connection. `POST /clubs` requires a signed-in Firebase user and creates a club where that user is the `OWNER`, with a 10,000-chip `CLUB_CHIPS` giveaway. `POST /platform/clubs` is the separate admin route for creating a funded club on behalf of another owner; it requires the trusted Firebase custom claim `platform_admin: true`. Assign that claim only through a trusted Firebase Admin process. If Firestore or Firebase verification is unavailable, protected routes fail closed; automated tests use fake verifiers and repositories and need no cloud account.
 
 Completed hands are written to the restricted Firestore hand audit collection. Player clients must use `GET /clubs/{club_id}/hands/{hand_id}/replay`; the server masks opponents' cards unless they were shown at showdown. See [API.md](API.md) for the response contract and [database/README.md](database/README.md) for the audit schema.
+
+### UI Club Creation Contract
+
+Create the club through the Wallet REST API (`http://127.0.0.1:8001` locally), not the game-server API. A signed-in user sends their Firebase ID token and the club name; the backend generates the club ID, assigns the caller as `OWNER` in that club only, and grants 10,000 `CLUB_CHIPS` from the giveaway reserve.
+
+```http
+POST /clubs
+Authorization: Bearer <Firebase ID token>
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{"name":"Friday Poker Club"}
+```
+
+Response `201`:
+
+```json
+{
+	"club_id": "generated-club-id",
+	"name": "Friday Poker Club",
+	"owner_user_id": "firebase-uid",
+	"treasury_balance": 10000
+}
+```
+
+Use `treasury_balance` for the initial UI display and `club_id` for subsequent membership, wallet, lobby, and table requests. The club-side grant log is `clubs/{club_id}/transactions/initial-funding`; the matching reserve debit is `platform_wallets/club-chip-giveaway-reserve/transactions/club-{club_id}-initial-grant`. The giveaway reserve is separate from global play money. This request has no idempotency key, so prevent repeated submits and do not blindly retry an ambiguous timeout. See [API.md](API.md#self-service-club-creation) for the complete contract and browser example.
+
+`POST /platform/clubs` remains restricted to platform admins because it allows the caller to choose another user's owner UID.
 
 ### UI Table Creation Contract
 

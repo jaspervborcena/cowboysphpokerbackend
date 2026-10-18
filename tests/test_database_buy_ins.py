@@ -7,6 +7,7 @@ from google.cloud import firestore
 
 from database import (
     BuyInStatus,
+    FirestoreRequiredError,
     FirestoreHandRepository,
     TableActionCommitStatus,
     WalletTransactionStatus,
@@ -197,14 +198,20 @@ def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
     assert client.documents[reserve_path]["chip_balance"] == 980_000
 
 
-def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
+def test_create_club_funds_treasury_from_club_chip_giveaway_reserve(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     client = FakeFirestoreClient({
+        ("platform_wallets", "club-chip-giveaway-reserve"): {
+            "wallet_id": "club-chip-giveaway-reserve",
+            "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+            "currency_type": "CLUB_CHIPS",
+            "chip_balance": 1_000_000,
+        },
         ("platform_wallets", "global-playmoney-reserve"): {
             "wallet_id": "global-playmoney-reserve",
             "wallet_type": "PLATFORM_RESERVE",
             "currency_type": "GLOBAL_PLAYMONEY",
-            "chip_balance": 1_000_000,
+            "chip_balance": 500_000,
         }
     })
     repository = FirestoreHandRepository(client)
@@ -213,11 +220,23 @@ def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
 
     treasury_path = ("clubs", "club-42", "treasury", "wallet")
     initial_grant_path = ("clubs", "club-42", "transactions", "initial-funding")
-    reserve_path = ("platform_wallets", "global-playmoney-reserve")
+    reserve_path = ("platform_wallets", "club-chip-giveaway-reserve")
+    reserve_grant_path = (
+        "platform_wallets",
+        "club-chip-giveaway-reserve",
+        "transactions",
+        "club-club-42-initial-grant",
+    )
     assert client.documents[treasury_path]["chip_balance"] == 10_000
     assert client.documents[initial_grant_path]["amount"] == 10_000
-    assert client.documents[initial_grant_path]["from_wallet_id"] == "global-playmoney-reserve"
+    assert client.documents[initial_grant_path]["currency_type"] == "CLUB_CHIPS"
+    assert client.documents[initial_grant_path]["from_wallet_id"] == "club-chip-giveaway-reserve"
+    assert client.documents[initial_grant_path]["from_wallet_type"] == "CLUB_CHIP_GIVEAWAY_RESERVE"
     assert client.documents[reserve_path]["chip_balance"] == 990_000
+    assert client.documents[("platform_wallets", "global-playmoney-reserve")]["chip_balance"] == 500_000
+    assert client.documents[reserve_grant_path]["amount"] == 10_000
+    assert client.documents[reserve_grant_path]["to_club_id"] == "club-42"
+    assert client.documents[reserve_grant_path]["balance_after"] == 990_000
 
 
 def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
@@ -511,7 +530,14 @@ def test_inter_club_treasury_transfer_rejects_unauthorized_and_insufficient_fund
 
 def test_create_club_grants_initial_treasury_funds_once(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient({
+        ("platform_wallets", "club-chip-giveaway-reserve"): {
+            "wallet_id": "club-chip-giveaway-reserve",
+            "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+            "currency_type": "CLUB_CHIPS",
+            "chip_balance": hand_repository.INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE,
+        }
+    })
     repository = FirestoreHandRepository(client)
 
     assert repository.create_club("new-club", "New Club", "owner-1", "platform-admin")
@@ -528,10 +554,33 @@ def test_create_club_grants_initial_treasury_funds_once(monkeypatch) -> None:
     assert client.documents[("clubs", "new-club", "treasury", "wallet")] == {
         "chip_balance": 10000
     }
-    assert client.documents[("clubs", "new-club", "transactions", "initial-funding")]["amount"] == 10000
+    initial_funding = client.documents[("clubs", "new-club", "transactions", "initial-funding")]
+    assert initial_funding["amount"] == 10000
+    assert initial_funding["from_wallet_id"] == "club-chip-giveaway-reserve"
+    assert client.documents[("platform_wallets", "club-chip-giveaway-reserve")]["chip_balance"] == (
+        hand_repository.INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE - 10000
+    )
+    assert client.documents[(
+        "platform_wallets",
+        "club-chip-giveaway-reserve",
+        "transactions",
+        "club-new-club-initial-grant",
+    )]["amount"] == 10000
 
     assert not repository.create_club("new-club", "Changed Name", "owner-2", "platform-admin")
     assert client.documents[("clubs", "new-club", "treasury", "wallet")]["chip_balance"] == 10000
+
+
+def test_create_club_requires_preprovisioned_giveaway_reserve(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+
+    with pytest.raises(FirestoreRequiredError, match="reserve is not provisioned"):
+        repository.create_club("club-no-reserve", "No Reserve", "owner-1", "admin-1")
+
+    assert ("clubs", "club-no-reserve") not in client.documents
+    assert not any(path[0] == "platform_wallets" for path in client.documents)
 
 
 def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:
