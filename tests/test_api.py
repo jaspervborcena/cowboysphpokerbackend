@@ -49,6 +49,12 @@ class FakeHandRepository:
         self.interclub_calls: list[tuple[object, ...]] = []
         self.club_wallet_balances: dict[str, int] = {}
         self.created_clubs: list[tuple[str, str, str, str]] = []
+        self.user_profiles: dict[str, dict[str, object]] = {}
+        self.club_profiles: dict[str, dict[str, object]] = {}
+        self.agent_groups: dict[str, dict[str, object]] = {}
+        self.agent_group_keys: dict[tuple[str, str], str] = {}
+        self.agent_group_memberships: dict[str, dict[str, object]] = {}
+        self.next_player_id = 10_000_000
         self.in_play_balances: dict[str, int] = {}
         self.global_wallets: dict[str, dict[str, object]] = {}
 
@@ -72,15 +78,126 @@ class FakeHandRepository:
     def get_global_wallet(self, user_id: str) -> dict[str, object] | None:
         return self.global_wallets.get(user_id)
 
+    def ensure_user_profile(
+        self, user_id: str, username: str
+    ) -> tuple[dict[str, object], bool]:
+        profile = self.user_profiles.get(user_id)
+        if profile is not None:
+            return profile, False
+        self.next_player_id += 1
+        profile = {
+            "user_id": user_id,
+            "player_id": f"{self.next_player_id:08d}",
+            "username": username,
+        }
+        self.user_profiles[user_id] = profile
+        return profile, True
+
+    def get_user_profile_by_player_id(self, player_id: str) -> dict[str, object] | None:
+        return next(
+            (profile for profile in self.user_profiles.values() if profile["player_id"] == player_id),
+            None,
+        )
+
+    def get_club_profile(self, club_uuid: str) -> dict[str, object] | None:
+        return self.club_profiles.get(
+            club_uuid,
+            {"club_uuid": club_uuid, "club_id": club_uuid},
+        )
+
+    def create_agent_group(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        agent_player_id: str,
+        created_by: str,
+    ) -> dict[str, object] | None:
+        agent_profile = self.get_user_profile_by_player_id(agent_player_id)
+        if agent_profile is None:
+            return None
+        agent_user_id = str(agent_profile["user_id"])
+        agent_member = self.get_club_member(club_uuid, agent_user_id)
+        if agent_member is None or agent_member.get("role") != "AGENT":
+            return None
+        existing_group_id = self.agent_group_keys.get((club_uuid, agent_player_id))
+        if existing_group_id is not None:
+            return self.agent_groups[existing_group_id]
+        group = {
+            "agent_group_id": agent_group_id,
+            "club_uuid": club_uuid,
+            "club_id": club_id,
+            "agent_player_id": agent_player_id,
+            "agent_user_id": agent_user_id,
+            "acting_agent_player_id": agent_player_id,
+            "acting_agent_user_id": agent_user_id,
+            "agent_balance": 0,
+            "rakeback_balance": 0,
+            "status": "active",
+        }
+        self.agent_groups[agent_group_id] = group
+        self.agent_group_keys[(club_uuid, agent_player_id)] = agent_group_id
+        return group
+
+    def get_agent_group(self, agent_group_id: str) -> dict[str, object] | None:
+        return self.agent_groups.get(agent_group_id)
+
+    def add_agent_group_member(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        member_player_id: str,
+        assigned_by: str,
+    ) -> dict[str, object] | None:
+        group = self.agent_groups.get(agent_group_id)
+        member_profile = self.get_user_profile_by_player_id(member_player_id)
+        if group is None or member_profile is None:
+            return None
+        member_user_id = str(member_profile["user_id"])
+        member = self.get_club_member(club_uuid, member_user_id)
+        if member is None or member.get("role") != "PLAYER":
+            return None
+        membership_id = f"{agent_group_id}:{member_player_id}"
+        assignment = {
+            "membership_id": membership_id,
+            "agent_group_id": agent_group_id,
+            "club_uuid": club_uuid,
+            "club_id": club_id,
+            "member_player_id": member_player_id,
+            "member_user_id": member_user_id,
+            "status": "active",
+        }
+        self.agent_group_memberships[membership_id] = assignment
+        return assignment
+
+    def list_agent_group_members(self, agent_group_id: str) -> list[dict[str, object]]:
+        return sorted(
+            [
+                assignment
+                for assignment in self.agent_group_memberships.values()
+                if assignment["agent_group_id"] == agent_group_id
+                and assignment["status"] == "active"
+            ],
+            key=lambda assignment: str(assignment["member_player_id"]),
+        )
+
     def create_club(
         self,
+        club_uuid: str,
         club_id: str,
         name: str,
         owner_user_id: str,
         created_by: str,
-    ) -> bool:
-        self.created_clubs.append((club_id, name, owner_user_id, created_by))
-        return True
+    ) -> tuple[bool, str]:
+        owner_profile, _ = self.ensure_user_profile(owner_user_id, owner_user_id)
+        self.created_clubs.append((club_uuid, club_id, name, owner_user_id, created_by))
+        self.club_profiles[club_uuid] = {
+            "club_uuid": club_uuid,
+            "club_id": club_id,
+            "name": name,
+        }
+        return True, str(owner_profile["player_id"])
 
     def get_club_wallet_balance(self, club_id: str) -> int:
         return self.club_wallet_balances.get(club_id, 0)
@@ -372,7 +489,9 @@ def test_member_wallet_summary_separates_available_and_in_play_chips(monkeypatch
     assert response.status_code == 200
     assert response.json() == {
         "club_id": "wallet-club",
+        "club_uuid": "wallet-club",
         "user_id": "wallet-player",
+        "player_id": repository.user_profiles["wallet-player"]["player_id"],
         "role": "PLAYER",
         "currency_type": "CLUB_CHIPS",
         "available_balance": 14_600,
@@ -1017,10 +1136,84 @@ def test_current_membership_returns_authoritative_role(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "club_id": "demo",
+        "club_uuid": "demo",
         "user_id": "club-agent",
+        "player_id": repository.user_profiles["club-agent"]["player_id"],
         "username": "Name club-agent",
         "role": "AGENT",
     }
+
+
+def test_profile_ensure_returns_stable_player_id_for_authenticated_uid(monkeypatch) -> None:
+    repository = FakeHandRepository({})
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/me/profile/ensure",
+            headers={"Authorization": "Bearer valid:profile-user"},
+        )
+        retry = client.post(
+            "/me/profile/ensure",
+            headers={"Authorization": "Bearer valid:profile-user"},
+        )
+        other_user = client.post(
+            "/me/profile/ensure",
+            headers={"Authorization": "Bearer valid:other-profile-user"},
+        )
+
+    assert first.status_code == 200
+    assert first.json()["user_id"] == "profile-user"
+    assert len(first.json()["player_id"]) == 8
+    assert first.json()["created"] is True
+    assert retry.json()["player_id"] == first.json()["player_id"]
+    assert retry.json()["created"] is False
+    assert other_user.json()["player_id"] != first.json()["player_id"]
+
+
+def test_club_agent_group_creation_and_player_assignment_use_player_ids(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"club-manager": 0, "club-agent": 0, "club-player": 0},
+        {"club-manager": "MANAGER", "club-agent": "AGENT", "club-player": "PLAYER"},
+    )
+    agent_profile, _ = repository.ensure_user_profile("club-agent", "Agent")
+    player_profile, _ = repository.ensure_user_profile("club-player", "Player")
+    repository.club_profiles["club-uuid-1"] = {
+        "club_uuid": "club-uuid-1",
+        "club_id": "12345678",
+        "name": "Test Club",
+    }
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        group_response = client.post(
+            "/clubs/club-uuid-1/agent-groups",
+            json={"agent_player_id": agent_profile["player_id"]},
+            headers={"Authorization": "Bearer valid:club-manager"},
+        )
+        agent_group_id = group_response.json()["agent_group_id"]
+        assignment = client.post(
+            f"/clubs/club-uuid-1/agent-groups/{agent_group_id}/members",
+            json={"member_player_id": player_profile["player_id"]},
+            headers={"Authorization": "Bearer valid:club-manager"},
+        )
+        group_members = client.get(
+            f"/clubs/club-uuid-1/agent-groups/{agent_group_id}/members",
+            headers={"Authorization": "Bearer valid:club-manager"},
+        )
+
+    assert group_response.status_code == 201
+    assert group_response.json()["club_uuid"] == "club-uuid-1"
+    assert group_response.json()["club_id"] == "12345678"
+    assert group_response.json()["agent_player_id"] == agent_profile["player_id"]
+    assert group_response.json()["agent_balance"] == 0
+    assert group_response.json()["rakeback_balance"] == 0
+    assert assignment.status_code == 201
+    assert assignment.json()["member_player_id"] == player_profile["player_id"]
+    assert group_members.status_code == 200
+    assert [row["member_player_id"] for row in group_members.json()] == [
+        player_profile["player_id"]
+    ]
 
 
 def test_hand_replay_requires_membership_and_returns_filtered_frames(monkeypatch) -> None:
@@ -1526,23 +1719,32 @@ def test_platform_admin_creates_club_with_initial_treasury_funds(monkeypatch) ->
     configure_test_dependencies(monkeypatch, repository)
 
     with TestClient(app) as client:
+        owner_profile = client.post(
+            "/me/profile/ensure",
+            headers={"Authorization": "Bearer valid:new-owner"},
+        )
         created = client.post(
             "/platform/clubs",
-            json={"name": "New Club", "owner_user_id": "new-owner"},
+            json={"name": "New Club", "owner_player_id": owner_profile.json()["player_id"]},
             headers={"Authorization": "Bearer valid:platform-admin"},
         )
         denied = client.post(
             "/platform/clubs",
-            json={"name": "Unauthorized Club", "owner_user_id": "regular-user"},
+            json={"name": "Unauthorized Club", "owner_player_id": "12345678"},
             headers={"Authorization": "Bearer valid:regular-user"},
         )
 
     assert created.status_code == 201
+    assert created.json()["club_id"].isdigit()
+    assert len(created.json()["club_id"]) == 8
+    assert len(created.json()["club_uuid"]) == 36
     assert created.json()["treasury_balance"] == 10000
     assert created.json()["owner_user_id"] == "new-owner"
+    assert created.json()["owner_player_id"] == owner_profile.json()["player_id"]
     assert denied.status_code == 403
     assert len(repository.created_clubs) == 1
     assert repository.created_clubs[0][1:] == (
+        created.json()["club_id"],
         "New Club",
         "new-owner",
         "platform-admin",

@@ -18,8 +18,10 @@ from app.auth.roles import (
 )
 from database import (
     FirestoreRequiredError,
+    ID_ALLOCATION_ATTEMPTS,
     INITIAL_CLUB_TREASURY_FUNDS,
     WalletTransactionStatus,
+    epoch_8_digit_id,
 )
 
 
@@ -42,19 +44,59 @@ class ClubTreasuryTransferRequest(BaseModel):
 
 class CreateClubRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    owner_user_id: str = Field(min_length=1, max_length=128)
+    owner_player_id: str = Field(pattern=r"^\d{8}$")
 
 
 class ClubMembershipResponse(BaseModel):
     club_id: str
+    club_uuid: str
     user_id: str
+    player_id: str
     username: str
     role: Literal["OWNER", "MANAGER", "AGENT", "PLAYER"]
 
 
+class UserProfileResponse(BaseModel):
+    user_id: str
+    player_id: str
+    username: str
+    nickname: str | None = None
+    created: bool
+
+
+class CreateAgentGroupRequest(BaseModel):
+    agent_player_id: str = Field(pattern=r"^\d{8}$")
+
+
+class AgentGroupMemberRequest(BaseModel):
+    member_player_id: str = Field(pattern=r"^\d{8}$")
+
+
+class AgentGroupResponse(BaseModel):
+    agent_group_id: str
+    club_uuid: str
+    club_id: str
+    agent_player_id: str
+    acting_agent_player_id: str
+    agent_balance: int = Field(ge=0)
+    rakeback_balance: int = Field(ge=0)
+    status: Literal["active", "suspended"]
+
+
+class AgentGroupMemberResponse(BaseModel):
+    membership_id: str
+    agent_group_id: str
+    club_uuid: str
+    club_id: str
+    member_player_id: str
+    status: Literal["active", "removed"]
+
+
 class ClubWalletSummaryResponse(BaseModel):
     club_id: str
+    club_uuid: str
     user_id: str
+    player_id: str
     role: Literal["OWNER", "MANAGER", "AGENT", "PLAYER"]
     currency_type: Literal["CLUB_CHIPS"]
     available_balance: int = Field(ge=0)
@@ -75,8 +117,10 @@ class GlobalWalletEnsureResponse(GlobalWalletResponse):
 
 class ClubProvisionResponse(BaseModel):
     club_id: str
+    club_uuid: str
     name: str
     owner_user_id: str
+    owner_player_id: str
     treasury_balance: int = Field(ge=0)
 
 
@@ -159,19 +203,73 @@ def wallet_transaction_http_error(status: WalletTransactionStatus) -> HTTPExcept
     },
 )
 async def get_my_club_membership(
+    request: Request,
     club_id: str,
     membership: ClubMembership = Depends(get_active_club_member),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     profile = membership.profile
+    username = str(
+        profile.get("username")
+        or membership.user.display_name
+        or membership.user.uid
+    )
+    try:
+        user_profile, _ = await asyncio.to_thread(
+            request.app.state.repository.ensure_user_profile,
+            membership.user.uid,
+            username,
+        )
+        club_profile = await asyncio.to_thread(
+            request.app.state.repository.get_club_profile,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Membership profile is unavailable.") from error
+    if club_profile is None:
+        raise HTTPException(status_code=404, detail="Club not found.")
     return {
-        "club_id": club_id,
+        "club_id": str(club_profile["club_id"]),
+        "club_uuid": club_id,
         "user_id": membership.user.uid,
-        "username": str(
-            profile.get("username")
-            or membership.user.display_name
-            or membership.user.uid
-        ),
+        "player_id": str(user_profile["player_id"]),
+        "username": username,
         "role": membership.role.value,
+    }
+
+@router.post(
+    "/me/profile/ensure",
+    tags=["Membership"],
+    summary="Ensure my user profile and player ID",
+    description="Idempotently creates the authenticated user's profile and assigns a unique 8-digit player_id. Identity is derived from the verified Firebase ID token.",
+    response_model=UserProfileResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        503: error_response("User profile storage is unavailable."),
+    },
+)
+async def ensure_my_user_profile(
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    username = current_user.display_name or current_user.uid
+    try:
+        profile, created = await asyncio.to_thread(
+            request.app.state.repository.ensure_user_profile,
+            current_user.uid,
+            username,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="User profile is unavailable.") from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail="A player ID could not be allocated.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail="User profile identity conflicts with an existing record.") from error
+    return {
+        "user_id": current_user.uid,
+        "player_id": str(profile["player_id"]),
+        "username": str(profile.get("username") or username),
+        "nickname": profile.get("nickname"),
+        "created": created,
     }
 
 
@@ -189,6 +287,7 @@ async def get_my_club_membership(
     },
 )
 async def get_my_club_wallet_summary(
+    request: Request,
     club_id: str,
     membership: ClubMembership = Depends(get_active_club_member),
 ) -> dict[str, Any]:
@@ -200,9 +299,30 @@ async def get_my_club_wallet_summary(
         for value in (available, in_play)
     ):
         raise HTTPException(status_code=409, detail="Club member wallet balance is invalid.")
+    username = str(
+        profile.get("username")
+        or membership.user.display_name
+        or membership.user.uid
+    )
+    try:
+        user_profile, _ = await asyncio.to_thread(
+            request.app.state.repository.ensure_user_profile,
+            membership.user.uid,
+            username,
+        )
+        club_profile = await asyncio.to_thread(
+            request.app.state.repository.get_club_profile,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Wallet identity lookup is unavailable.") from error
+    if club_profile is None:
+        raise HTTPException(status_code=404, detail="Club not found.")
     return {
-        "club_id": club_id,
+        "club_id": str(club_profile["club_id"]),
+        "club_uuid": club_id,
         "user_id": membership.user.uid,
+        "player_id": str(user_profile["player_id"]),
         "role": membership.role.value,
         "currency_type": "CLUB_CHIPS",
         "available_balance": available,
@@ -306,23 +426,46 @@ async def create_club(
     if not platform_admin.platform_admin:
         raise HTTPException(status_code=403, detail="Platform administrator access is required.")
 
-    club_id = str(uuid4())
     try:
-        created = await asyncio.to_thread(
-            request.app.state.repository.create_club,
-            club_id,
-            create_request.name,
-            create_request.owner_user_id,
-            platform_admin.uid,
+        owner_profile = await asyncio.to_thread(
+            request.app.state.repository.get_user_profile_by_player_id,
+            create_request.owner_player_id,
         )
     except (FirestoreRequiredError, GoogleAPICallError) as error:
-        raise HTTPException(status_code=503, detail="Club provisioning is unavailable.") from error
+        raise HTTPException(status_code=503, detail="Owner profile lookup is unavailable.") from error
+    if owner_profile is None:
+        raise HTTPException(status_code=404, detail="Club owner player was not found.")
+
+    club_uuid = str(uuid4())
+    owner_user_id = str(owner_profile["user_id"])
+    created = False
+    club_id = ""
+    owner_player_id = create_request.owner_player_id
+    for allocation_attempt in range(ID_ALLOCATION_ATTEMPTS):
+        club_id = epoch_8_digit_id(allocation_attempt)
+        try:
+            created, owner_player_id = await asyncio.to_thread(
+                request.app.state.repository.create_club,
+                club_uuid,
+                club_id,
+                create_request.name,
+                owner_user_id,
+                platform_admin.uid,
+            )
+        except (FirestoreRequiredError, GoogleAPICallError) as error:
+            raise HTTPException(status_code=503, detail="Club provisioning is unavailable.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail="Club provisioning could not be completed.") from error
+        if created:
+            break
     if not created:
-        raise HTTPException(status_code=409, detail="Club ID already exists; retry the request.")
+        raise HTTPException(status_code=503, detail="A unique club ID could not be allocated.")
     return {
         "club_id": club_id,
+        "club_uuid": club_uuid,
         "name": create_request.name,
-        "owner_user_id": create_request.owner_user_id,
+        "owner_user_id": owner_user_id,
+        "owner_player_id": owner_player_id,
         "treasury_balance": INITIAL_CLUB_TREASURY_FUNDS,
     }
 
@@ -515,3 +658,163 @@ async def claim_back_club_chips(
         "to_user_id": operator_id,
         "status": status.value,
     }
+
+
+@router.post(
+    "/clubs/{club_id}/agent-groups",
+    status_code=201,
+    tags=["Club membership"],
+    summary="Create an agent group",
+    description="Creates one club-scoped agent group for an active AGENT identified by player_id. The operational balance and rakeback balance start at zero and are separate.",
+    response_model=AgentGroupResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("An active OWNER or MANAGER membership is required."),
+        404: error_response("Club or active agent membership not found."),
+        409: error_response("An agent group already exists for this club and agent."),
+        503: error_response("Agent group storage is unavailable."),
+    },
+)
+async def create_agent_group(
+    request: Request,
+    club_id: str,
+    body: CreateAgentGroupRequest,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    try:
+        club = await asyncio.to_thread(
+            request.app.state.repository.get_club_profile,
+            club_id,
+        )
+        if club is None:
+            raise HTTPException(status_code=404, detail="Club not found.")
+        group = await asyncio.to_thread(
+            request.app.state.repository.create_agent_group,
+            club_id,
+            str(club["club_id"]),
+            str(uuid4()),
+            body.agent_player_id,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Agent group storage is unavailable.") from error
+    if group is None:
+        raise HTTPException(status_code=404, detail="Active AGENT membership not found.")
+    return group
+
+
+@router.get(
+    "/clubs/{club_id}/agent-groups/{agent_group_id}",
+    tags=["Club membership"],
+    summary="Get an agent group",
+    response_model=AgentGroupResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("The caller is not authorized for this agent group."),
+        404: error_response("Agent group not found."),
+        503: error_response("Agent group storage is unavailable."),
+    },
+)
+async def get_agent_group(
+    request: Request,
+    club_id: str,
+    agent_group_id: str,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER, ClubRole.AGENT}:
+        raise HTTPException(status_code=403, detail="An OWNER, MANAGER, or assigned AGENT role is required.")
+    try:
+        group = await asyncio.to_thread(
+            request.app.state.repository.get_agent_group,
+            agent_group_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Agent group storage is unavailable.") from error
+    if group is None or group.get("club_uuid") != club_id:
+        raise HTTPException(status_code=404, detail="Agent group not found.")
+    if membership.role is ClubRole.AGENT and group.get("acting_agent_user_id") != membership.user.uid:
+        raise HTTPException(status_code=403, detail="The caller is not the acting agent for this group.")
+    return group
+
+
+@router.post(
+    "/clubs/{club_id}/agent-groups/{agent_group_id}/members",
+    status_code=201,
+    tags=["Club membership"],
+    summary="Assign a player to an agent group",
+    response_model=AgentGroupMemberResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("An active OWNER or MANAGER membership is required."),
+        404: error_response("Club, group, or active PLAYER membership not found."),
+        503: error_response("Agent group membership storage is unavailable."),
+    },
+)
+async def add_agent_group_member(
+    request: Request,
+    club_id: str,
+    agent_group_id: str,
+    body: AgentGroupMemberRequest,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    try:
+        group = await asyncio.to_thread(
+            request.app.state.repository.get_agent_group,
+            agent_group_id,
+        )
+        if group is None or group.get("club_uuid") != club_id:
+            raise HTTPException(status_code=404, detail="Agent group not found.")
+        assignment = await asyncio.to_thread(
+            request.app.state.repository.add_agent_group_member,
+            club_id,
+            str(group["club_id"]),
+            agent_group_id,
+            body.member_player_id,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Agent group membership storage is unavailable.") from error
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Active PLAYER membership not found.")
+    return assignment
+
+
+@router.get(
+    "/clubs/{club_id}/agent-groups/{agent_group_id}/members",
+    tags=["Club membership"],
+    summary="List players assigned to an agent group",
+    response_model=list[AgentGroupMemberResponse],
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("The caller is not authorized for this agent group."),
+        404: error_response("Agent group not found."),
+        503: error_response("Agent group membership storage is unavailable."),
+    },
+)
+async def list_agent_group_members(
+    request: Request,
+    club_id: str,
+    agent_group_id: str,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> list[dict[str, Any]]:
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER, ClubRole.AGENT}:
+        raise HTTPException(status_code=403, detail="An OWNER, MANAGER, or assigned AGENT role is required.")
+    try:
+        group = await asyncio.to_thread(
+            request.app.state.repository.get_agent_group,
+            agent_group_id,
+        )
+        if group is None or group.get("club_uuid") != club_id:
+            raise HTTPException(status_code=404, detail="Agent group not found.")
+        if membership.role is ClubRole.AGENT and group.get("acting_agent_user_id") != membership.user.uid:
+            raise HTTPException(status_code=403, detail="The caller is not the acting agent for this group.")
+        return await asyncio.to_thread(
+            request.app.state.repository.list_agent_group_members,
+            agent_group_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Agent group membership storage is unavailable.") from error

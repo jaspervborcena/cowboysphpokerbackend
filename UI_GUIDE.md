@@ -70,6 +70,17 @@ The backend does not provide a player-initiated cash-out request/approval workfl
 
 The same person may have both agent and player roles, but current balances are not separate by role. The wallet-dashboard fixture remains a conceptual composite, not a single API response; label its data as mock and use the live routes for real balances and club-chip movements.
 
+### Membership and club provisioning API
+
+Use the Wallet API base URL and send `Authorization: Bearer <id_token>` on both requests. Do not send a user ID for membership lookup; the server derives it from the verified token.
+
+| Operation | Request and parameters | Authorization | Response / behavior |
+| --- | --- | --- | --- |
+| Get my membership | `GET /clubs/{club_id}/members/me`; path `club_id` is currently the club UUID (`club_uuid`), despite the route parameter name. No query parameters or body. | Active club membership. | `200`: `club_id` (8-digit business ID), `club_uuid`, Firebase UID `user_id`, 8-digit `player_id`, `username`, and authoritative `role`. `401` for invalid credentials; `403` if not an active member; `404` if the club is missing. |
+| Create a club | `POST /platform/clubs`; no path or query parameters. JSON body: `name` (1-100 characters) and `owner_player_id` (exactly 8 digits). | Firebase ID token with trusted `platform_admin: true` claim. | `201`: generated `club_id` (8-digit business ID), `club_uuid`, `name`, resolved `owner_user_id` (Firebase UID), `owner_player_id`, and `treasury_balance` (10,000). `404` if the owner player ID is unknown; `403` if caller is not a platform admin. This is a trusted bootstrap operation, not a player-facing create-club flow. |
+
+For club REST paths that currently take `{club_id}`, pass the UUID returned as `club_uuid`, not the 8-digit business `club_id`. The server returns both identifiers so the UI can keep operational routing and public display/search identities distinct. Platform provisioning has no idempotency key; do not blindly retry after an ambiguous timeout.
+
 Proposed UI mock shape (not a current API response):
 
 ```typescript
@@ -111,7 +122,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 ## Session and Permissions
 
 1. Get the signed-in Firebase user's ID token when making a request. Send it on protected REST calls as `Authorization: Bearer <id_token>`.
-2. Call `GET /clubs/{club_id}/members/me` on the Wallet API and use the returned `role`, `username`, and `user_id` to render the session and available controls. Load the member's balances separately from `GET /clubs/{club_id}/members/me/wallet`.
+2. Call `GET /clubs/{club_id}/members/me` on the Wallet API using the club UUID in the current path parameter. Use the returned `role`, `username`, `user_id`, `player_id`, `club_id`, and `club_uuid` to render the session and identify the club. Load member balances separately from `GET /clubs/{club_id}/members/me/wallet`.
 3. Treat the role as read-only. The server authorizes every operation from the verified Firebase identity and active membership; never trust a role, user ID, or permission supplied by the UI.
 4. On `40101`, refresh/re-authenticate with Firebase and retry a safe read. On `40301`, show an access-denied state and do not repeatedly retry.
 

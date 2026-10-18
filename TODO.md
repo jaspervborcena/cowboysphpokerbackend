@@ -85,7 +85,18 @@ The client implementation checklist lives in [UI_GUIDE.md](UI_GUIDE.md); API req
 
 ## Security, Economy, and Operations
 
-- [ ] Define Firestore wallet accounts for `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, `CLUB_AGENT`, `CLUB_PLAYER`, and table escrow, with explicit owners, scopes, and currency types.
+- [ ] Implement server-authoritative membership and moderation lifecycle APIs: manager may demote agents to players and kick players; owners may kick managers; union leaders may suspend/remove union clubs and close clubs after a grace period. Enforce hand-safe kicks, deny play and manager/agent claim-backs while suspended, preserve records on closure, and audit actor/reason/time.
+- [ ] Define club plans with 1-10 star levels and plan-specific member limits (including 5,000-member and unlimited tiers); enforce capacity on admission and require at least 3 stars before linking a club to a union. Define plan-downgrade behavior when current membership exceeds the new limit.
+- [ ] Separate club identifiers: keep `clubs/{club_uuid}` UUID-keyed, allocate and return a collision-safe 8-digit business `club_id`, and use `club_uuid` in operational REST/local-WebSocket paths. Add a flat `club_id_index/{club_id}` mapping for public search, invitations, and union-socket home-club resolution. Test uniqueness, lookup, invalid IDs, and authorization; do not add `/v2` routes.
+- [ ] Define and implement `users/{user_id}` as the Firebase-UID-keyed profile with a server-assigned unique 8-digit `player_id`; add a collision-safe player-ID lookup/index for invitation resolution, expose both IDs through authenticated APIs, and enforce profile ownership without treating IDs as credentials.
+- [ ] Add club invitation/join APIs that target members by 8-digit `player_id`, derive the joining `user_id` from Firebase auth, and accept an optional 8-digit `agent_player_id` for referral/agent assignment. Validate the agent's club role and authorization server-side; migrate current UID-valued `agent_id` references without trusting client-provided UIDs.
+- [ ] Define and implement same-location enforcement for ring games: when a location match is confirmed between an ordinary player and a VIP, remove the ordinary player. Keep VIP priority separate from authorization roles; define location threshold/accuracy, equal-priority handling, consent/privacy/retention, hand-boundary behavior, and server-side verification before enforcement.
+- [ ] Model club-scoped `agent_groups/{agent_group_id}` with both `club_uuid` and `club_id`, original `agent_player_id`, current acting-agent ID, operational `agent_balance`, and separate `rakeback_balance`; store each assigned player in a separate flat membership document. Update balances only through server-side ledger transactions and preserve group membership/rakeback across manager takeover and restoration.
+- [ ] Define Firestore wallet accounts for `DIAMONDS`, `GLOBAL_PLAYMONEY`, `CLUB_TREASURY`, `CLUB_AGENT`, `CLUB_PLAYER`, and table escrow, with explicit owners, scopes, and currency types.
+- [ ] Keep new Firestore business records flat and small, using top-level documents with reference IDs instead of embedded child objects, arrays of ledger/member records, or deep paths. Respect Firestore's fixed 1 MiB document limit; existing nested paths require an explicit migration rather than an implicit rename.
+- [ ] Add a separate `DIAMONDS` currency for player and club accounts, with server-verified card/GCash purchases, idempotent payment and ledger records, and explicit rules for player/club transfers, refunds, and chargebacks.
+- [ ] Define a server-owned Diamond catalog and atomic spending flows for VIP/Black VIP, avatars, card protection, emojis, table themes, club creation/plan upgrades, club chips (example 200 Diamonds for 100,000 chips), and additional global play-money chips; define item duration, pricing, and permitted conversions without merging currency balances.
+- [ ] Add player inventory/entitlement records and purchase/transfer APIs for Diamonds; never grant currency or paid items from client-provided balances or unverified payment callbacks.
 - [ ] Support one Firebase identity as both an `AGENT` and a `PLAYER` with separate club-scoped agent-operating and personal-player wallets/ledgers. Define role grants, transfer boundaries, idempotency, and audit rules; never merge these balances.
 - [x] On new account creation, provision a persistent `GLOBAL_PLAYMONEY` wallet and grant exactly 20,000 play-money chips once through trusted server-side provisioning. The implementation uses a reserve-backed debit and records accounting rows; never expose an arbitrary client-controlled grant amount or mix it with club accounts.
 - [x] Confirm the club treasury grant path as a reserve-backed 10,000-chip initial grant that creates club-owned treasury state without creating an owner personal balance. Preserve distinct account scopes and audit records.
@@ -97,14 +108,17 @@ The client implementation checklist lives in [UI_GUIDE.md](UI_GUIDE.md); API req
 - [ ] Test cutoff boundaries, delayed/retried expiration jobs, active-hand handling, and recovery when the service is unavailable at the cutoff.
 - [ ] Validate platform club owner UIDs and add request idempotency to prevent duplicate initial grants.
 - [ ] Review authorization for every REST route, WebSocket action, table, union, and administrative operation.
+- [ ] Standardize Firestore ownership/audit fields on new and migrated business records: Firebase UID `user_id` where user-owned, server timestamps `created_at`/`updated_at`, and actor UIDs `created_by`/`updated_by`. Keep immutable ledger/audit records creation-only; migrate existing records before rules require these fields.
+- [ ] Implement a shared trace/event envelope with `trace_id`, request/action/transaction IDs, actor/target and scope IDs, event type, outcome, source service, and server timestamp. Correlate REST, WebSocket, Pub/Sub, and worker operations; write structured events to Google Cloud Logging and export selected events asynchronously to partitioned/clustered BigQuery tables. Do not write generic logs to Firestore; keep authoritative financial ledger records in Firestore transactions. Define redaction, retention, access controls, cost limits, and tests.
 - [ ] Restrict Cloud Run ingress and manage/rotate `WORKER_COORDINATION_TOKEN` through the deployment secret manager; the application bearer-token gate is implemented.
 - [ ] Add an idempotent player cash-out request/approval API and define/test seat exit, rebuy/top-up, external payout/refund, and reconciliation before treating club balances as a complete money ledger.
 - [ ] Add Firestore schema versions, access rules/indexes, emulator-backed transaction tests, and backup/restore drills.
 - [ ] Add per-table metrics (mailbox depth, action latency, timer drift, lease renewals), alerts, rate limits, and deployment/rollback checks.
 
-## Later Game Scope
+## Next Game Scope After NLH
 
-- [ ] Next game-engine sequence: validate PLO4 first, then PLO5 and PLO6 as separate configurations; preserve Omaha's exact-two-hole/exact-three-board rule and keep each variant unavailable until verified.
+- [x] NLH is the implemented and create-supported baseline.
+- [ ] Validate PLO4, PLO5, and PLO6 as separate configurations; preserve Omaha's exact-two-hole/exact-three-board rule and keep each variant unavailable until verified.
 - [ ] Build Tongits as a separate engine with its own state, actions, meld evaluation, and scoring.
-- [ ] Deferred until after PLO4/PLO5/PLO6: add tournament registration, an authoritative tournament clock, blind-level commands, eliminations, table balancing, prize settlement, and recovery as a separate domain service.
+- [ ] After PLO4, PLO5, PLO6, and Tongits: add tournament registration, an authoritative tournament clock, blind-level commands, eliminations, table balancing, prize settlement, and recovery as a separate domain service.
 - [ ] Keep unverified games unavailable even if the game catalog lists them.

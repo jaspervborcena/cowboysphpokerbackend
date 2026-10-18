@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from enum import StrEnum
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,12 @@ from google.cloud import firestore
 
 INITIAL_CLUB_TREASURY_FUNDS = 10_000
 INITIAL_GLOBAL_PLAYMONEY_FUNDS = 20_000
+ID_ALLOCATION_ATTEMPTS = 128
+
+
+def epoch_8_digit_id(offset: int = 0) -> str:
+    epoch_seconds = int(time.time())
+    return f"{10_000_000 + ((epoch_seconds + offset) % 90_000_000):08d}"
 
 
 class BuyInStatus(StrEnum):
@@ -196,6 +203,14 @@ class NullHandRepository:
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, Any], bool]:
         raise FirestoreRequiredError("Firestore must be enabled to provision a global wallet.")
 
+    def ensure_user_profile(
+        self, user_id: str, username: str
+    ) -> tuple[dict[str, Any], bool]:
+        raise FirestoreRequiredError("Firestore must be enabled to provision a user profile.")
+
+    def get_user_profile_by_player_id(self, player_id: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to resolve a player ID.")
+
     def get_global_wallet(self, user_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load a global wallet.")
 
@@ -204,12 +219,42 @@ class NullHandRepository:
 
     def create_club(
         self,
+        club_uuid: str,
         club_id: str,
         name: str,
         owner_user_id: str,
         created_by: str,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         raise FirestoreRequiredError("Firestore must be enabled to create a club.")
+
+    def create_agent_group(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        agent_player_id: str,
+        created_by: str,
+    ) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to create an agent group.")
+
+    def get_club_profile(self, club_uuid: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load a club profile.")
+
+    def get_agent_group(self, agent_group_id: str) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load an agent group.")
+
+    def add_agent_group_member(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        member_player_id: str,
+        assigned_by: str,
+    ) -> dict[str, Any] | None:
+        raise FirestoreRequiredError("Firestore must be enabled to assign an agent-group member.")
+
+    def list_agent_group_members(self, agent_group_id: str) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled to list agent-group members.")
 
     def transfer_between_club_wallets(
         self,
@@ -979,14 +1024,104 @@ class FirestoreHandRepository:
             return None
         return snapshot.to_dict() or {}
 
+    def ensure_user_profile(
+        self, user_id: str, username: str
+    ) -> tuple[dict[str, Any], bool]:
+        profile_ref = self._client.collection("users").document(user_id)
+        player_indexes = self._client.collection("player_id_index")
+
+        for offset in range(ID_ALLOCATION_ATTEMPTS):
+            candidate_player_id = epoch_8_digit_id(offset)
+            index_ref = player_indexes.document(candidate_player_id)
+            transaction = self._client.transaction()
+
+            @firestore.transactional
+            def commit(transaction: Any) -> tuple[dict[str, Any], bool] | None:
+                profile_snapshot = profile_ref.get(transaction=transaction)
+                profile = profile_snapshot.to_dict() or {}
+                if profile_snapshot.exists and profile.get("player_id"):
+                    existing_player_id = str(profile["player_id"])
+                    existing_index_ref = player_indexes.document(existing_player_id)
+                    existing_index = existing_index_ref.get(transaction=transaction)
+                    if existing_index.exists:
+                        index_data = existing_index.to_dict() or {}
+                        if index_data.get("user_id") != user_id:
+                            raise ValueError("Existing player_id is assigned to another user.")
+                    else:
+                        transaction.set(
+                            existing_index_ref,
+                            {
+                                "player_id": existing_player_id,
+                                "user_id": user_id,
+                                "created_at": firestore.SERVER_TIMESTAMP,
+                            },
+                        )
+                    return profile, False
+
+                index_snapshot = index_ref.get(transaction=transaction)
+                if index_snapshot.exists:
+                    index_data = index_snapshot.to_dict() or {}
+                    if index_data.get("user_id") == user_id:
+                        return profile, False
+                    return None
+
+                profile_data = {
+                    **profile,
+                    "user_id": user_id,
+                    "player_id": candidate_player_id,
+                    "username": username,
+                    "created_at": profile.get("created_at", firestore.SERVER_TIMESTAMP),
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                    "created_by": profile.get("created_by", user_id),
+                    "updated_by": user_id,
+                }
+                transaction.set(profile_ref, profile_data, merge=True)
+                transaction.set(
+                    index_ref,
+                    {
+                        "player_id": candidate_player_id,
+                        "user_id": user_id,
+                        "created_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                return profile_data, True
+
+            result = commit(transaction)
+            if result is not None:
+                return result
+
+        raise RuntimeError("Could not allocate a unique 8-digit player_id.")
+
+    def get_user_profile_by_player_id(self, player_id: str) -> dict[str, Any] | None:
+        index_snapshot = (
+            self._client.collection("player_id_index").document(player_id).get()
+        )
+        if not index_snapshot.exists:
+            return None
+        index_data = index_snapshot.to_dict() or {}
+        user_id = index_data.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            return None
+        profile_snapshot = self._client.collection("users").document(user_id).get()
+        if not profile_snapshot.exists:
+            return None
+        profile = profile_snapshot.to_dict() or {}
+        if profile.get("player_id") != player_id:
+            return None
+        return profile
+
     def create_club(
         self,
+        club_uuid: str,
         club_id: str,
         name: str,
         owner_user_id: str,
         created_by: str,
-    ) -> bool:
-        club_ref = self._client.collection("clubs").document(club_id)
+    ) -> tuple[bool, str]:
+        owner_profile, _ = self.ensure_user_profile(owner_user_id, owner_user_id)
+        owner_player_id = str(owner_profile["player_id"])
+        club_ref = self._client.collection("clubs").document(club_uuid)
+        club_index_ref = self._client.collection("club_id_index").document(club_id)
         owner_ref = club_ref.collection("members").document(owner_user_id)
         wallet_ref = club_ref.collection("treasury").document("wallet")
         initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
@@ -996,8 +1131,9 @@ class FirestoreHandRepository:
         @firestore.transactional
         def commit(transaction: Any) -> bool:
             club_snapshot = club_ref.get(transaction=transaction)
-            if club_snapshot.exists:
-                return False
+            club_index_snapshot = club_index_ref.get(transaction=transaction)
+            if club_snapshot.exists or club_index_snapshot.exists:
+                return False, owner_player_id
 
             reserve_snapshot = reserve_ref.get(transaction=transaction)
             reserve_wallet = reserve_snapshot.to_dict() or {}
@@ -1015,18 +1151,34 @@ class FirestoreHandRepository:
             transaction.set(
                 club_ref,
                 {
+                    "club_uuid": club_uuid,
                     "club_id": club_id,
                     "name": name,
                     "status": "active",
                     "owner_user_id": owner_user_id,
+                    "owner_player_id": owner_player_id,
                     "created_by": created_by,
                     "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                club_index_ref,
+                {
+                    "club_id": club_id,
+                    "club_uuid": club_uuid,
+                    "name": name,
+                    "status": "active",
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "created_by": created_by,
                 },
             )
             transaction.set(
                 owner_ref,
                 {
                     "user_id": owner_user_id,
+                    "player_id": owner_player_id,
+                    "club_uuid": club_uuid,
+                    "club_id": club_id,
                     "role": "OWNER",
                     "status": "active",
                     "chip_balance": 0,
@@ -1061,6 +1213,7 @@ class FirestoreHandRepository:
                     "from_wallet_type": "PLATFORM_RESERVE",
                     "to_wallet_type": "CLUB_TREASURY",
                     "to_club_id": club_id,
+                    "to_club_uuid": club_uuid,
                     "amount": INITIAL_CLUB_TREASURY_FUNDS,
                     "performed_by": created_by,
                     "note": "Initial club treasury funding",
@@ -1068,9 +1221,193 @@ class FirestoreHandRepository:
                     "reserve_balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                 },
             )
-            return True
+            return True, owner_player_id
 
         return commit(transaction)
+
+    def create_agent_group(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        agent_player_id: str,
+        created_by: str,
+    ) -> dict[str, Any] | None:
+        agent_profile = self.get_user_profile_by_player_id(agent_player_id)
+        if agent_profile is None:
+            return None
+        agent_user_id = str(agent_profile["user_id"])
+        club_ref = self._client.collection("clubs").document(club_uuid)
+        agent_member_ref = club_ref.collection("members").document(agent_user_id)
+        group_ref = self._client.collection("agent_groups").document(agent_group_id)
+        group_index_id = f"{club_uuid}_{agent_player_id}"
+        group_index_ref = self._client.collection("agent_group_index").document(group_index_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> dict[str, Any] | None:
+            club_snapshot = club_ref.get(transaction=transaction)
+            member_snapshot = agent_member_ref.get(transaction=transaction)
+            group_index_snapshot = group_index_ref.get(transaction=transaction)
+            if not club_snapshot.exists or not member_snapshot.exists:
+                return None
+            club = club_snapshot.to_dict() or {}
+            member = member_snapshot.to_dict() or {}
+            if club.get("club_id") != club_id:
+                return None
+            if str(member.get("role", "")).upper() != "AGENT" or member.get("status") != "active":
+                return None
+
+            if group_index_snapshot.exists:
+                index_data = group_index_snapshot.to_dict() or {}
+                existing_group_id = index_data.get("agent_group_id")
+                if not isinstance(existing_group_id, str) or not existing_group_id:
+                    return None
+                existing_group_ref = self._client.collection("agent_groups").document(
+                    existing_group_id
+                )
+                existing_group_snapshot = existing_group_ref.get(transaction=transaction)
+                existing_group = existing_group_snapshot.to_dict() or {}
+                if (
+                    existing_group_snapshot.exists
+                    and existing_group.get("club_uuid") == club_uuid
+                    and existing_group.get("agent_player_id") == agent_player_id
+                ):
+                    return existing_group
+                return None
+
+            group = {
+                "agent_group_id": agent_group_id,
+                "club_uuid": club_uuid,
+                "club_id": club_id,
+                "agent_player_id": agent_player_id,
+                "agent_user_id": agent_user_id,
+                "acting_agent_player_id": agent_player_id,
+                "acting_agent_user_id": agent_user_id,
+                "agent_balance": 0,
+                "rakeback_balance": 0,
+                "status": "active",
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "created_by": created_by,
+                "updated_by": created_by,
+            }
+            transaction.set(group_ref, group)
+            transaction.set(
+                group_index_ref,
+                {
+                    "agent_group_id": agent_group_id,
+                    "club_uuid": club_uuid,
+                    "club_id": club_id,
+                    "agent_player_id": agent_player_id,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.update(
+                agent_member_ref,
+                {
+                    "agent_group_id": agent_group_id,
+                    "agent_player_id": agent_player_id,
+                    "agent_id": agent_user_id,
+                },
+            )
+            return group
+
+        return commit(transaction)
+
+    def get_club_profile(self, club_uuid: str) -> dict[str, Any] | None:
+        snapshot = self._client.collection("clubs").document(club_uuid).get()
+        if not snapshot.exists:
+            return None
+        club = snapshot.to_dict() or {}
+        club["club_uuid"] = club_uuid
+        return club
+
+    def get_agent_group(self, agent_group_id: str) -> dict[str, Any] | None:
+        snapshot = self._client.collection("agent_groups").document(agent_group_id).get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict() or {}
+
+    def add_agent_group_member(
+        self,
+        club_uuid: str,
+        club_id: str,
+        agent_group_id: str,
+        member_player_id: str,
+        assigned_by: str,
+    ) -> dict[str, Any] | None:
+        member_profile = self.get_user_profile_by_player_id(member_player_id)
+        if member_profile is None:
+            return None
+        member_user_id = str(member_profile["user_id"])
+        club_ref = self._client.collection("clubs").document(club_uuid)
+        group_ref = self._client.collection("agent_groups").document(agent_group_id)
+        member_ref = club_ref.collection("members").document(member_user_id)
+        membership_id = hashlib.sha256(
+            f"{club_uuid}:{member_player_id}".encode("utf-8")
+        ).hexdigest()
+        assignment_ref = self._client.collection("agent_group_memberships").document(
+            membership_id
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> dict[str, Any] | None:
+            group_snapshot = group_ref.get(transaction=transaction)
+            member_snapshot = member_ref.get(transaction=transaction)
+            assignment_snapshot = assignment_ref.get(transaction=transaction)
+            if not group_snapshot.exists or not member_snapshot.exists:
+                return None
+            group = group_snapshot.to_dict() or {}
+            member = member_snapshot.to_dict() or {}
+            if (
+                group.get("club_uuid") != club_uuid
+                or group.get("club_id") != club_id
+                or group.get("status") != "active"
+                or member.get("status") != "active"
+                or str(member.get("role", "")).upper() != "PLAYER"
+            ):
+                return None
+            if assignment_snapshot.exists:
+                existing = assignment_snapshot.to_dict() or {}
+                return existing if existing.get("agent_group_id") == agent_group_id else None
+
+            assignment = {
+                "membership_id": membership_id,
+                "agent_group_id": agent_group_id,
+                "club_uuid": club_uuid,
+                "club_id": club_id,
+                "member_player_id": member_player_id,
+                "member_user_id": member_user_id,
+                "status": "active",
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "created_by": assigned_by,
+            }
+            transaction.set(assignment_ref, assignment)
+            transaction.update(
+                member_ref,
+                {
+                    "agent_id": group["acting_agent_user_id"],
+                    "agent_group_id": agent_group_id,
+                    "agent_player_id": group["agent_player_id"],
+                },
+            )
+            return assignment
+
+        return commit(transaction)
+
+    def list_agent_group_members(self, agent_group_id: str) -> list[dict[str, Any]]:
+        snapshots = self._client.collection("agent_group_memberships").stream()
+        return sorted(
+            [
+                snapshot.to_dict() or {}
+                for snapshot in snapshots
+                if (snapshot.to_dict() or {}).get("agent_group_id") == agent_group_id
+                and (snapshot.to_dict() or {}).get("status") == "active"
+            ],
+            key=lambda assignment: str(assignment.get("member_player_id", "")),
+        )
 
     def get_club_wallet_balance(self, club_id: str) -> int:
         wallet_ref = (
@@ -1302,19 +1639,69 @@ class FirestoreHandRepository:
             sender = sender_snapshot.to_dict() or {}
             recipient = recipient_snapshot.to_dict() or {}
             role = str(sender.get("role", "")).upper()
+            recipient_role = str(recipient.get("role", "")).upper()
             if role not in {"OWNER", "MANAGER", "AGENT"}:
                 return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
             if role == "AGENT" and recipient.get("agent_id") != sender_user_id:
                 return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
 
-            balance = sender.get("chip_balance", 0)
+            sender_group_ref = None
+            sender_group = None
+            if role == "AGENT":
+                agent_group_id = sender.get("agent_group_id")
+                if not isinstance(agent_group_id, str) or not agent_group_id:
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+                sender_group_ref = self._client.collection("agent_groups").document(agent_group_id)
+                sender_group_snapshot = sender_group_ref.get(transaction=transaction)
+                sender_group = sender_group_snapshot.to_dict() or {}
+                if (
+                    not sender_group_snapshot.exists
+                    or sender_group.get("status") != "active"
+                    or sender_group.get("acting_agent_user_id") != sender_user_id
+                    or sender_group.get("club_uuid") != club_id
+                ):
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+
+            recipient_group_ref = None
+            recipient_group = None
+            if recipient_role == "AGENT":
+                recipient_group_id = recipient.get("agent_group_id")
+                if not isinstance(recipient_group_id, str) or not recipient_group_id:
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+                recipient_group_ref = self._client.collection("agent_groups").document(recipient_group_id)
+                recipient_group_snapshot = recipient_group_ref.get(transaction=transaction)
+                recipient_group = recipient_group_snapshot.to_dict() or {}
+                if (
+                    not recipient_group_snapshot.exists
+                    or recipient_group.get("status") != "active"
+                    or recipient_group.get("club_uuid") != club_id
+                ):
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+
+            balance = (
+                sender_group.get("agent_balance", 0)
+                if sender_group is not None
+                else sender.get("chip_balance", 0)
+            )
             if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
                 return WalletTransactionStatus.INVALID_BALANCE
             if balance < amount:
                 return WalletTransactionStatus.INSUFFICIENT_BALANCE
 
-            transaction.update(sender_ref, {"chip_balance": firestore.Increment(-amount)})
-            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            if sender_group_ref is not None:
+                transaction.update(
+                    sender_group_ref,
+                    {"agent_balance": firestore.Increment(-amount), "updated_at": firestore.SERVER_TIMESTAMP},
+                )
+            else:
+                transaction.update(sender_ref, {"chip_balance": firestore.Increment(-amount)})
+            if recipient_group_ref is not None:
+                transaction.update(
+                    recipient_group_ref,
+                    {"agent_balance": firestore.Increment(amount), "updated_at": firestore.SERVER_TIMESTAMP},
+                )
+            else:
+                transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
             transaction.set(
                 ledger_ref,
                 {
@@ -1325,6 +1712,8 @@ class FirestoreHandRepository:
                     "from_user_id": sender_user_id,
                     "to_user_id": recipient_user_id,
                     "performed_by": performed_by,
+                    "from_agent_group_id": sender_group.get("agent_group_id") if sender_group else None,
+                    "to_agent_group_id": recipient_group.get("agent_group_id") if recipient_group else None,
                     "note": note,
                     "timestamp": firestore.SERVER_TIMESTAMP,
                 },
@@ -1375,6 +1764,23 @@ class FirestoreHandRepository:
             if role == "AGENT" and player.get("agent_id") != recipient_user_id:
                 return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
 
+            recipient_group_ref = None
+            recipient_group = None
+            if role == "AGENT":
+                agent_group_id = recipient.get("agent_group_id")
+                if not isinstance(agent_group_id, str) or not agent_group_id:
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+                recipient_group_ref = self._client.collection("agent_groups").document(agent_group_id)
+                recipient_group_snapshot = recipient_group_ref.get(transaction=transaction)
+                recipient_group = recipient_group_snapshot.to_dict() or {}
+                if (
+                    not recipient_group_snapshot.exists
+                    or recipient_group.get("status") != "active"
+                    or recipient_group.get("acting_agent_user_id") != recipient_user_id
+                    or recipient_group.get("club_uuid") != club_id
+                ):
+                    return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
+
             balance = player.get("chip_balance", 0)
             in_play = player.get("in_play_balance", 0)
             if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (balance, in_play)):
@@ -1385,7 +1791,13 @@ class FirestoreHandRepository:
                 return WalletTransactionStatus.INSUFFICIENT_BALANCE
 
             transaction.update(player_ref, {"chip_balance": firestore.Increment(-amount)})
-            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            if recipient_group_ref is not None:
+                transaction.update(
+                    recipient_group_ref,
+                    {"agent_balance": firestore.Increment(amount), "updated_at": firestore.SERVER_TIMESTAMP},
+                )
+            else:
+                transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
             transaction.set(
                 ledger_ref,
                 {
@@ -1396,6 +1808,7 @@ class FirestoreHandRepository:
                     "from_user_id": player_user_id,
                     "to_user_id": recipient_user_id,
                     "performed_by": performed_by,
+                    "to_agent_group_id": recipient_group.get("agent_group_id") if recipient_group else None,
                     "note": note,
                     "timestamp": firestore.SERVER_TIMESTAMP,
                 },

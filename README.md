@@ -316,6 +316,6 @@ For the opt-in WebSocket routing implementation, set `PUBSUB_ROUTING_ENABLED=tru
 ### Later
 
 - Close remaining security and economy gaps: owner-UID validation, idempotent platform club provisioning, full authorization review, cash-out/refund/reconciliation policy, and operational monitoring.
-- Prioritize verified PLO4, then PLO5 and PLO6, as separate engine milestones; preserve Omaha's exact-two-hole/exact-three-board rule. Tournament registration, scheduling, and balancing are deferred until after those variants and belong in a separate service, not hand rules. Keep unverified games unavailable.
+- NLH is the current create-supported baseline. Next, validate PLO4, PLO5, PLO6, then Tongits as separate engine milestones; preserve Omaha's exact-two-hole/exact-three-board rule for PLO. Defer tournament registration, scheduling, balancing, and settlement until after those games; keep tournament authority in a separate service and unverified games unavailable.
 
 For Union table provisioning, endpoint flows, and shared settlement behavior, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).

@@ -328,6 +328,7 @@ def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
 
 def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    monkeypatch.setattr(hand_repository.time, "time", lambda: 1_700_000_000)
     client = FakeFirestoreClient({
         ("platform_wallets", "global-playmoney-reserve"): {
             "wallet_id": "global-playmoney-reserve",
@@ -338,15 +339,52 @@ def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
     })
     repository = FirestoreHandRepository(client)
 
-    assert repository.create_club("club-42", "Test Club", "owner-1", "admin-1") is True
+    created, owner_player_id = repository.create_club(
+        "club-uuid-42", "12345678", "Test Club", "owner-1", "admin-1"
+    )
+    assert created is True
+    assert len(owner_player_id) == 8
 
-    treasury_path = ("clubs", "club-42", "treasury", "wallet")
-    initial_grant_path = ("clubs", "club-42", "transactions", "initial-funding")
+    club_path = ("clubs", "club-uuid-42")
+    index_path = ("club_id_index", "12345678")
+    treasury_path = ("clubs", "club-uuid-42", "treasury", "wallet")
+    initial_grant_path = ("clubs", "club-uuid-42", "transactions", "initial-funding")
     reserve_path = ("platform_wallets", "global-playmoney-reserve")
+    assert client.documents[club_path]["club_id"] == "12345678"
+    assert client.documents[club_path]["club_uuid"] == "club-uuid-42"
+    assert client.documents[index_path]["club_uuid"] == "club-uuid-42"
     assert client.documents[treasury_path]["chip_balance"] == 10_000
     assert client.documents[initial_grant_path]["amount"] == 10_000
     assert client.documents[initial_grant_path]["from_wallet_id"] == "global-playmoney-reserve"
     assert client.documents[reserve_path]["chip_balance"] == 990_000
+
+
+def test_ensure_user_profile_allocates_unique_player_id_and_is_idempotent(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    monkeypatch.setattr(hand_repository.time, "time", lambda: 1_700_000_000)
+    first_player_id = hand_repository.epoch_8_digit_id()
+    second_player_id = hand_repository.epoch_8_digit_id(1)
+    client = FakeFirestoreClient({
+        ("player_id_index", first_player_id): {
+            "player_id": first_player_id,
+            "user_id": "existing-user",
+        }
+    })
+    repository = FirestoreHandRepository(client)
+
+    profile, created = repository.ensure_user_profile("new-user", "New Player")
+    retried_profile, retried_created = repository.ensure_user_profile(
+        "new-user", "New Player"
+    )
+    resolved_profile = repository.get_user_profile_by_player_id(second_player_id)
+
+    assert created is True
+    assert retried_created is False
+    assert profile["player_id"] == second_player_id
+    assert retried_profile["player_id"] == second_player_id
+    assert profile["user_id"] == "new-user"
+    assert resolved_profile == profile
+    assert client.documents[("player_id_index", second_player_id)]["user_id"] == "new-user"
 
 
 def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
@@ -713,21 +751,123 @@ def test_send_out_is_double_entry_idempotent_and_limited_to_agent_downline(monke
     sender = ("clubs", "club-1", "members", "agent-1")
     player = ("clubs", "club-1", "members", "player-1")
     other_player = ("clubs", "club-1", "members", "player-2")
+    agent_group = ("agent_groups", "group-1")
     client = FakeFirestoreClient(
         {
-            sender: {"role": "AGENT", "chip_balance": 1000},
+            sender: {"role": "AGENT", "status": "active", "agent_id": "agent-1", "agent_group_id": "group-1", "chip_balance": 1000},
             player: {"role": "PLAYER", "agent_id": "agent-1", "chip_balance": 100},
             other_player: {"role": "PLAYER", "agent_id": "agent-2", "chip_balance": 100},
+            agent_group: {
+                "agent_group_id": "group-1",
+                "club_uuid": "club-1",
+                "club_id": "club-public-1",
+                "agent_player_id": "12345678",
+                "acting_agent_user_id": "agent-1",
+                "agent_balance": 1000,
+                "rakeback_balance": 75,
+                "status": "active",
+            },
         }
     )
     repository = FirestoreHandRepository(client)
 
     assert repository.send_out_club_chips("club-1", "agent-1", "player-1", 250, "tx-1", "agent-1") == WalletTransactionStatus.COMPLETED
-    assert client.documents[sender]["chip_balance"] == 750
+    assert client.documents[sender]["chip_balance"] == 1000
+    assert client.documents[agent_group]["agent_balance"] == 750
+    assert client.documents[agent_group]["rakeback_balance"] == 75
     assert client.documents[player]["chip_balance"] == 350
     assert repository.send_out_club_chips("club-1", "agent-1", "player-1", 250, "tx-1", "agent-1") == WalletTransactionStatus.IDEMPOTENT_REPLAY
     assert repository.send_out_club_chips("club-1", "agent-1", "player-2", 250, "tx-2", "agent-1") == WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
-    assert client.documents[sender]["chip_balance"] == 750
+    assert client.documents[agent_group]["agent_balance"] == 750
+
+
+def test_agent_claim_back_credits_group_operating_balance_without_touching_rakeback(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    player = ("clubs", "club-1", "members", "player-1")
+    agent = ("clubs", "club-1", "members", "agent-1")
+    agent_group = ("agent_groups", "group-1")
+    client = FakeFirestoreClient(
+        {
+            player: {"role": "PLAYER", "status": "active", "agent_id": "agent-1", "chip_balance": 500, "in_play_balance": 0},
+            agent: {"role": "AGENT", "status": "active", "agent_group_id": "group-1", "chip_balance": 900},
+            agent_group: {
+                "agent_group_id": "group-1",
+                "club_uuid": "club-1",
+                "club_id": "12345678",
+                "acting_agent_user_id": "agent-1",
+                "agent_balance": 200,
+                "rakeback_balance": 65,
+                "status": "active",
+            },
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    result = repository.claim_back_club_chips(
+        "club-1", "player-1", "agent-1", 100, "claim-1", "agent-1"
+    )
+
+    assert result is WalletTransactionStatus.COMPLETED
+    assert client.documents[player]["chip_balance"] == 400
+    assert client.documents[agent_group]["agent_balance"] == 300
+    assert client.documents[agent_group]["rakeback_balance"] == 65
+    assert client.documents[agent]["chip_balance"] == 900
+
+
+def test_agent_group_and_flat_member_assignment_are_scoped_and_idempotent(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_uuid = "club-uuid-1"
+    club_id = "12345678"
+    agent_user_id = "agent-user"
+    player_user_id = "player-user"
+    agent_player_id = "11112222"
+    member_player_id = "33334444"
+    client = FakeFirestoreClient(
+        {
+            ("clubs", club_uuid): {"club_uuid": club_uuid, "club_id": club_id},
+            ("clubs", club_uuid, "members", agent_user_id): {
+                "user_id": agent_user_id,
+                "player_id": agent_player_id,
+                "role": "AGENT",
+                "status": "active",
+                "chip_balance": 300,
+            },
+            ("clubs", club_uuid, "members", player_user_id): {
+                "user_id": player_user_id,
+                "player_id": member_player_id,
+                "role": "PLAYER",
+                "status": "active",
+                "chip_balance": 100,
+            },
+            ("users", agent_user_id): {"user_id": agent_user_id, "player_id": agent_player_id},
+            ("users", player_user_id): {"user_id": player_user_id, "player_id": member_player_id},
+            ("player_id_index", agent_player_id): {"user_id": agent_user_id},
+            ("player_id_index", member_player_id): {"user_id": player_user_id},
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    group = repository.create_agent_group(
+        club_uuid, club_id, "group-1", agent_player_id, "manager-user"
+    )
+    assignment = repository.add_agent_group_member(
+        club_uuid, club_id, "group-1", member_player_id, "manager-user"
+    )
+    retry_assignment = repository.add_agent_group_member(
+        club_uuid, club_id, "group-1", member_player_id, "manager-user"
+    )
+
+    assert group is not None
+    assert group["club_uuid"] == club_uuid
+    assert group["club_id"] == club_id
+    assert group["agent_balance"] == 0
+    assert group["rakeback_balance"] == 0
+    assert assignment is not None
+    assert retry_assignment == assignment
+    assert len(repository.list_agent_group_members("group-1")) == 1
+    assert client.documents[("agent_group_index", f"{club_uuid}_{agent_player_id}")]["agent_group_id"] == "group-1"
+    assert client.documents[("clubs", club_uuid, "members", agent_user_id)]["agent_group_id"] == "group-1"
+    assert client.documents[("clubs", club_uuid, "members", player_user_id)]["agent_player_id"] == agent_player_id
 
 
 def test_claim_back_rejects_in_play_balance_and_transfers_available_chips(monkeypatch) -> None:
@@ -817,27 +957,42 @@ def test_inter_club_treasury_transfer_rejects_unauthorized_and_insufficient_fund
 
 def test_create_club_grants_initial_treasury_funds_once(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    monkeypatch.setattr(hand_repository.time, "time", lambda: 1_700_000_000)
     client = FakeFirestoreClient({})
     repository = FirestoreHandRepository(client)
 
-    assert repository.create_club("new-club", "New Club", "owner-1", "platform-admin")
+    club_uuid = "new-club-uuid"
+    club_id = "76543210"
+    created, owner_player_id = repository.create_club(
+        club_uuid, club_id, "New Club", "owner-1", "platform-admin"
+    )
+    assert created is True
+    assert owner_player_id == client.documents[("users", "owner-1")]["player_id"]
 
-    assert client.documents[("clubs", "new-club")]["owner_user_id"] == "owner-1"
-    assert client.documents[("clubs", "new-club", "members", "owner-1")] == {
+    assert client.documents[("clubs", club_uuid)]["owner_user_id"] == "owner-1"
+    assert client.documents[("clubs", club_uuid)]["club_id"] == club_id
+    owner_player_id = client.documents[("users", "owner-1")]["player_id"]
+    assert client.documents[("clubs", club_uuid, "members", "owner-1")] == {
         "user_id": "owner-1",
+        "player_id": owner_player_id,
+        "club_uuid": club_uuid,
+        "club_id": club_id,
         "role": "OWNER",
         "status": "active",
         "chip_balance": 0,
         "in_play_balance": 0,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
-    assert client.documents[("clubs", "new-club", "treasury", "wallet")] == {
+    assert client.documents[("clubs", club_uuid, "treasury", "wallet")] == {
         "chip_balance": 10000
     }
-    assert client.documents[("clubs", "new-club", "transactions", "initial-funding")]["amount"] == 10000
+    assert client.documents[("clubs", club_uuid, "transactions", "initial-funding")]["amount"] == 10000
 
-    assert not repository.create_club("new-club", "Changed Name", "owner-2", "platform-admin")
-    assert client.documents[("clubs", "new-club", "treasury", "wallet")]["chip_balance"] == 10000
+    retried, _ = repository.create_club(
+        club_uuid, club_id, "Changed Name", "owner-2", "platform-admin"
+    )
+    assert retried is False
+    assert client.documents[("clubs", club_uuid, "treasury", "wallet")]["chip_balance"] == 10000
 
 
 def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:

@@ -1,6 +1,6 @@
 # API and WebSocket Contract
 
-This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. The economy keeps club-managed chips separate from global non-cash play money. Global-wallet provisioning and reads, club-member wallet summaries, and some club-chip flows are implemented; global-play-money tables and transfers between global and club balances are not. This is an initial authorization layer, not a complete production security review.
+This guide describes the endpoints and messages currently implemented for a UI client. Protected REST routes require a Firebase ID token; table sockets require it in an initial authentication message. Club and union membership are verified server-side. Club chips are the only currency used to buy into or play at club tables, including tables shared through a union; a union-table buy-in is debited from the player's selected home-club balance. Diamonds and global play money are separate currencies and cannot be used directly for club gameplay. Global-wallet provisioning and reads, club-member wallet summaries, and some club-chip flows are implemented; global-play-money tables and transfers between global and club balances are not. This is an initial authorization layer, not a complete production security review.
 
 Realtime gameplay is websocket-based. The app protocol for table state and player actions is the WebSocket connection; it is not gRPC. The gRPC dependency is only part of the Google Cloud Firebase/Firestore client stack used for auth and optional persistence.
 
@@ -60,14 +60,22 @@ Validation errors use `status: "fail"` and may include safe field names in `erro
 
 REST request validation currently returns HTTP `400`; authentication, authorization, not-found, conflict, and service failures retain their corresponding HTTP status. The numeric code is the stable application identifier.
 
+### Generic logs and tracing
+
+Use the shared event envelope defined in [FIRESTORE_UI_SCHEMA.md](FIRESTORE_UI_SCHEMA.md) for traceable events: `event_id`, `event_type`, server `created_at`, `created_by`/`user_id`, applicable actor/target and scope IDs, `trace_id`, `request_id`/`action_id`/`transaction_id`, `source_service`, `outcome`, and optional `error_code`/`duration_ms`. Generate a `trace_id` at request or socket-action ingress, include it in structured logs and error responses, and propagate it through Pub/Sub/worker calls. Never accept actor IDs or timestamps from an untrusted client.
+
+Do not write generic logs or audit events to Firestore. Emit structured JSON to Google Cloud Logging and export selected events asynchronously to BigQuery. BigQuery is for analysis/reporting, not the synchronous transaction or authorization path. Keep Firestore wallet/club transaction records as authoritative business state, atomically committed with balance changes; these are not diagnostic logs. The current implementation logs errors with trace IDs but does not yet provide uniform success-event tracing. Do not log credentials, full request bodies, payment secrets, raw GPS coordinates, private cards, or deck state. Define retention and access controls before enabling broad tracing.
+
 ## UI Integration Flow
 
 For a step-by-step UI implementation guide with current v1 action IDs, heartbeat handling, safe errors, and reconnect guidance, see [UI_GUIDE.md](UI_GUIDE.md).
 
 Use the signed-in Firebase user's ID token for every protected REST request and for each new table WebSocket connection. The backend derives `user_id` and role from that verified token and the active Firestore membership; do not send a user ID in the socket URL or use the UI's selected role as authorization.
 
+For new Firestore business records, use `user_id` for a user-owned document and server-managed `created_at`, `updated_at`, `created_by`, and `updated_by` audit fields. API handlers must derive user/actor IDs from the verified token and timestamps from the server, not accept them as trusted request values. Immutable ledger/audit records use creation metadata only. Firestore Rules must validate ownership and authorization; these fields alone do not grant access.
+
 1. After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to create the user's initial global play-money wallet if it does not exist. This is an explicit API call, not an automatic Firebase Auth trigger. Use `GET /me/wallets/global-playmoney` to refresh it later.
-2. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name, and `GET /clubs/{club_id}/members/me/wallet` to load that membership's available and in-play club-chip balances.
+2. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name, and `GET /clubs/{club_id}/members/me/wallet` to load that membership's `available_balance` and `in_play_balance`. Use `available_balance` as the spendable club-chip balance; do not read the underlying Firestore `chip_balance` directly. Use the table snapshot's seat `stack` for the balance at a specific table.
 3. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
 4. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
 5. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
@@ -93,6 +101,48 @@ All roles require active membership. Role assignment is not exposed by this API.
 
 `UNION_ADMIN` is a separate union-scoped authority, not a club role. It is assigned under `unions/{union_id}/admins/{user_id}` and does not grant extra privileges over the user's club. See [Union Tables and Settlement](#union-tables-and-settlement).
 
+### Membership invite/join identity fields (not implemented)
+
+The API does not currently expose club invitation, join, or membership-creation endpoints. For the planned flow, authenticate the request with the Firebase ID token; the backend derives `user_id` and loads the user's assigned 8-digit `player_id` from `users/{user_id}`. Public search and invitation targeting use `player_id`, not Firebase UID.
+
+An optional `agent_player_id` may be supplied during invitation or join acceptance to record the referring/assigned agent. It is the agent's 8-digit `player_id`, not a Firebase UID. The backend must verify that the ID maps to an active `AGENT` authorized for that club, then resolve it internally. Do not accept a client-supplied `user_id` as the joining user's identity, and do not send duplicate `agent_id` and `referral_id` fields. Current stored `agent_id` values are Firebase UIDs; this is a planned API contract requiring backend migration.
+
+### Role management and moderation (not implemented)
+
+The rules below are required product behavior, but the current API has no role-change, kick, suspension, or club-sanction endpoints. Current membership `status` is only checked for `active`; do not present these actions as available until the backend APIs and audit writes exist.
+
+| Actor | Allowed action | Scope / constraints |
+| --- | --- | --- |
+| Club `MANAGER` | Change an `AGENT` to `PLAYER`; manage assigned players; kick a `PLAYER` | Do not interrupt an active hand. Apply the kick after the hand finishes, or immediately when the player is not in a hand. |
+| Club `OWNER` | Kick a `MANAGER` | Same hand-safe rule. Preserve the member and financial audit history; do not erase balances. |
+| Union `UNION_ADMIN` (union leader) | Suspend a violating club, remove it from the union, or close it globally after the suspension/grace period | Suspension blocks play. Managers and agents cannot claim chips back while the club is suspended. Closure must preserve financial and moderation audit records. |
+
+Agent role changes must preserve the agent's referral/rakeback group. Keep a stable agent-group identity (based on the agent's `player_id`) and its accumulated rakeback; do not transfer or reset that balance during a temporary manager takeover. Record the manager as the temporary acting operator for that same group. If the original agent returns, restore the assignment to the same group. Rakeback is not automatically paid to players; it remains available for an authorized manual chip send-out.
+
+These actions need server-authoritative authorization, reason and actor audit fields, idempotent requests, and explicit lifecycle states. A member kick requested during a hand must remain pending until the hand ends; a suspended club must reject new table access and block manager/agent claim-back operations. Club closure is an access/lifecycle action, not deletion of wallet, ledger, or hand-history records. Endpoint paths and exact lifecycle field names remain to be designed with the backend implementation; the UI must not write these states directly to Firestore.
+
+### Same-location ring-game enforcement (not implemented)
+
+For ring games, the product rule is to remove players detected at the same location, applying player priority when deciding whom to remove. If an ordinary player and a VIP player match, remove the ordinary player and allow the VIP to remain. `VIP` is a player priority classification, not a club authorization role. This rule does not apply to tournaments unless separately specified.
+
+The backend currently has no GPS collection, location request, VIP classification, or location-based enforcement. Before implementation, define the location-match distance/accuracy threshold, behavior when both players have equal priority, consent and platform permission requirements, and how a match detected during a hand is applied. Do not persist raw coordinates longer than required; retain only the minimum auditable enforcement decision. Enforcement must be server-authoritative and must not rely on client-supplied VIP status.
+
+### Club plans, member capacity, and union eligibility (not implemented)
+
+Clubs have a plan-based star level from 1 to 10. The plan determines the maximum number of club members; a 10-star club may have a 5,000-member limit or unlimited capacity depending on its plan, so the UI must display the backend-provided limit rather than infer it from the star level. A club must have at least 3 stars to be eligible to join a union. The backend must enforce both the member limit when admitting members and the star threshold when linking a club to a union; UI checks are display-only.
+
+The current API and Firestore model do not expose club stars, plans, member capacity, or union-eligibility checks. The exact plan-to-capacity mapping and whether a plan can change while a club exceeds its new limit remain to be defined before implementation. Existing union-club provisioning is union-admin controlled; the minimum-star rule must be validated server-side when creating or changing that link.
+
+The intended product ID format is an 8-digit business `club_id`, matching the planned 8-digit `player_id`. Keep Firestore documents keyed by UUID as `clubs/{club_uuid}` and use `club_uuid` for authenticated club REST paths and local WebSocket paths; these routes can address the Firestore document directly. Use the 8-digit `club_id` for public search and invitations, backed by a flat `club_id_index/{club_id}` record that maps to `club_uuid`. Union sockets resolve the player's home `club_id` through that index during authentication. `POST /platform/clubs` generates and returns both IDs. No `/v2` route is needed. Current backend behavior still accepts UUID-valued `club_id` parameters until this contract is implemented. IDs are references, not authorization; routes must still verify the authenticated user's membership and permissions.
+
+### Diamonds, purchases, and premium items (not implemented)
+
+Diamonds are a separate premium digital currency for players and clubs. They may be purchased through supported payment methods such as cards or GCash, and may be tradable between allowed player/club accounts once transfer rules are defined. Diamonds must never be combined with `GLOBAL_PLAYMONEY` or `CLUB_CHIPS` balances.
+
+Planned diamond spending includes VIP and Black VIP entitlements, avatars, card-protection effects, emojis, table themes, club creation/plan upgrades, club-chip purchases, and additional global play-money chips. One example conversion is 200 Diamonds for 100,000 club chips; this is an example price, not a current or hard-coded API rate. Club chips are the only currency usable for club or union-table gameplay. Diamonds cannot be used as a table stack or buy-in; a player must first complete a permitted Diamond-to-club-chip conversion, and union-table buy-ins still debit the player's home club's chip balance. The backend must own the product catalog, current prices, eligibility, and atomic purchase/conversion rules.
+
+Payment providers must confirm settlement server-side before Diamonds are credited. Purchase requests and callbacks need idempotency, provider-reference validation, refund/chargeback handling, and auditable ledger entries; clients must never directly set a Diamond balance or grant an item. The API currently has no Diamond wallet, payment, transfer, catalog, entitlement, or currency-conversion endpoints. Transferability boundaries, pricing, VIP durations, and refund behavior remain to be specified before implementation.
+
 ### Get my membership
 
 `GET /clubs/{club_id}/members/me`
@@ -101,14 +151,16 @@ Requires a valid Firebase ID token and active membership. Response `200`:
 
 ```json
 {
-  "club_id": "demo",
-  "user_id": "player-a",
+  "club_id": "87654321",
+  "club_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "firebase-user-id",
+  "player_id": "12345678",
   "username": "joppy2024",
   "role": "PLAYER"
 }
 ```
 
-The `role` value is authoritative and is always one of the four role IDs listed above.
+`user_id` is the Firebase Auth UID; `player_id` is the member's 8-digit business ID. `club_uuid` identifies the club's Firestore document, while `club_id` is its 8-digit business ID. The `role` value is authoritative and is always one of the four role IDs listed above.
 
 Invalid/missing REST credentials return `401`; a valid Firebase user who is not an active club member returns `403`.
 
@@ -159,22 +211,24 @@ Request:
 ```json
 {
   "name": "New Club",
-  "owner_user_id": "firebase-user-id"
+  "owner_player_id": "12345678"
 }
 ```
 
-The endpoint returns `201` with the generated club ID, name, owner ID, and initial treasury balance:
+`owner_player_id` must identify an existing user profile. The server resolves it to the owner's Firebase UID; clients do not choose or submit `owner_user_id`. If no profile has that player ID, the endpoint returns `404`. The endpoint returns `201` with both generated club IDs, the resolved owner IDs, and the initial treasury balance:
 
 ```json
 {
-  "club_id": "generated-club-id",
+  "club_id": "87654321",
+  "club_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "name": "New Club",
   "owner_user_id": "firebase-user-id",
+  "owner_player_id": "12345678",
   "treasury_balance": 10000
 }
 ```
 
-It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, debits the platform reserve, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
+It creates an active `OWNER` membership for the resolved owner, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, debits the platform reserve, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The `club_uuid` is generated as the Firestore document ID and `club_id` is a collision-checked 8-digit business ID. There is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
 
 Implementation note: global-wallet grants and club treasury grants currently debit the same platform-reserve record, while their destination currencies remain `GLOBAL_PLAYMONEY` and `CLUB_CHIPS`, respectively. This platform-internal funding behavior does not define a user-facing conversion rate or allow users to transfer between those wallet types.
 

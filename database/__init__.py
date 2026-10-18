@@ -2,6 +2,7 @@ from database.hand_repository import (
     BuyInStatus,
     FirestoreHandRepository,
     FirestoreRequiredError,
+    ID_ALLOCATION_ATTEMPTS,
     INITIAL_CLUB_TREASURY_FUNDS,
     NullHandRepository,
     TableActionCommitResult,
@@ -10,6 +11,7 @@ from database.hand_repository import (
     TableLeaseExpiredError,
     WalletTransactionStatus,
     create_hand_repository,
+    epoch_8_digit_id,
     table_action_fingerprint,
 )
 from database.ledger import (
@@ -25,6 +27,7 @@ __all__ = [
     "ClubWalletLedger",
     "FirestoreHandRepository",
     "FirestoreRequiredError",
+    "ID_ALLOCATION_ATTEMPTS",
     "GlobalWalletLedger",
     "INITIAL_CLUB_TREASURY_FUNDS",
     "NullHandRepository",
@@ -37,5 +40,6 @@ __all__ = [
     "WalletTransactionStatus",
     "calculate_hand_settlement_finances",
     "create_hand_repository",
+    "epoch_8_digit_id",
     "table_action_fingerprint",
 ]
