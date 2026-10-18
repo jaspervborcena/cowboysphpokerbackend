@@ -9,6 +9,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Implement separate currency-scoped reserves for global play-money grants and 10,000-chip club-creation giveaways, with atomic debit, destination credit, and ledger logging.
 - [x] Add self-service `POST /clubs`: derive the owner from the Firebase UID and grant 10,000 `CLUB_CHIPS` from the pre-provisioned giveaway reserve.
 - [x] Provision the production `CLUB_CHIPS` giveaway reserve with a 1,000,000,000-chip opening allocation and audit record.
+- [x] Refresh the Firebase architecture diagram statuses for the current single-process runtime, implemented checkpoint primitive, and separate global/club-chip reserves; keep unfinished scaling and recovery components marked as targets.
 - [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records; operations with stable transaction IDs are retry-idempotent.
 - [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
