@@ -67,14 +67,15 @@ For a step-by-step UI implementation guide with current v1 action IDs, heartbeat
 Use the signed-in Firebase user's ID token for every protected REST request and for each new table WebSocket connection. The backend derives `user_id` and role from that verified token and the active Firestore membership; do not send a user ID in the socket URL or use the UI's selected role as authorization.
 
 1. After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to create the user's initial global play-money wallet if it does not exist. This is an explicit API call, not an automatic Firebase Auth trigger. Use `GET /me/wallets/global-playmoney` to refresh it later.
-2. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name, and `GET /clubs/{club_id}/members/me/wallet` to load that membership's available and in-play club-chip balances.
-3. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
-4. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
-5. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
-6. As `PLAYER`, buy in locally with `POST /clubs/{club_id}/tables/{table_id}/seats`, or into a union table with `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats`. The union seat request debits the selected home club's member balance. Generate one UUID for `buy_in_id`; retain and reuse it only when retrying that same purchase.
-7. Connect to `/ws/table/{club_id}/{table_id}` for a local table, or `/ws/union/{union_id}/{table_id}` for a shared table. Send the Firebase token first; union auth also includes the player's verified home-club selection. Wait for `authenticated` and then render the player-specific snapshot.
-8. Start local hands with the club endpoint or shared hands with the union endpoint. Send game actions over the socket and replace the UI state with each complete snapshot.
-9. Use the snapshot's `hand_id` for replay. Local hands use `/clubs/{club_id}/hands/{hand_id}/replay`; union hands use `/unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`.
+2. When the player creates a club, call `POST /clubs`; the authenticated UID becomes `OWNER` and the club receives 10,000 `CLUB_CHIPS` from the giveaway reserve. Use the returned `club_id` for club requests.
+3. Call `GET /clubs/{club_id}/members/me` to load the server-assigned club role and display name, and `GET /clubs/{club_id}/members/me/wallet` to load that membership's available and in-play club-chip balances.
+4. Call `GET /clubs/{club_id}/tables` and `GET /clubs/{club_id}/unions` to populate the separate Club Tables and Union Tables lobby tabs.
+5. For a shared lobby, call `GET /clubs/{club_id}/unions/{union_id}/tables`. A club must be an active member of that union.
+6. As `OWNER` or `MANAGER`, create a local table with `POST /clubs/{club_id}/tables/{table_id}`. Only `UNION_ADMIN` can create/start/delete union tables.
+7. As `PLAYER`, buy in locally with `POST /clubs/{club_id}/tables/{table_id}/seats`, or into a union table with `POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats`. The union seat request debits the selected home club's member balance. Generate one UUID for `buy_in_id`; retain and reuse it only when retrying that same purchase.
+8. Connect to `/ws/table/{club_id}/{table_id}` for a local table, or `/ws/union/{union_id}/{table_id}` for a shared table. Send the Firebase token first; union auth also includes the player's verified home-club selection. Wait for `authenticated` and then render the player-specific snapshot.
+9. Start local hands with the club endpoint or shared hands with the union endpoint. Send game actions over the socket and replace the UI state with each complete snapshot.
+10. Use the snapshot's `hand_id` for replay. Local hands use `/clubs/{club_id}/hands/{hand_id}/replay`; union hands use `/unions/{union_id}/hands/{hand_id}/replay?club_id={club_id}`.
 
 The Angular client reads Firebase configuration from `window.__COWBOYS_FIREBASE_CONFIG__`; the host must provide that configuration and establish a signed-in user before protected API calls can succeed. The demo `player-a` ID alone cannot authenticate. Local CORS defaults allow `http://localhost:4200` and `http://127.0.0.1:4200`. Set `CORS_ALLOWED_ORIGINS` to a comma-separated exact-origin allowlist in each deployment.
 
@@ -89,7 +90,17 @@ Membership roles are `OWNER` (Club owner), `MANAGER` (Manager), `AGENT` (Agent),
 | `AGENT` | Send chips to and claim chips back from assigned downline members, subject to the agent's available balance. |
 | `PLAYER` | Buy in, take a seat, and connect to play. |
 
-All roles require active membership. Role assignment is not exposed by this API.
+All roles require active membership. Owners and managers can list active club members with `GET /clubs/{club_id}/members` and administer roles with `POST /clubs/{club_id}/members/{user_id}/role`. Role changes are club-scoped, transactional, and audited; the actor UID always comes from the verified Firebase token.
+
+Promotion and demotion policy:
+
+| Actor | Allowed transitions |
+| --- | --- |
+| `OWNER` | `PLAYER` to `AGENT` or `MANAGER`; `AGENT` to `MANAGER`; `MANAGER` to `AGENT` or `PLAYER`; `AGENT` to `PLAYER`. |
+| `MANAGER` | `PLAYER` or `AGENT` to `MANAGER`; `MANAGER` to `AGENT` or `PLAYER`; `AGENT` to `PLAYER`. |
+| `AGENT` / `PLAYER` | Cannot change roles. |
+
+No actor can change their own role, assign `OWNER`, or change the current club owner's role. The member directory returns only `user_id`, `username`, and role for active members; it does not expose balances.
 
 `UNION_ADMIN` is a separate union-scoped authority, not a club role. It is assigned under `unions/{union_id}/admins/{user_id}` and does not grant extra privileges over the user's club. See [Union Tables and Settlement](#union-tables-and-settlement).
 
@@ -111,6 +122,48 @@ Requires a valid Firebase ID token and active membership. Response `200`:
 The `role` value is authoritative and is always one of the four role IDs listed above.
 
 Invalid/missing REST credentials return `401`; a valid Firebase user who is not an active club member returns `403`.
+
+### List active club members
+
+`GET /clubs/{club_id}/members`
+
+Requires an active `OWNER` or `MANAGER` membership. It returns active members only, with no wallet or balance fields. This directory is intended for the role-management UI.
+
+Response `200`:
+
+```json
+[
+  {"user_id":"player-a","username":"Alice","role":"PLAYER"},
+  {"user_id":"agent-a","username":"Bob","role":"AGENT"}
+]
+```
+
+### Change a club member role
+
+`POST /clubs/{club_id}/members/{user_id}/role`
+
+Requires an active `OWNER` or `MANAGER` membership. The server determines the actor from the Firebase token and enforces the transition matrix above inside the Firestore transaction. The request cannot choose the actor or set `OWNER`.
+
+Request:
+
+```json
+{"role":"MANAGER","transaction_id":"00000000-0000-0000-0000-000000000123"}
+```
+
+Response `200`:
+
+```json
+{
+  "club_id":"club-a",
+  "user_id":"player-a",
+  "previous_role":"PLAYER",
+  "role":"MANAGER",
+  "transaction_id":"00000000-0000-0000-0000-000000000123",
+  "status":"completed"
+}
+```
+
+Each successful change updates the member document and writes `clubs/{club_id}/role_changes/{transaction_id}` atomically. Reuse the same transaction ID only to retry the same actor, target, and target role; conflicting reuse returns `409`. Self-changes and unauthorized transitions return `403`; inactive targets return `409`; missing targets return `404`.
 
 ### Wallet summaries
 
@@ -150,6 +203,54 @@ Response `200`:
 
 `created` is `false` when the wallet already existed. `GET /me/wallets/global-playmoney` reads the authenticated user's wallet without creating one; it returns the same wallet fields except `created`. Missing wallet returns `404`; invalid stored balance returns `409`; invalid/missing credentials return `401`; unavailable Firestore returns `503`. These endpoints never accept a client-supplied user ID or grant amount. User global play money cannot be converted to or transferred into club chips, and global-table gameplay is not implemented.
 
+### Self-service club creation
+
+`POST /clubs` requires a valid Firebase ID token. Any signed-in user can create a club. The server generates the club ID and uses the token's verified UID as the sole initial `OWNER`; the request does not accept an owner ID or role. In the same Firestore transaction, it creates the club, owner membership, and treasury with an initial 10,000 `CLUB_CHIPS` grant from the pre-provisioned `platform_wallets/club-chip-giveaway-reserve`. The reserve is provisioned with 1,000,000,000 chips and an `OPENING_BALANCE` record at `platform_wallets/club-chip-giveaway-reserve/transactions/initial-allocation`. Club creation never recreates a missing reserve; if it is absent or underfunded, the request fails without creating the club. This is separate from global play-money, and the client must not issue or credit the chips itself.
+
+Request:
+
+```json
+{"name":"Friday Poker Club"}
+```
+
+Response `201`:
+
+```json
+{
+  "club_id": "generated-club-id",
+  "name": "Friday Poker Club",
+  "owner_user_id": "firebase-uid",
+  "treasury_balance": 10000
+}
+```
+
+UI example:
+
+```typescript
+const user = getAuth(app).currentUser;
+if (!user) throw new Error("Sign in first");
+
+const response = await fetch(`${walletApiBase}/clubs`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${await user.getIdToken()}`,
+  },
+  body: JSON.stringify({ name: clubName }),
+});
+if (!response.ok) throw new Error("Could not create club");
+
+const club: {
+  club_id: string;
+  name: string;
+  owner_user_id: string;
+  treasury_balance: number;
+} = await response.json();
+// Display club.treasury_balance, then use club.club_id for membership and lobby requests.
+```
+
+The creator is an `OWNER` only in this club; this does not assign a global administrator role or change their membership in other clubs. The club transaction `clubs/{club_id}/transactions/initial-funding` records the grant, and `platform_wallets/club-chip-giveaway-reserve/transactions/club-{club_id}-initial-grant` records the matching reserve debit and remaining balance. These two entries are written atomically. The `GLOBAL_PLAYMONEY` reserve and global wallet ledger are not used for this grant. This endpoint has no request idempotency key and each successful request creates a new club and grant; disable repeated submissions while a request is pending and do not blindly retry after a timeout. The separate platform-admin endpoint below remains available for creating a club on behalf of another owner.
+
 ### Platform club provisioning
 
 `POST /platform/clubs` requires a valid Firebase ID token with the trusted custom claim `platform_admin: true`. The claim must be assigned through a trusted Firebase Admin process; this API does not allow users to grant themselves platform-admin access.
@@ -174,9 +275,9 @@ The endpoint returns `201` with the generated club ID, name, owner ID, and initi
 }
 ```
 
-It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, debits the platform reserve, and writes an `INITIAL_GRANT` audit entry atomically. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
+It creates an active `OWNER` membership for `owner_user_id`, initializes the shared treasury wallet with exactly 10,000 `CLUB_CHIPS`, debits the `CLUB_CHIPS` giveaway reserve at `platform_wallets/club-chip-giveaway-reserve`, and writes an `INITIAL_GRANT` audit entry atomically. The giveaway reserve is separate from the `GLOBAL_PLAYMONEY` reserve used for global play-money wallets. The grant is not added to the owner's personal balance. Existing clubs are not funded by this endpoint. The API currently does not verify that `owner_user_id` belongs to an existing Firebase Auth user, so the platform admin must supply the correct UID. Club IDs are generated for each request and there is no request idempotency key; a retry after an ambiguous timeout can create another club and another grant. Do not blindly retry a request whose outcome is unknown.
 
-Implementation note: global-wallet grants and club treasury grants currently debit the same platform-reserve record, while their destination currencies remain `GLOBAL_PLAYMONEY` and `CLUB_CHIPS`, respectively. This platform-internal funding behavior does not define a user-facing conversion rate or allow users to transfer between those wallet types.
+Global-wallet grants debit the `GLOBAL_PLAYMONEY` reserve; platform-funded club-creation giveaways debit the separate `CLUB_CHIPS` giveaway reserve. The two reserve balances and their audit records are accounted for independently; this does not allow users to transfer between global play money and club chips.
 
 ### Club wallet transfers
 

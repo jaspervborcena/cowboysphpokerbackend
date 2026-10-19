@@ -8,7 +8,9 @@ from google.cloud import firestore
 
 from database import (
     BuyInStatus,
+    FirestoreRequiredError,
     FirestoreHandRepository,
+    RoleChangeStatus,
     TableActionCommitStatus,
     TableLeaseConflictError,
     TableLeaseExpiredError,
@@ -19,9 +21,10 @@ from database import hand_repository
 
 
 class FakeSnapshot:
-    def __init__(self, data: dict[str, Any] | None) -> None:
+    def __init__(self, data: dict[str, Any] | None, document_id: str | None = None) -> None:
         self._data = data
         self.exists = data is not None
+        self.id = document_id
 
     def to_dict(self) -> dict[str, Any] | None:
         return dict(self._data) if self._data is not None else None
@@ -55,7 +58,7 @@ class FakeCollectionReference:
 
     def stream(self) -> list[FakeSnapshot]:
         return [
-            FakeSnapshot(data)
+            FakeSnapshot(data, path[-1])
             for path, data in self.client.documents.items()
             if path[:-1] == self.path
         ]
@@ -170,6 +173,141 @@ def test_buy_in_debits_balance_reserves_seat_and_is_idempotent(monkeypatch) -> N
     assert client.documents[member_path]["chip_balance"] == 600
 
 
+@pytest.mark.parametrize(
+    ("actor_role", "current_role", "target_role"),
+    [
+        ("OWNER", "PLAYER", "AGENT"),
+        ("OWNER", "PLAYER", "MANAGER"),
+        ("OWNER", "AGENT", "MANAGER"),
+        ("OWNER", "MANAGER", "AGENT"),
+        ("OWNER", "MANAGER", "PLAYER"),
+        ("OWNER", "AGENT", "PLAYER"),
+        ("MANAGER", "PLAYER", "MANAGER"),
+        ("MANAGER", "AGENT", "MANAGER"),
+        ("MANAGER", "MANAGER", "AGENT"),
+        ("MANAGER", "MANAGER", "PLAYER"),
+        ("MANAGER", "AGENT", "PLAYER"),
+    ],
+)
+def test_club_role_change_allows_policy_transitions(
+    monkeypatch,
+    actor_role: str,
+    current_role: str,
+    target_role: str,
+) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        ("clubs", club_id, "members", "actor"): {"status": "active", "role": actor_role},
+        ("clubs", club_id, "members", "target"): {"status": "active", "role": current_role},
+    })
+    repository = FirestoreHandRepository(client)
+
+    status, previous_role = repository.change_club_member_role(
+        club_id, "actor", "target", target_role, "role-change-1"
+    )
+
+    assert status is RoleChangeStatus.COMPLETED
+    assert previous_role == current_role
+    assert client.documents[("clubs", club_id, "members", "target")]["role"] == target_role
+    audit = client.documents[("clubs", club_id, "role_changes", "role-change-1")]
+    assert audit["from_role"] == current_role
+    assert audit["to_role"] == target_role
+    assert audit["performed_by"] == "actor"
+
+
+@pytest.mark.parametrize(
+    ("actor_role", "target_user_id", "current_role", "target_role", "expected"),
+    [
+        ("PLAYER", "target", "PLAYER", "AGENT", RoleChangeStatus.UNAUTHORIZED_ACTOR),
+        ("OWNER", "actor", "OWNER", "PLAYER", RoleChangeStatus.SELF_CHANGE),
+        ("MANAGER", "target", "PLAYER", "AGENT", RoleChangeStatus.INVALID_TRANSITION),
+        ("MANAGER", "owner", "OWNER", "PLAYER", RoleChangeStatus.OWNER_PROTECTED),
+    ],
+)
+def test_club_role_change_rejects_forbidden_transitions(
+    monkeypatch,
+    actor_role: str,
+    target_user_id: str,
+    current_role: str,
+    target_role: str,
+    expected: RoleChangeStatus,
+) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    members = {
+        "actor": {"status": "active", "role": actor_role},
+        "target": {"status": "active", "role": "PLAYER"},
+        "owner": {"status": "active", "role": "OWNER"},
+    }
+    members[target_user_id] = {"status": "active", "role": current_role}
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        **{
+            ("clubs", club_id, "members", user_id): member
+            for user_id, member in members.items()
+        },
+    })
+    repository = FirestoreHandRepository(client)
+
+    status, _ = repository.change_club_member_role(
+        club_id, "actor", target_user_id, target_role, "role-change-2"
+    )
+
+    assert status is expected
+    assert ("clubs", club_id, "role_changes", "role-change-2") not in client.documents
+
+
+def test_club_role_change_is_idempotent_and_detects_conflicting_reuse(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        ("clubs", club_id, "members", "owner"): {"status": "active", "role": "OWNER"},
+        ("clubs", club_id, "members", "player"): {"status": "active", "role": "PLAYER"},
+    })
+    repository = FirestoreHandRepository(client)
+    arguments = (club_id, "owner", "player", "AGENT", "role-change-3")
+
+    assert repository.change_club_member_role(*arguments) == (
+        RoleChangeStatus.COMPLETED,
+        "PLAYER",
+    )
+    assert repository.change_club_member_role(*arguments) == (
+        RoleChangeStatus.IDEMPOTENT_REPLAY,
+        "PLAYER",
+    )
+    assert repository.change_club_member_role(
+        club_id, "owner", "player", "MANAGER", "role-change-3"
+    )[0] is RoleChangeStatus.IDEMPOTENCY_CONFLICT
+
+
+def test_list_club_members_returns_only_safe_active_member_fields() -> None:
+    client = FakeFirestoreClient({
+        ("clubs", "club-roles", "members", "owner"): {
+            "username": "Club Owner",
+            "role": "OWNER",
+            "status": "active",
+            "chip_balance": 5000,
+        },
+        ("clubs", "club-roles", "members", "inactive"): {
+            "username": "Inactive Member",
+            "role": "PLAYER",
+            "status": "inactive",
+            "chip_balance": 2500,
+        },
+    })
+    repository = FirestoreHandRepository(client)
+
+    assert repository.list_club_members("club-roles") == [
+        {
+            "user_id": "owner",
+            "username": "Club Owner",
+            "role": "OWNER",
+            "status": "active",
+        }
+    ]
 def test_buy_in_commits_lease_checked_checkpoint_with_balance_and_seat(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     now = datetime.now(timezone.utc)
@@ -326,14 +464,20 @@ def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
     assert client.documents[reserve_path]["chip_balance"] == 980_000
 
 
-def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
+def test_create_club_funds_treasury_from_club_chip_giveaway_reserve(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     client = FakeFirestoreClient({
+        ("platform_wallets", "club-chip-giveaway-reserve"): {
+            "wallet_id": "club-chip-giveaway-reserve",
+            "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+            "currency_type": "CLUB_CHIPS",
+            "chip_balance": 1_000_000,
+        },
         ("platform_wallets", "global-playmoney-reserve"): {
             "wallet_id": "global-playmoney-reserve",
             "wallet_type": "PLATFORM_RESERVE",
             "currency_type": "GLOBAL_PLAYMONEY",
-            "chip_balance": 1_000_000,
+            "chip_balance": 500_000,
         }
     })
     repository = FirestoreHandRepository(client)
@@ -342,11 +486,23 @@ def test_create_club_funds_treasury_from_platform_reserve(monkeypatch) -> None:
 
     treasury_path = ("clubs", "club-42", "treasury", "wallet")
     initial_grant_path = ("clubs", "club-42", "transactions", "initial-funding")
-    reserve_path = ("platform_wallets", "global-playmoney-reserve")
+    reserve_path = ("platform_wallets", "club-chip-giveaway-reserve")
+    reserve_grant_path = (
+        "platform_wallets",
+        "club-chip-giveaway-reserve",
+        "transactions",
+        "club-club-42-initial-grant",
+    )
     assert client.documents[treasury_path]["chip_balance"] == 10_000
     assert client.documents[initial_grant_path]["amount"] == 10_000
-    assert client.documents[initial_grant_path]["from_wallet_id"] == "global-playmoney-reserve"
+    assert client.documents[initial_grant_path]["currency_type"] == "CLUB_CHIPS"
+    assert client.documents[initial_grant_path]["from_wallet_id"] == "club-chip-giveaway-reserve"
+    assert client.documents[initial_grant_path]["from_wallet_type"] == "CLUB_CHIP_GIVEAWAY_RESERVE"
     assert client.documents[reserve_path]["chip_balance"] == 990_000
+    assert client.documents[("platform_wallets", "global-playmoney-reserve")]["chip_balance"] == 500_000
+    assert client.documents[reserve_grant_path]["amount"] == 10_000
+    assert client.documents[reserve_grant_path]["to_club_id"] == "club-42"
+    assert client.documents[reserve_grant_path]["balance_after"] == 990_000
 
 
 def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
@@ -371,6 +527,67 @@ def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
     assert repository.get_table_checkpoint("club", "club-1", "table-1")["checkpoint"] == checkpoint
 
 
+def test_table_lease_release_rejects_lease_epoch_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client, now_factory=lambda: now)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-release-fence"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-release-fence", "table-release-fence", "worker-a", 1, checkpoint
+    )
+    lease = repository.claim_table_lease(
+        "club", "club-release-fence", "table-release-fence", "worker-a", 30
+    )
+
+    lease_path = (
+        "clubs", "club-release-fence", "tables", "table-release-fence", "runtime", "lease"
+    )
+    fencing_generation = lease["fencing_generation"]
+    client.documents[lease_path]["fencing_generation"] = fencing_generation + 1
+    mismatched_lease = dict(client.documents[lease_path])
+
+    with pytest.raises(TableLeaseExpiredError):
+        repository.release_table_lease(
+            "club",
+            "club-release-fence",
+            "table-release-fence",
+            "worker-a",
+            fencing_generation,
+        )
+
+    assert client.documents[lease_path] == mismatched_lease
+
+
+def test_checkpoint_action_commit_rejects_expired_durable_lease(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client, now_factory=lambda: now)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-expired"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-expired", "table-expired", None, 0, checkpoint
+    )
+    repository.claim_table_lease(
+        "club", "club-expired", "table-expired", "worker-a", 30, now=now
+    )
+    expired_at = now + timedelta(seconds=31)
+
+    result = repository.commit_table_action(
+        "club",
+        "club-expired",
+        "table-expired",
+        "worker-a",
+        1,
+        0,
+        "player-a",
+        "action-a",
+        "0" * 64,
+        checkpoint,
+        now=expired_at,
+    )
+
+    assert result.status is TableActionCommitStatus.FENCED
 def test_table_creation_checkpoint_starts_unowned_then_claims_generation_one(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     client = FakeFirestoreClient({})
@@ -817,7 +1034,14 @@ def test_inter_club_treasury_transfer_rejects_unauthorized_and_insufficient_fund
 
 def test_create_club_grants_initial_treasury_funds_once(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
+    client = FakeFirestoreClient({
+        ("platform_wallets", "club-chip-giveaway-reserve"): {
+            "wallet_id": "club-chip-giveaway-reserve",
+            "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+            "currency_type": "CLUB_CHIPS",
+            "chip_balance": hand_repository.INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE,
+        }
+    })
     repository = FirestoreHandRepository(client)
 
     assert repository.create_club("new-club", "New Club", "owner-1", "platform-admin")
@@ -834,10 +1058,33 @@ def test_create_club_grants_initial_treasury_funds_once(monkeypatch) -> None:
     assert client.documents[("clubs", "new-club", "treasury", "wallet")] == {
         "chip_balance": 10000
     }
-    assert client.documents[("clubs", "new-club", "transactions", "initial-funding")]["amount"] == 10000
+    initial_funding = client.documents[("clubs", "new-club", "transactions", "initial-funding")]
+    assert initial_funding["amount"] == 10000
+    assert initial_funding["from_wallet_id"] == "club-chip-giveaway-reserve"
+    assert client.documents[("platform_wallets", "club-chip-giveaway-reserve")]["chip_balance"] == (
+        hand_repository.INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE - 10000
+    )
+    assert client.documents[(
+        "platform_wallets",
+        "club-chip-giveaway-reserve",
+        "transactions",
+        "club-new-club-initial-grant",
+    )]["amount"] == 10000
 
     assert not repository.create_club("new-club", "Changed Name", "owner-2", "platform-admin")
     assert client.documents[("clubs", "new-club", "treasury", "wallet")]["chip_balance"] == 10000
+
+
+def test_create_club_requires_preprovisioned_giveaway_reserve(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client)
+
+    with pytest.raises(FirestoreRequiredError, match="reserve is not provisioned"):
+        repository.create_club("club-no-reserve", "No Reserve", "owner-1", "admin-1")
+
+    assert ("clubs", "club-no-reserve") not in client.documents
+    assert not any(path[0] == "platform_wallets" for path in client.documents)
 
 
 def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:

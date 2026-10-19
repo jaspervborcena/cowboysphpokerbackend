@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from google.cloud import firestore
 
 
 INITIAL_CLUB_TREASURY_FUNDS = 10_000
 INITIAL_GLOBAL_PLAYMONEY_FUNDS = 20_000
+CLUB_CHIP_GIVEAWAY_RESERVE_ID = "club-chip-giveaway-reserve"
+INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE = 1_000_000_000
 
 
 class BuyInStatus(StrEnum):
@@ -41,6 +43,20 @@ class WalletTransactionStatus(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
 
+class RoleChangeStatus(StrEnum):
+    COMPLETED = "completed"
+    IDEMPOTENT_REPLAY = "idempotent_replay"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    CLUB_NOT_FOUND = "club_not_found"
+    ACTOR_NOT_FOUND = "actor_not_found"
+    UNAUTHORIZED_ACTOR = "unauthorized_actor"
+    SELF_CHANGE = "self_change"
+    TARGET_NOT_FOUND = "target_not_found"
+    TARGET_INACTIVE = "target_inactive"
+    OWNER_PROTECTED = "owner_protected"
+    INVALID_TRANSITION = "invalid_transition"
+
+
 class TableActionCommitStatus(StrEnum):
     COMMITTED = "committed"
     IDEMPOTENT_REPLAY = "idempotent_replay"
@@ -50,10 +66,27 @@ class TableActionCommitStatus(StrEnum):
     SEQUENCE_CONFLICT = "sequence_conflict"
 
 
+class TableLeaseOperationStatus(StrEnum):
+    ACQUIRED = "acquired"
+    RENEWED = "renewed"
+    HELD = "held"
+    FENCED = "fenced"
+    NOT_INITIALIZED = "not_initialized"
+    RELEASED = "released"
+
+
 @dataclass(frozen=True)
 class TableActionCommitResult:
     status: TableActionCommitStatus
     sequence: int
+
+
+@dataclass(frozen=True)
+class TableLeaseOperationResult:
+    status: TableLeaseOperationStatus
+    owner_id: str | None
+    fencing_epoch: int
+    lease_expires_at: datetime | None
 
 
 def table_action_fingerprint(
@@ -114,7 +147,7 @@ class NullHandRepository:
     ) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load a table lease.")
 
-    def claim_table_lease(
+    def _legacy_claim_table_lease(
         self,
         scope_type: str,
         scope_id: str,
@@ -128,7 +161,7 @@ class NullHandRepository:
     ) -> dict[str, Any]:
         raise FirestoreRequiredError("Firestore must be enabled to claim a table lease.")
 
-    def renew_table_lease(
+    def _legacy_renew_table_lease(
         self,
         scope_type: str,
         scope_id: str,
@@ -153,7 +186,7 @@ class NullHandRepository:
     ) -> dict[str, Any]:
         raise FirestoreRequiredError("Firestore must be enabled to authorize a table lease.")
 
-    def release_table_lease(
+    def _legacy_release_table_lease(
         self,
         scope_type: str,
         scope_id: str,
@@ -173,8 +206,40 @@ class NullHandRepository:
         owner_id: str | None,
         fencing_epoch: int,
         checkpoint: dict[str, Any],
+        lease_ttl_seconds: int = 30,
     ) -> bool:
         raise FirestoreRequiredError("Firestore must be enabled to initialize a table checkpoint.")
+
+    def _legacy_claim_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        ttl_seconds: int = 30,
+    ) -> TableLeaseOperationResult:
+        raise FirestoreRequiredError("Firestore must be enabled to claim table ownership.")
+
+    def _legacy_renew_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_epoch: int,
+        ttl_seconds: int = 30,
+    ) -> TableLeaseOperationResult:
+        raise FirestoreRequiredError("Firestore must be enabled to renew table ownership.")
+
+    def _legacy_release_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_epoch: int,
+    ) -> TableLeaseOperationResult:
+        raise FirestoreRequiredError("Firestore must be enabled to release table ownership.")
 
     def commit_table_action(
         self,
@@ -249,6 +314,19 @@ class NullHandRepository:
 
     def get_club_member(self, club_id: str, user_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to verify club membership.")
+
+    def list_club_members(self, club_id: str) -> list[dict[str, Any]]:
+        raise FirestoreRequiredError("Firestore must be enabled to list club members.")
+
+    def change_club_member_role(
+        self,
+        club_id: str,
+        actor_user_id: str,
+        target_user_id: str,
+        target_role: str,
+        transaction_id: str,
+    ) -> tuple[RoleChangeStatus, str | None]:
+        raise FirestoreRequiredError("Firestore must be enabled to change club roles.")
 
     def get_hand_history(self, club_id: str, hand_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load hand history.")
@@ -354,8 +432,13 @@ class NullHandRepository:
 
 
 class FirestoreHandRepository:
-    def __init__(self, client: firestore.Client) -> None:
+    def __init__(
+        self,
+        client: firestore.Client,
+        now_factory: Callable[[], datetime] | None = None,
+    ) -> None:
         self._client = client
+        self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
 
     def start_worker_session(self, worker_id: str, ttl_seconds: int) -> dict[str, Any]:
         if not worker_id or ttl_seconds < 1:
@@ -760,6 +843,220 @@ class FirestoreHandRepository:
 
         return commit(transaction)
 
+    def _legacy_claim_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        ttl_seconds: int = 30,
+    ) -> TableLeaseOperationResult:
+        _validate_lease_ttl(ttl_seconds)
+        if not worker_id:
+            raise ValueError("A worker ID is required to claim table ownership.")
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> TableLeaseOperationResult:
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            now = self._now_factory()
+            lease = lease_snapshot.to_dict() or {}
+            state = state_snapshot.to_dict() or {}
+            current_expiry = lease.get("lease_expires_at")
+            current_owner = lease.get("owner_id")
+            current_epoch = max(
+                int(lease.get("fencing_epoch", 0)),
+                int(state.get("fencing_epoch", 0)),
+            )
+            active = isinstance(current_expiry, datetime) and current_expiry > now
+
+            if active and state_snapshot.exists and (
+                state.get("owner_id") != current_owner
+                or state.get("fencing_epoch") != lease.get("fencing_epoch")
+            ):
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.FENCED,
+                    current_owner,
+                    current_epoch,
+                    current_expiry,
+                )
+
+            if active and current_owner != worker_id:
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.HELD,
+                    current_owner,
+                    int(lease.get("fencing_epoch", current_epoch)),
+                    current_expiry,
+                )
+
+            if active and current_owner == worker_id:
+                next_epoch = int(lease.get("fencing_epoch", current_epoch))
+                status = TableLeaseOperationStatus.RENEWED
+            else:
+                next_epoch = current_epoch + 1
+                status = TableLeaseOperationStatus.ACQUIRED
+            expires_at = now + timedelta(seconds=ttl_seconds)
+            lease_data = {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_epoch": next_epoch,
+                "lease_expires_at": expires_at,
+                "heartbeat_at": now,
+                "lease_status": "active",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+            transaction.set(lease_ref, lease_data)
+            if state_snapshot.exists:
+                transaction.update(
+                    state_ref,
+                    {
+                        "owner_id": worker_id,
+                        "fencing_epoch": next_epoch,
+                        "lease_expires_at": expires_at,
+                        "lease_status": "active",
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            return TableLeaseOperationResult(status, worker_id, next_epoch, expires_at)
+
+        return commit(transaction)
+
+    def _legacy_renew_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_epoch: int,
+        ttl_seconds: int = 30,
+    ) -> TableLeaseOperationResult:
+        _validate_lease_ttl(ttl_seconds)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> TableLeaseOperationResult:
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            if not lease_snapshot.exists:
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.NOT_INITIALIZED, None, 0, None
+                )
+            lease = lease_snapshot.to_dict() or {}
+            state = state_snapshot.to_dict() or {}
+            now = self._now_factory()
+            expiry = lease.get("lease_expires_at")
+            if (
+                lease.get("owner_id") != worker_id
+                or lease.get("fencing_epoch") != fencing_epoch
+                or not isinstance(expiry, datetime)
+                or expiry <= now
+                or (state_snapshot.exists and (
+                    state.get("owner_id") != worker_id
+                    or state.get("fencing_epoch") != fencing_epoch
+                ))
+            ):
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.FENCED,
+                    lease.get("owner_id"),
+                    int(lease.get("fencing_epoch", 0)),
+                    expiry if isinstance(expiry, datetime) else None,
+                )
+            renewed_expiry = now + timedelta(seconds=ttl_seconds)
+            transaction.update(
+                lease_ref,
+                {
+                    "lease_expires_at": renewed_expiry,
+                    "heartbeat_at": now,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            if state_snapshot.exists:
+                transaction.update(
+                    state_ref,
+                    {
+                        "lease_expires_at": renewed_expiry,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            return TableLeaseOperationResult(
+                TableLeaseOperationStatus.RENEWED,
+                worker_id,
+                fencing_epoch,
+                renewed_expiry,
+            )
+
+        return commit(transaction)
+
+    def _legacy_release_table_lease(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        worker_id: str,
+        fencing_epoch: int,
+    ) -> TableLeaseOperationResult:
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> TableLeaseOperationResult:
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            if not lease_snapshot.exists:
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.NOT_INITIALIZED, None, 0, None
+                )
+            lease = lease_snapshot.to_dict() or {}
+            if (
+                lease.get("owner_id") != worker_id
+                or lease.get("fencing_epoch") != fencing_epoch
+                or (state_snapshot.exists and (
+                    (state_snapshot.to_dict() or {}).get("owner_id") != worker_id
+                    or (state_snapshot.to_dict() or {}).get("fencing_epoch") != fencing_epoch
+                ))
+            ):
+                return TableLeaseOperationResult(
+                    TableLeaseOperationStatus.FENCED,
+                    lease.get("owner_id"),
+                    int(lease.get("fencing_epoch", 0)),
+                    lease.get("lease_expires_at"),
+                )
+            now = self._now_factory()
+            transaction.update(
+                lease_ref,
+                {
+                    "lease_expires_at": now,
+                    "heartbeat_at": now,
+                    "lease_status": "released",
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            if state_snapshot.exists:
+                transaction.update(
+                    state_ref,
+                    {
+                        "lease_expires_at": now,
+                        "lease_status": "released",
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            return TableLeaseOperationResult(
+                TableLeaseOperationStatus.RELEASED,
+                worker_id,
+                fencing_epoch,
+                now,
+            )
+
+        return commit(transaction)
+
     def commit_table_action(
         self,
         scope_type: str,
@@ -795,11 +1092,31 @@ class FirestoreHandRepository:
         lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
         action_key = hashlib.sha256(f"{user_id}\0{action_id}".encode("utf-8")).hexdigest()
         action_ref = state_ref.collection("actions").document(action_key)
+        lease_ref = self._table_runtime_lease_ref(scope_type, scope_id, table_id)
         transaction = self._client.transaction()
         current_time = now or datetime.now(timezone.utc)
 
         @firestore.transactional
         def commit(transaction: Any) -> TableActionCommitResult:
+            state_snapshot = state_ref.get(transaction=transaction)
+            lease_snapshot = lease_ref.get(transaction=transaction)
+            if not state_snapshot.exists:
+                return TableActionCommitResult(TableActionCommitStatus.NOT_INITIALIZED, 0)
+            current = state_snapshot.to_dict() or {}
+            current_sequence = current.get("sequence", 0)
+            lease = lease_snapshot.to_dict() or {}
+            lease_expiry = lease.get("lease_expires_at")
+            if (
+                not lease_snapshot.exists
+                or current.get("owner_id") != owner_id
+                or current.get("fencing_epoch") != fencing_epoch
+                or lease.get("owner_id") != owner_id
+                or lease.get("fencing_generation") != fencing_epoch
+                or not isinstance(lease_expiry, datetime)
+                or lease_expiry <= current_time
+            ):
+                return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
+
             action_snapshot = action_ref.get(transaction=transaction)
             if action_snapshot.exists:
                 existing_action = action_snapshot.to_dict() or {}
@@ -812,25 +1129,6 @@ class FirestoreHandRepository:
                     status,
                     int(existing_action.get("sequence", 0)),
                 )
-
-            state_snapshot = state_ref.get(transaction=transaction)
-            if not state_snapshot.exists:
-                return TableActionCommitResult(TableActionCommitStatus.NOT_INITIALIZED, 0)
-            current = state_snapshot.to_dict() or {}
-            current_sequence = current.get("sequence", 0)
-            if current.get("owner_id") != owner_id or current.get("fencing_epoch") != fencing_epoch:
-                return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
-
-            lease_snapshot = lease_ref.get(transaction=transaction)
-            lease = lease_snapshot.to_dict() or {} if lease_snapshot.exists else {}
-            expires_at = lease.get("lease_expires_at")
-            if (
-                lease.get("owner_id") != owner_id
-                or lease.get("fencing_generation") != fencing_epoch
-                or expires_at is None
-                or expires_at <= current_time
-            ):
-                return TableActionCommitResult(TableActionCommitStatus.FENCED, current_sequence)
             if current_sequence != expected_sequence:
                 return TableActionCommitResult(
                     TableActionCommitStatus.SEQUENCE_CONFLICT,
@@ -959,7 +1257,8 @@ class FirestoreHandRepository:
                     "amount": INITIAL_GLOBAL_PLAYMONEY_FUNDS,
                     "from_wallet_id": "global-playmoney-reserve",
                     "to_wallet_id": f"global-wallet-{user_id}",
-                    "from_wallet_type": "PLATFORM_RESERVE",
+                    "lease_status": "active",
+                    "updated_at": firestore.SERVER_TIMESTAMP,
                     "to_wallet_type": "GLOBAL_PLAYMONEY",
                     "from_user_id": "platform",
                     "to_user_id": user_id,
@@ -990,7 +1289,12 @@ class FirestoreHandRepository:
         owner_ref = club_ref.collection("members").document(owner_user_id)
         wallet_ref = club_ref.collection("treasury").document("wallet")
         initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
-        reserve_ref = self._client.collection("platform_wallets").document("global-playmoney-reserve")
+        reserve_ref = self._client.collection("platform_wallets").document(
+            CLUB_CHIP_GIVEAWAY_RESERVE_ID
+        )
+        reserve_transaction_ref = reserve_ref.collection("transactions").document(
+            f"club-{club_id}-initial-grant"
+        )
         transaction = self._client.transaction()
 
         @firestore.transactional
@@ -1000,17 +1304,12 @@ class FirestoreHandRepository:
                 return False
 
             reserve_snapshot = reserve_ref.get(transaction=transaction)
-            reserve_wallet = reserve_snapshot.to_dict() or {}
             if not reserve_snapshot.exists:
-                reserve_wallet = {
-                    "wallet_id": "global-playmoney-reserve",
-                    "wallet_type": "PLATFORM_RESERVE",
-                    "currency_type": "GLOBAL_PLAYMONEY",
-                    "chip_balance": 1_000_000_000,
-                }
+                raise FirestoreRequiredError("Club chip giveaway reserve is not provisioned.")
+            reserve_wallet = reserve_snapshot.to_dict() or {}
             reserve_balance = reserve_wallet.get("chip_balance", 0)
             if isinstance(reserve_balance, bool) or not isinstance(reserve_balance, int) or reserve_balance < INITIAL_CLUB_TREASURY_FUNDS:
-                raise ValueError("Platform reserve does not have enough funds for an initial club grant.")
+                raise ValueError("Club chip giveaway reserve does not have enough funds for an initial grant.")
 
             transaction.set(
                 club_ref,
@@ -1038,9 +1337,9 @@ class FirestoreHandRepository:
                 reserve_ref,
                 {
                     **reserve_wallet,
-                    "wallet_id": "global-playmoney-reserve",
-                    "wallet_type": "PLATFORM_RESERVE",
-                    "currency_type": "GLOBAL_PLAYMONEY",
+                    "wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
+                    "wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+                    "currency_type": "CLUB_CHIPS",
                     "chip_balance": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 },
@@ -1056,9 +1355,9 @@ class FirestoreHandRepository:
                     "transaction_id": "initial-funding",
                     "currency_type": "CLUB_CHIPS",
                     "type": "INITIAL_GRANT",
-                    "from_wallet_id": "global-playmoney-reserve",
+                    "from_wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
                     "to_wallet_id": f"club-treasury-{club_id}",
-                    "from_wallet_type": "PLATFORM_RESERVE",
+                    "from_wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
                     "to_wallet_type": "CLUB_TREASURY",
                     "to_club_id": club_id,
                     "amount": INITIAL_CLUB_TREASURY_FUNDS,
@@ -1066,6 +1365,24 @@ class FirestoreHandRepository:
                     "note": "Initial club treasury funding",
                     "timestamp": firestore.SERVER_TIMESTAMP,
                     "reserve_balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
+                },
+            )
+            transaction.set(
+                reserve_transaction_ref,
+                {
+                    "transaction_id": f"club-{club_id}-initial-grant",
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "INITIAL_GRANT",
+                    "from_wallet_id": CLUB_CHIP_GIVEAWAY_RESERVE_ID,
+                    "to_wallet_id": f"club-treasury-{club_id}",
+                    "from_wallet_type": "CLUB_CHIP_GIVEAWAY_RESERVE",
+                    "to_wallet_type": "CLUB_TREASURY",
+                    "to_club_id": club_id,
+                    "amount": INITIAL_CLUB_TREASURY_FUNDS,
+                    "performed_by": created_by,
+                    "note": "Initial club treasury funding",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                    "balance_after": reserve_balance - INITIAL_CLUB_TREASURY_FUNDS,
                 },
             )
             return True
@@ -1199,6 +1516,121 @@ class FirestoreHandRepository:
         if not snapshot.exists:
             return None
         return snapshot.to_dict()
+
+    def list_club_members(self, club_id: str) -> list[dict[str, Any]]:
+        members_ref = self._client.collection("clubs").document(club_id).collection("members")
+        return [
+            {
+                "user_id": snapshot.id,
+                "username": str(member.get("username") or snapshot.id),
+                "role": member.get("role"),
+                "status": member.get("status"),
+            }
+            for snapshot in members_ref.stream()
+            if (member := snapshot.to_dict() or {}).get("status") == "active"
+        ]
+
+    def change_club_member_role(
+        self,
+        club_id: str,
+        actor_user_id: str,
+        target_user_id: str,
+        target_role: str,
+        transaction_id: str,
+    ) -> tuple[RoleChangeStatus, str | None]:
+        club_ref = self._client.collection("clubs").document(club_id)
+        actor_ref = club_ref.collection("members").document(actor_user_id)
+        target_ref = club_ref.collection("members").document(target_user_id)
+        change_ref = club_ref.collection("role_changes").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> tuple[RoleChangeStatus, str | None]:
+            club_snapshot = club_ref.get(transaction=transaction)
+            change_snapshot = change_ref.get(transaction=transaction)
+            actor_snapshot = actor_ref.get(transaction=transaction)
+            target_snapshot = target_ref.get(transaction=transaction)
+
+            if change_snapshot.exists:
+                previous_change = change_snapshot.to_dict() or {}
+                same_change = (
+                    previous_change.get("performed_by") == actor_user_id
+                    and previous_change.get("user_id") == target_user_id
+                    and previous_change.get("to_role") == target_role
+                )
+                if same_change:
+                    return (
+                        RoleChangeStatus.IDEMPOTENT_REPLAY,
+                        previous_change.get("from_role"),
+                    )
+                return RoleChangeStatus.IDEMPOTENCY_CONFLICT, None
+
+            if not club_snapshot.exists:
+                return RoleChangeStatus.CLUB_NOT_FOUND, None
+            if not actor_snapshot.exists or (actor_snapshot.to_dict() or {}).get("status") != "active":
+                return RoleChangeStatus.ACTOR_NOT_FOUND, None
+            actor_role = (actor_snapshot.to_dict() or {}).get("role")
+            if actor_role not in {"OWNER", "MANAGER"}:
+                return RoleChangeStatus.UNAUTHORIZED_ACTOR, None
+            if actor_user_id == target_user_id:
+                return RoleChangeStatus.SELF_CHANGE, None
+            if not target_snapshot.exists:
+                return RoleChangeStatus.TARGET_NOT_FOUND, None
+
+            target = target_snapshot.to_dict() or {}
+            if target.get("status") != "active":
+                return RoleChangeStatus.TARGET_INACTIVE, None
+            current_role = target.get("role")
+            club = club_snapshot.to_dict() or {}
+            if (
+                current_role == "OWNER"
+                or target_user_id == club.get("owner_user_id")
+                or target_role == "OWNER"
+            ):
+                return RoleChangeStatus.OWNER_PROTECTED, None
+
+            allowed_transitions = {
+                "OWNER": {
+                    ("PLAYER", "AGENT"),
+                    ("PLAYER", "MANAGER"),
+                    ("AGENT", "MANAGER"),
+                    ("MANAGER", "AGENT"),
+                    ("MANAGER", "PLAYER"),
+                    ("AGENT", "PLAYER"),
+                },
+                "MANAGER": {
+                    ("PLAYER", "MANAGER"),
+                    ("AGENT", "MANAGER"),
+                    ("MANAGER", "AGENT"),
+                    ("MANAGER", "PLAYER"),
+                    ("AGENT", "PLAYER"),
+                },
+            }
+            if (current_role, target_role) not in allowed_transitions[actor_role]:
+                return RoleChangeStatus.INVALID_TRANSITION, current_role
+
+            transaction.update(
+                target_ref,
+                {
+                    "role": target_role,
+                    "role_updated_at": firestore.SERVER_TIMESTAMP,
+                    "role_updated_by": actor_user_id,
+                },
+            )
+            transaction.set(
+                change_ref,
+                {
+                    "transaction_id": transaction_id,
+                    "user_id": target_user_id,
+                    "from_role": current_role,
+                    "to_role": target_role,
+                    "performed_by": actor_user_id,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return RoleChangeStatus.COMPLETED, current_role
+
+        return commit(transaction)
 
     def enqueue_pending_hand(
         self,
@@ -2287,6 +2719,11 @@ def _validate_table_checkpoint_write(
     table_data = checkpoint.get("table")
     if not isinstance(table_data, dict) or table_data.get("table_id") != table_id:
         raise ValueError("Table checkpoint ID does not match its Firestore path.")
+
+
+def _validate_lease_ttl(ttl_seconds: int) -> None:
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+        raise ValueError("Lease TTL must be a positive integer number of seconds.")
 
 
 def create_hand_repository(enabled: bool) -> NullHandRepository | FirestoreHandRepository:
