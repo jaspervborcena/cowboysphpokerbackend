@@ -29,18 +29,26 @@ clubs/{club_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
+    runtime/state
+      actions/{action_hash}
+    runtime/lease
 unions/{union_id}
   admins/{user_id}
   clubs/{club_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
+    runtime/state
+      actions/{action_hash}
+    runtime/lease
   settlements/{YYYY-MM-DD}
     clubs/{club_id}
     hands/{hand_id}
 ```
 
 `clubs`, `members`, `tables`, and `hands` are Firestore collections/subcollections. The `{...}` portions are document IDs, not literal field values.
+
+The repository provides Firestore transaction operations for `tables/{table_id}/runtime/state`, its `actions/{action_hash}` journal, and `tables/{table_id}/runtime/lease`. Checkpoints carry a schema version, sequence, owner ID, fencing epoch, and serialized state. Lease records carry owner, fencing generation, expiry, heartbeat, and status. `commit_table_action` validates checkpoint owner/epoch, the matching lease owner/generation, and lease expiry in the same transaction as the checkpoint and journal write. With Firestore enabled, `TableRuntime` commits first-party hand starts, explicit player actions, standalone pre-actions, and timeout actions through this transaction. Club and union buy-in transactions also validate the lease and sequence and atomically write the staged seat checkpoint/action with member balances, seat reservation, and ledger records. Table creation initializes an unowned generation-zero checkpoint; union metadata and checkpoint are initialized atomically. The generic `/workers/{worker_id}/...` coordinator remains process-local, and the runtime table map is not durable.
 
 ## Fields Written by the Backend
 

@@ -30,6 +30,7 @@ class TableLeaseManager:
         self.ttl_seconds = ttl_seconds
         self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
         self._leases: dict[str, TableLease] = {}
+        self._last_fencing_generation: dict[str, int] = {}
 
     def claim_lease(
         self,
@@ -42,8 +43,10 @@ class TableLeaseManager:
         current = self._leases.get(table_id)
 
         if current is None:
-            lease = self._new_lease(table_id, worker_id, generation=1, now=now)
+            generation = self._last_fencing_generation.get(table_id, 0) + 1
+            lease = self._new_lease(table_id, worker_id, generation=generation, now=now)
             self._leases[table_id] = lease
+            self._last_fencing_generation[table_id] = generation
             return lease
 
         if current.owner_worker_id == worker_id and current.lease_expires_at > now:
@@ -54,9 +57,13 @@ class TableLeaseManager:
                 f"Table {table_id} is already owned by worker {current.owner_worker_id}."
             )
 
-        new_generation = current.fencing_generation + 1
+        new_generation = max(
+            current.fencing_generation,
+            self._last_fencing_generation.get(table_id, 0),
+        ) + 1
         lease = self._new_lease(table_id, worker_id, generation=new_generation, now=now)
         self._leases[table_id] = lease
+        self._last_fencing_generation[table_id] = new_generation
         return lease
 
     def recover_lease(
@@ -67,6 +74,10 @@ class TableLeaseManager:
     ) -> TableLease:
         if fencing_generation < 1:
             raise ValueError("Fencing generation must be at least 1.")
+        if fencing_generation < self._last_fencing_generation.get(table_id, 0):
+            raise LeaseExpiredError(
+                f"Cannot recover an older lease generation for table {table_id}."
+            )
         now = self._now_factory()
         lease = self._new_lease(
             table_id,
@@ -75,6 +86,7 @@ class TableLeaseManager:
             now=now,
         )
         self._leases[table_id] = lease
+        self._last_fencing_generation[table_id] = fencing_generation
         return lease
 
     def renew_lease(self, table_id: str, worker_id: str, fencing_generation: int) -> TableLease:
@@ -186,6 +198,10 @@ class TableLeaseManager:
         if lease.lease_expires_at <= self._now_factory():
             raise LeaseExpiredError(f"Lease for table {table_id} has expired.")
         del self._leases[table_id]
+        self._last_fencing_generation[table_id] = max(
+            lease.fencing_generation,
+            self._last_fencing_generation.get(table_id, 0),
+        )
         return True
 
 
@@ -315,6 +331,48 @@ class WorkerCoordinatorRegistry:
             return []
         released = coordinator.shutdown()
         self._coordinators.pop(worker_id, None)
+        return released
+
+
+class WorkerFleetScheduler:
+    def __init__(self, route_manager: TableRouteManager) -> None:
+        self.route_manager = route_manager
+        self.registry = WorkerCoordinatorRegistry(route_manager)
+
+    def assign_worker_tables(
+        self,
+        worker_id: str,
+        table_ids: list[str],
+        *,
+        force_reclaim: bool = False,
+    ) -> dict[str, TableLease]:
+        coordinator = self.registry.start_worker(worker_id)
+        leases: dict[str, TableLease] = {}
+        for table_id in table_ids:
+            lease = coordinator.bind_table(table_id, force_reclaim=force_reclaim)
+            leases[table_id] = lease
+        return leases
+
+    def heartbeat_worker(self, worker_id: str, table_ids: list[str]) -> dict[str, TableLease]:
+        coordinator = self.registry.get_or_create(worker_id)
+        renewals: dict[str, TableLease] = {}
+        for table_id in table_ids:
+            if table_id in set(coordinator.assigned_tables()):
+                renewals[table_id] = coordinator.heartbeat(table_id)
+        return renewals
+
+    def assigned_tables(self, worker_id: str) -> list[str]:
+        return self.registry.assigned_tables(worker_id)
+
+    def release_worker_tables(self, worker_id: str, table_ids: list[str]) -> list[str]:
+        coordinator = self.registry.get_or_create(worker_id)
+        released: list[str] = []
+        for table_id in table_ids:
+            if table_id in set(coordinator.assigned_tables()):
+                if coordinator.session.release_table(table_id):
+                    released.append(table_id)
+        if not coordinator.assigned_tables():
+            self.registry._coordinators.pop(worker_id, None)
         return released
 
 

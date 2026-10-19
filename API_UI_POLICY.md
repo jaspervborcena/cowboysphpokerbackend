@@ -48,6 +48,10 @@ For this repository, the policy is:
 - still considered authoritative because it creates the club record, owner membership, and reserve-backed treasury grant
 - must be implemented as an internal server operation even when a UI flow triggers it
 
+### 1.4 Internal worker coordination
+
+The game server's `/workers/{worker_id}/...` coordination routes are not UI-safe. They require the configured `WORKER_COORDINATION_TOKEN` bearer token, must reject mismatched path/payload worker IDs, and require an active worker session before claim/renew/release operations. Do not call them from a browser or expose them through public ingress; they are internal service routes and remain separate from player-facing API flows. When Firestore is enabled, the runtime can enforce the scoped lease operations through the durable repository, but cross-instance ownership and recovery remain the next hardening milestone.
+
 ---
 
 ## 2. Endpoint classification

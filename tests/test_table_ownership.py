@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from database import (
+    FirestoreHandRepository,
+    TableActionCommitResult,
+    TableActionCommitStatus,
+)
 from logic.connections import ConnectionManager
 from logic.first_party_table import FirstPartyNLHGame
-from logic.runtime import TableRuntime
+from logic.runtime import TableRuntime, TableStateConflict
 from logic.table_checkpoint import serialize_first_party_table
 from logic.table_ownership import (
     LeaseAlreadyHeldError,
@@ -15,6 +21,7 @@ from logic.table_ownership import (
     TableRouteManager,
     WorkerCoordinator,
     WorkerCoordinatorRegistry,
+    WorkerFleetScheduler,
     WorkerLeaseSession,
 )
 
@@ -53,6 +60,23 @@ def test_expired_lease_can_be_reclaimed_and_generation_increments() -> None:
     assert first.fencing_generation == 1
     assert second.fencing_generation == 2
     assert second.owner_worker_id == "worker-b"
+
+
+def test_released_lease_generation_is_not_reused() -> None:
+    router = TableRouteManager(ttl_seconds=30, now_factory=_now)
+    first = router.assign_table("table-release", "worker-a")
+
+    assert router.release_table("table-release", "worker-a") is True
+    second = router.assign_table("table-release", "worker-b")
+
+    assert first.fencing_generation == 1
+    assert second.fencing_generation == 2
+    with pytest.raises(LeaseAlreadyHeldError):
+        router.authorize_table_action(
+            "table-release",
+            "worker-a",
+            first.fencing_generation,
+        )
 
 
 def test_renew_lease_requires_matching_worker_and_generation() -> None:
@@ -117,6 +141,458 @@ def test_runtime_enforces_worker_lease_and_generation_fencing() -> None:
 
     active = runtime.authorize_action("worker-b", 2)
     assert active.owner_worker_id == "worker-b"
+
+
+def test_runtime_uses_durable_lease_repository_for_club_and_union_tables() -> None:
+    class LeaseRepository(FirestoreHandRepository):
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.lease: dict[str, object] | None = None
+            self.checkpoints: dict[tuple[str, str, str], dict[str, object]] = {}
+
+        def get_table_checkpoint(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            self.calls.append(("get_checkpoint", scope_type, scope_id, table_id))
+            return self.checkpoints.get((scope_type, scope_id, table_id))
+
+        def initialize_table_checkpoint(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            owner_id: str,
+            fencing_epoch: int,
+            checkpoint: dict[str, object],
+        ) -> bool:
+            self.calls.append(("initialize_checkpoint", scope_type, scope_id, table_id, fencing_epoch))
+            key = (scope_type, scope_id, table_id)
+            if key in self.checkpoints:
+                return False
+            self.checkpoints[key] = {
+                "owner_id": owner_id,
+                "fencing_epoch": fencing_epoch,
+                "sequence": 0,
+                "checkpoint": checkpoint,
+            }
+            return True
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("claim", scope_type, scope_id, table_id, worker_id, force_reclaim))
+            current = _now()
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 4,
+                "lease_expires_at": current + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current,
+                "status": "active",
+            }
+            key = (scope_type, scope_id, table_id)
+            if key not in self.checkpoints and initial_checkpoint is not None:
+                self.checkpoints[key] = {
+                    "owner_id": worker_id,
+                    "fencing_epoch": 4,
+                    "sequence": 0,
+                    "checkpoint": initial_checkpoint,
+                }
+            return self.lease
+
+        def get_table_lease(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            self.calls.append(("get", scope_type, scope_id, table_id))
+            return self.lease
+
+        def renew_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            ttl_seconds: int,
+            *,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("renew", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            return self.lease
+
+        def authorize_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            *,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            self.calls.append(("authorize", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            return self.lease
+
+        def release_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            fencing_generation: int,
+            *,
+            now: datetime | None = None,
+        ) -> bool:
+            self.calls.append(("release", scope_type, scope_id, table_id, worker_id, fencing_generation))
+            assert self.lease is not None
+            self.lease = {**self.lease, "owner_id": None, "status": "released"}
+            return True
+
+    repository = LeaseRepository()
+    runtime = TableRuntime(
+        "club-1",
+        FirstPartyNLHGame("durable-club-table", 10, 20, 20, 1000),
+        ConnectionManager(),
+        repository,
+        turn_timeout_seconds=0,
+    )
+
+    claimed = runtime.claim_lease("worker-a")
+    assert claimed.fencing_generation == 4
+    assert runtime.current_lease().owner_worker_id == "worker-a"
+    assert runtime.renew_lease("worker-a", 4).fencing_generation == 4
+    assert runtime.authorize_action("worker-a", 4).owner_worker_id == "worker-a"
+    assert runtime.release_lease("worker-a", 4) is True
+    assert runtime.current_lease() is None
+
+    union_runtime = TableRuntime(
+        "club-1",
+        FirstPartyNLHGame("durable-union-table", 10, 20, 20, 1000),
+        ConnectionManager(),
+        repository,
+        turn_timeout_seconds=0,
+        union_id="union-1",
+    )
+    union_runtime.claim_lease("worker-b")
+
+    assert repository.calls[0] == (
+        "claim", "club", "club-1", "durable-club-table", "worker-a", False
+    )
+    assert ("claim", "union", "union-1", "durable-union-table", "worker-b", False) in repository.calls
+
+
+def test_runtime_commits_hand_start_checkpoint_under_durable_lease() -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self, commit_status: TableActionCommitStatus) -> None:
+            self.commit_status = commit_status
+            self.checkpoint: dict[str, object] | None = None
+            self.lease: dict[str, object] | None = None
+            self.commit_arguments: tuple[object, ...] | None = None
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            current = _now()
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 1,
+                "lease_expires_at": current + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current,
+                "status": "active",
+            }
+            self.checkpoint = {
+                "owner_id": worker_id,
+                "fencing_epoch": 1,
+                "sequence": 0,
+                "checkpoint": initial_checkpoint,
+            }
+            return self.lease
+
+        def get_table_checkpoint(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.checkpoint
+
+        def get_table_lease(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.lease
+
+        def commit_table_action(self, *args: object, **kwargs: object) -> TableActionCommitResult:
+            self.commit_arguments = args
+            current_sequence = int(self.checkpoint["sequence"])  # type: ignore[index]
+            if self.commit_status is TableActionCommitStatus.COMMITTED:
+                self.checkpoint = {
+                    **self.checkpoint,  # type: ignore[arg-type]
+                    "sequence": current_sequence + 1,
+                    "checkpoint": args[-1],
+                }
+                return TableActionCommitResult(self.commit_status, current_sequence + 1)
+            return TableActionCommitResult(self.commit_status, current_sequence)
+
+    async def run_test(commit_status: TableActionCommitStatus) -> tuple[TableRuntime, DurableRepository]:
+        game = FirstPartyNLHGame("durable-start-table", 10, 20, 20, 1000)
+        assert game.add_player(0, "alice", "Alice", 500)
+        assert game.add_player(1, "bob", "Bob", 500)
+        repository = DurableRepository(commit_status)
+        runtime = TableRuntime(
+            "club-1", game, ConnectionManager(), repository, turn_timeout_seconds=0
+        )
+        runtime.claim_lease("worker-a")
+        return runtime, repository
+
+    async def verify() -> None:
+        runtime, repository = await run_test(TableActionCommitStatus.COMMITTED)
+        assert await runtime.start_hand()
+        assert repository.commit_arguments is not None
+        assert repository.commit_arguments[7] == "start-hand:" + runtime.game._current_hand_id
+        assert runtime._table_sequence == 1
+        assert repository.checkpoint["checkpoint"] == serialize_first_party_table(runtime.game)
+
+        runtime, repository = await run_test(TableActionCommitStatus.FENCED)
+        before = serialize_first_party_table(runtime.game)
+        with pytest.raises(TableStateConflict):
+            await runtime.start_hand()
+        assert serialize_first_party_table(runtime.game) == before
+
+    asyncio.run(verify())
+
+
+def test_runtime_commits_pre_action_checkpoint_and_restores_when_fenced() -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self, commit_status: TableActionCommitStatus) -> None:
+            self.commit_status = commit_status
+            self.checkpoint: dict[str, object] | None = None
+            self.lease: dict[str, object] | None = None
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            current = _now()
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 1,
+                "lease_expires_at": current + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current,
+                "status": "active",
+            }
+            self.checkpoint = {
+                "owner_id": worker_id,
+                "fencing_epoch": 1,
+                "sequence": 0,
+                "checkpoint": initial_checkpoint,
+            }
+            return self.lease
+
+        def get_table_checkpoint(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.checkpoint
+
+        def get_table_lease(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.lease
+
+        def commit_table_action(self, *args: object, **kwargs: object) -> TableActionCommitResult:
+            assert self.checkpoint is not None
+            current_sequence = int(self.checkpoint["sequence"])
+            if self.commit_status is TableActionCommitStatus.COMMITTED:
+                self.checkpoint = {
+                    **self.checkpoint,
+                    "sequence": current_sequence + 1,
+                    "checkpoint": args[-1],
+                }
+                return TableActionCommitResult(self.commit_status, current_sequence + 1)
+            return TableActionCommitResult(self.commit_status, current_sequence)
+
+    async def verify() -> None:
+        game = FirstPartyNLHGame("durable-pre-action-table", 10, 20, 20, 1000)
+        assert game.add_player(0, "alice", "Alice", 500)
+        assert game.add_player(1, "bob", "Bob", 500)
+        assert game.start_new_hand()
+        waiting_player = "alice" if game.current_actor_user_id == "bob" else "bob"
+        repository = DurableRepository(TableActionCommitStatus.COMMITTED)
+        runtime = TableRuntime(
+            "club-1", game, ConnectionManager(), repository, turn_timeout_seconds=0
+        )
+        runtime.claim_lease("worker-a")
+
+        assert await runtime.set_pre_action(waiting_player, "CALL_ANY") == "CALL_ANY"
+        assert runtime._table_sequence == 1
+        persisted = repository.checkpoint["checkpoint"]
+        assert persisted == serialize_first_party_table(runtime.game)
+        assert runtime.game.get_pre_action_for_player(waiting_player)["action"] == "CALL_ANY"
+
+        repository.commit_status = TableActionCommitStatus.FENCED
+        before = serialize_first_party_table(runtime.game)
+        with pytest.raises(TableStateConflict):
+            await runtime.set_pre_action(waiting_player, "FOLD")
+        assert serialize_first_party_table(runtime.game) == before
+
+    asyncio.run(verify())
+
+
+def test_runtime_commits_timeout_action_checkpoint_under_durable_lease() -> None:
+    class DurableRepository(FirestoreHandRepository):
+        def __init__(self, commit_status: TableActionCommitStatus) -> None:
+            self.commit_status = commit_status
+            self.checkpoint: dict[str, object] | None = None
+            self.lease: dict[str, object] | None = None
+            self.commit_arguments: tuple[object, ...] | None = None
+
+        def claim_table_lease(
+            self,
+            scope_type: str,
+            scope_id: str,
+            table_id: str,
+            worker_id: str,
+            ttl_seconds: int,
+            *,
+            force_reclaim: bool = False,
+            initial_checkpoint: dict[str, object] | None = None,
+            now: datetime | None = None,
+        ) -> dict[str, object]:
+            current = _now()
+            self.lease = {
+                "table_id": table_id,
+                "owner_id": worker_id,
+                "fencing_generation": 1,
+                "lease_expires_at": current + timedelta(seconds=ttl_seconds),
+                "heartbeat_at": current,
+                "status": "active",
+            }
+            self.checkpoint = {
+                "owner_id": worker_id,
+                "fencing_epoch": 1,
+                "sequence": 0,
+                "checkpoint": initial_checkpoint,
+            }
+            return self.lease
+
+        def get_table_checkpoint(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.checkpoint
+
+        def get_table_lease(
+            self, scope_type: str, scope_id: str, table_id: str
+        ) -> dict[str, object] | None:
+            return self.lease
+
+        def commit_table_action(self, *args: object, **kwargs: object) -> TableActionCommitResult:
+            assert self.checkpoint is not None
+            self.commit_arguments = args
+            current_sequence = int(self.checkpoint["sequence"])
+            if self.commit_status is TableActionCommitStatus.COMMITTED:
+                self.checkpoint = {
+                    **self.checkpoint,
+                    "sequence": current_sequence + 1,
+                    "checkpoint": args[-1],
+                }
+                return TableActionCommitResult(self.commit_status, current_sequence + 1)
+            return TableActionCommitResult(self.commit_status, current_sequence)
+
+        def persist_hand_history_and_ledgers(self, *args: object, **kwargs: object) -> bool:
+            return True
+
+    async def make_runtime(
+        commit_status: TableActionCommitStatus,
+    ) -> tuple[TableRuntime, DurableRepository, str]:
+        game = FirstPartyNLHGame("durable-timeout-table", 10, 20, 20, 1000)
+        assert game.add_player(0, "alice", "Alice", 500)
+        assert game.add_player(1, "bob", "Bob", 500)
+        assert game.start_new_hand()
+        actor = game.current_actor_user_id
+        assert actor is not None
+        repository = DurableRepository(commit_status)
+        runtime = TableRuntime(
+            "club-1", game, ConnectionManager(), repository, turn_timeout_seconds=0
+        )
+        runtime.claim_lease("worker-a")
+        return runtime, repository, actor
+
+    async def verify() -> None:
+        runtime, repository, actor = await make_runtime(TableActionCommitStatus.COMMITTED)
+        await runtime._timeout_turn(actor)
+        assert repository.commit_arguments is not None
+        assert repository.commit_arguments[7] == f"timeout:0:{actor}"
+        assert runtime._table_sequence == 1
+        persisted_checkpoint = repository.checkpoint["checkpoint"]
+        assert persisted_checkpoint["runtime_state"]["completed_hand"] is not None
+
+        runtime, repository, actor = await make_runtime(TableActionCommitStatus.FENCED)
+        before = serialize_first_party_table(runtime.game)
+        with pytest.raises(TableStateConflict):
+            await runtime._timeout_turn(actor)
+        assert serialize_first_party_table(runtime.game) == before
+
+    asyncio.run(verify())
+
+
+def test_runtime_state_change_hook_runs_after_hand_start_and_player_action() -> None:
+    async def verify() -> None:
+        class SettlementRepository:
+            def persist_hand_history_and_ledgers(self, *args: object) -> bool:
+                return True
+
+        game = FirstPartyNLHGame("broadcast-hook-table", 10, 20, 20, 1000)
+        assert game.add_player(0, "alice", "Alice", 500)
+        assert game.add_player(1, "bob", "Bob", 500)
+        snapshots: list[dict[str, object]] = []
+
+        async def on_state_change(runtime: TableRuntime) -> None:
+            snapshots.append(serialize_first_party_table(runtime.game))
+
+        runtime = TableRuntime(
+            "club-1",
+            game,
+            ConnectionManager(),
+            repository=SettlementRepository(),
+            turn_timeout_seconds=0,
+            on_state_change=on_state_change,
+        )
+        assert await runtime.start_hand()
+        actor = runtime.game.current_actor_user_id
+        assert actor is not None
+        await runtime.act(actor, "FOLD")
+
+        assert len(snapshots) == 2
+        assert snapshots[0]["runtime_state"]["is_hand_running"] is True
+        assert snapshots[1]["runtime_state"]["is_hand_running"] is False
+
+    asyncio.run(verify())
 
 
 def test_runtime_recovers_persisted_checkpoint_and_lease() -> None:
@@ -241,3 +717,22 @@ def test_worker_registry_binds_multiple_tables_and_releases_worker_set() -> None
     assert set(released) == {"table-20", "table-21", "table-22"}
     assert registry.assigned_tables("worker-registry") == []
     assert all(router.current_owner(table_id) is None for table_id in ["table-20", "table-21", "table-22"])
+
+
+def test_worker_fleet_scheduler_assigns_and_heartbeats_a_table_batch() -> None:
+    router = TableRouteManager(ttl_seconds=30, now_factory=_now)
+    scheduler = WorkerFleetScheduler(router)
+
+    leases = scheduler.assign_worker_tables("worker-scheduler", ["table-50", "table-51", "table-52"])
+    assert set(leases) == {"table-50", "table-51", "table-52"}
+    assert all(router.current_owner(table_id) == "worker-scheduler" for table_id in leases)
+
+    refreshed = scheduler.heartbeat_worker("worker-scheduler", ["table-50", "table-51"])
+    assert set(refreshed) == {"table-50", "table-51"}
+    assert all(refreshed[table_id].owner_worker_id == "worker-scheduler" for table_id in refreshed)
+
+    released = scheduler.release_worker_tables("worker-scheduler", ["table-50", "table-52"])
+    assert set(released) == {"table-50", "table-52"}
+    assert router.current_owner("table-50") is None
+    assert router.current_owner("table-52") is None
+    assert set(scheduler.assigned_tables("worker-scheduler")) == {"table-51"}

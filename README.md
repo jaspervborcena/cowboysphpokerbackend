@@ -8,7 +8,7 @@ The live poker game protocol is websocket-first. Client actions, table state sna
 
 The Google Cloud libraries in this repo use gRPC under the hood for Firebase and Firestore integration, but the actual game communication at the app layer is websocket-based. Keep the realtime table transport on WebSocket and treat Firestore/Firebase as infrastructure services rather than the live game protocol.
 
-The selected production target is the Firebase/Firestore design in [GAME_SERVER_FIREBASE_ARCHITECTURE.drawio](GAME_SERVER_FIREBASE_ARCHITECTURE.drawio). Live NLH tables use the first-party engine through `logic/first_party_table.py`; PokerKit is no longer a runtime or test dependency.
+The selected production target is the Firebase/Firestore design in [GAME_SERVER_FIREBASE_ARCHITECTURE.drawio](GAME_SERVER_FIREBASE_ARCHITECTURE.drawio). Live NLH tables use the first-party engine through `logic/first_party_table.py`; PokerKit is no longer a runtime or test dependency. The current diagram remains the target architecture, while the implemented worker-route guards and Firestore lease checks are a partial rollout step toward the fully durable multi-worker design.
 
 ## Economy Tiers
 
@@ -32,7 +32,7 @@ tests/                   Engine and API integration tests
 
 The current WebSocket lifecycle, legacy and v1 message examples, and union-table behavior are documented in [websocket.md](websocket.md).
 The UI workflow, Firebase session handling, role-aware screens, v1 socket messages, retries, heartbeats, and error display guidance are in [UI_GUIDE.md](UI_GUIDE.md).
-The UI-safe/non-authoritative boundary for a second agent is documented in [AGENT_2_UI_SAFE_GUIDE.md](AGENT_2_UI_SAFE_GUIDE.md).
+The UI's permitted route exposure and authority boundaries are documented in [API_UI_POLICY.md](API_UI_POLICY.md).
 
 ## Club Roles
 
@@ -73,6 +73,7 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - V1 WebSocket action IDs with bounded in-process duplicate suppression, conflicting-ID errors, heartbeat PING/PONG, and idle connection cleanup.
 - Automatic turn timeout that checks when possible and folds when facing a bet.
 - Firestore-backed buy-in reservation: verifies available member balance, moves the amount to in-play chips, and reserves a seat idempotently.
+- Internal worker coordination hardening: service-token auth, active-session enforcement, and mismatched worker ID rejection for `/workers/{worker_id}/...` routes.
 - Operator-mediated club wallet send-out and claim-back transfers with role/downline checks and idempotent Firestore audit records.
 - Owner/manager treasury balance and atomic inter-club treasury transfers with paired audit records; card and PayPal funding are not enabled yet.
 - Platform-admin club provisioning creates the initial owner membership and grants 10,000 treasury chips exactly once through the reserve-backed accounting path.
@@ -81,18 +82,18 @@ Union administration is separate from club roles. `UNION_ADMIN` is assigned per 
 - Firestore transaction to save a hand audit, apply in-play balance deltas, and update seat stacks idempotently by hand ID.
 - Docker image suitable for Cloud Run, plus focused engine and WebSocket integration tests.
 
-## Game Engine Direction
+## Game Engine Status
 
 The current backend runs **No-Limit Texas Hold'em only**, using the first-party engine. The explicit `/games` registry lists only implemented, create-supported games.
 
-**Decision:** use a first-party game engine that we can maintain and debug. No PokerKit source is copied or imported, and it is not a project dependency.
+The first-party NLH implementation and runtime integration are complete. PokerKit is not imported or required. Future variants remain unavailable until their own rules, engine, settlement, replay, and tests are complete.
 
-| Priority | First-party game scope | Notes |
-| --- | --- | --- |
-| 1 | No-Limit Texas Hold'em | Replace the current engine first; keep existing REST/WebSocket and Firestore contracts stable where possible. |
-| 2 | Pot-Limit Omaha family | Add PLO, PLO5, and PLO6 as validated configurations only after the NLH engine is stable; preserve Omaha's exact-two-hole/exact-three-board evaluation rule. |
-| 3 | Tongits | Build as an independent engine with its own state, actions, meld evaluation, and scoring; do not force it into poker betting abstractions. |
-| Later | Other variants | Add only when selected, specified, implemented, and covered by their own rule and integration tests. |
+| Planned scope | Status |
+| --- | --- |
+| No-Limit Texas Hold'em | Implemented and create-supported. |
+| Pot-Limit Omaha family | Future work: PLO, PLO5, and PLO6 require separate validated configurations and Omaha's exact-two-hole/exact-three-board evaluation rule. |
+| Tongits | Future work: a separate engine with its own state, actions, meld evaluation, and scoring. |
+| Other variants | Add only after specification, implementation, and focused rule/integration tests. |
 
 The game catalog is an explicit first-party registry and lists only engines this server implements and supports for table creation.
 
@@ -126,10 +127,10 @@ For any new variant, verify the complete path: deterministic setup, legal action
 | --- | --- | --- |
 | Identity and access | Firebase ID-token verification, active membership checks, role-gated REST/WebSocket flows | Full route/table policy review, rate limits, production security review, and operational controls |
 | Client transport | FastAPI REST, legacy and v1 WebSocket protocols, player-specific masked snapshots | Cross-process gateway-to-owner routing, durable replay cursor, reconnect event replay, and load-tested delivery/backpressure |
-| Table runtime | In-process table map, per-table `asyncio.Lock`, turn timeout, bounded in-memory action deduplication | Single authoritative worker per table, leases/fencing, durable action IDs/state versions, checkpoint/recovery, timer recovery |
+| Table runtime | In-process table map, per-table `asyncio.Lock`, turn timeout, bounded in-memory action deduplication; `TableRuntime` lease methods and club/union claim routes use Firestore leases when enabled; worker routes enforce bearer auth, started-session checks, and path/payload worker ID matching | Replace generic process-local worker coordination with fully durable cross-instance assignment, recovery, and route ownership; enforce the unexpired lease fence in each mutation transaction and complete checkpoint-based multi-worker recovery |
 | Game engine | Live NLH actions, snapshots, replay frames, entry rules, straddles, and hand outcomes use the first-party engine. Unit, property, simulation, API, and audit tests cover the rules and contracts. | Verify settlement with the Firestore emulator before production rollout |
 | Settlement and economy | Firestore buy-in transactions, hand audits, idempotent hand settlement, club pools, treasury transfers, union clearing | Durable settlement intent/outbox worker, replayable retries, conservation/reconciliation checks, explicit buy-out lifecycle |
-| Persistence | Firestore repositories for current ledgers, audits, and union records | Durable table ownership, event/checkpoint schema, recovery procedures, transaction/contention tests, and a single authority per record type |
+| Persistence | Firestore repositories for ledgers, audits, union records, checkpoint/action primitives, and lease operations used by scoped runtime claims | Durable checkpoint lifecycle and replay, mutation-transaction fencing, recovery procedures, emulator contention tests, and one authority per record type |
 | Operations | Sanitized error codes, trace-linked logs, Docker/Cloud Run setup | Per-table metrics, alerts, load/soak tests, backup/restore drills, safe rollout and rollback |
 
 PokerKit is no longer used by the backend. Firestore emulator and production-like transaction verification remain required before enabling real-money settlement.
@@ -142,15 +143,9 @@ The button is not moved to accommodate a joining player. A new player in the sma
 
 Ring-game hand starts may specify one straddler: the player immediately after the big blind posts `2 * big_blind`. Preflop action starts after the straddler and the minimum raise increment becomes `2 * big_blind`. Short straddles, heads-up straddles, and tournament-mode straddles are rejected. Tournament gameplay is not implemented.
 
-### First-Party NLH Replacement Plan
+### Future Engine Scope
 
-1. Freeze the current client and hand-audit contracts. Write explicit, independently reviewed expected outcomes for representative hands and edge cases so the replacement has a behavioral target.
-2. Define typed engine contracts for configuration, state, actions, legal actions, domain events, completed-hand outcomes, and engine errors. Inject deterministic randomness in tests and a cryptographically secure source in production.
-3. Implement the NLH core as pure game logic: card/deck model, shuffle/deal/burn, betting and turn transitions, hand ranking, main/side-pot eligibility, tie splitting, and gross awards. Keep treasury policy and Firestore writes outside the engine.
-4. Add deterministic unit, property-based, and simulation tests for card uniqueness, legal/illegal actions, all-ins, side pots, ties, chip conservation, and reproducible failures.
-5. Integrate the owned engine behind the table runtime while preserving authorization, snapshots, settlement idempotency, and replay privacy. Do not run two engines as competing authorities for live money state.
-6. Verify idempotent Firestore settlement, audit records, and retries with the emulator before production rollout.
-7. Stabilize own-engine NLH before starting PLO variants or the separate Tongits engine. Keep those variants unavailable until each has complete rules, evaluation, settlement, replay, and security tests.
+The NLH migration is complete. Keep NLH as the only create-supported game until each future variant has a separate rule specification, engine implementation, settlement and replay behavior, and security/integration coverage. Track future game work in [TODO.md](TODO.md).
 
 The Firebase diagram describes the production target, not a two-week capacity guarantee. For an initial test deployment, keep the game scope to NLH and validate the engine and Firebase transaction behavior before claiming multi-worker or 1,000–10,000-player readiness.
 
@@ -319,12 +314,12 @@ The following is a gap list, not functionality already present. The app is suita
 - **External cash-outs and reconciliation:** local buy-in, operator-mediated club send-out/claim-back, and idempotent hand settlement update Firestore club balances. External payouts, rebuy/top-up, refunds, and reconciliation are still missing; club balances must not be treated as a complete production money ledger until those flows exist.
 - **Rake, BBJ, and promotions:** local tables support `OWNER`/`MANAGER` rake settings up to 10%, caps, no-flop-no-drop, BBJ fee/minimum-pot settings, and idempotent rake/BBJ pool entries. Rake and BBJ drops are deducted from winner awards and reconcile with player deltas. BBJ qualifying-hand evaluation/payout/reseed, Hand-of-the-Day funding and award distribution, union fee allocation, payout rounding policy, and winner announcements remain incomplete. A persistent global play-money wallet and global tables are not implemented.
 - **Reliable settlement retries:** completed hand audits are persisted with `settlement_status: "pending"` before the idempotent balance/pool transaction; that transaction marks them `settled`, and startup retries any pending audits. The runtime also retains the completed hand until persistence succeeds. If Firestore is unavailable before the pending audit is written, only the live process has the retry copy, so durable table recovery and storage-independent buffering remain open.
-- **Durable single-writer tables:** table state is process memory. Keep live-table tests on one backend instance for now. Before multiple runtime workers, add durable table ownership/fencing, recovery, and cross-process command routing; Pub/Sub is deferred until that split exists. Session affinity alone does not provide this guarantee.
+- **Durable single-writer tables:** Firestore-backed table mutations, buy-ins, worker sessions, scoped lease routes, and claim-time checkpoint restoration are implemented. An opt-in Pub/Sub/Redis transport now forwards WebSocket player/pre-actions to the lease owner and returns recipient-masked snapshots to the gateways with active socket presence. The gateway/runtime split is not complete: REST table mutations/settings are not yet owner-routed, worker services need per-ID deployment and IAM setup, and emulator/concurrency/load recovery tests remain. Keep live tables on one backend instance until those gates pass; session affinity alone is insufficient.
 
 ### P1: Complete the playable table workflow
 
 - **Table and seat lifecycle:** local/union table listing and union table closure exist, but add sit-out/sit-in, leave-seat, rebuy/top-up, cash-out, and host/dealer controls. Local club table metadata and all live table state remain in memory.
-- **WebSocket reliability:** Firebase-first authentication, route-validated v1 topics, standardized numeric error responses, heartbeat PING/PONG, and idle cleanup are implemented; legacy messages remain supported. The UI still needs to adopt v1 and send action IDs. Action deduplication is only bounded process memory, so durable idempotency, bounded send queues, and load-tested backpressure behavior remain. Reconnects authenticate again and receive a full snapshot; no snapshot sequence/version or incremental-delta recovery exists.
+- **WebSocket reliability:** Firebase-first authentication, route-validated v1 topics, standardized numeric error responses, heartbeat PING/PONG, and idle cleanup are implemented; legacy messages remain supported. Firestore-enabled player actions use a durable action journal; without Firestore, deduplication remains bounded process memory. The UI still needs to adopt v1 and send action IDs. Bounded send queues, full replay/reconnect recovery, and load-tested backpressure behavior remain open.
 - **Game-state edge cases:** all-ins, side pots, showdowns, timeouts, and hand-end conservation are covered by the first-party NLH tests. Configurable sit-out, disconnect policy, and process-restart recovery remain open.
 - **Firestore metadata and operations:** define schema versions/timestamps for local tables, provision union/admin/club membership documents, configure access rules/indexes, and test transactions with the Firestore emulator. The repository does not initialize member balances or recover live game state.
 
@@ -338,17 +333,21 @@ The following is a gap list, not functionality already present. The app is suita
 
 - Verify idempotent hand settlement and audit fields with the Firestore emulator, including retries and uncalled returns.
 - Continue UI implementation against the stable REST and WebSocket contracts. Keep the frontend game-engine agnostic, offer NLH only, and do not connect the UI to Pub/Sub.
-- For live-table testing, run one backend instance until durable table ownership and recovery exist.
+- For live-table testing, run one backend instance. Firestore leases/checkpoints and opt-in WebSocket Pub/Sub/Redis routing are wired, but REST mutations/settings, complete cross-worker recovery, emulator/concurrency/load tests, and deployment IAM remain open.
 
 ### Before Multi-Worker Runtime
 
-- Add table ownership leases with fencing, durable events/checkpoints, recovery of turn deadlines, action deduplication, and reconnect replay.
-- When gateway and runtime workers are separated, add Pub/Sub for internal command/event forwarding. Define ordering, retries, deduplication, and reply routing; Pub/Sub must not become the state or balance authority.
+- Route every REST table mutation, including hand start and settings/lifecycle operations, through the lease owner; WebSocket player/pre-action forwarding is implemented behind opt-in Pub/Sub routing.
+- Add durable event/checkpoint recovery, turn-deadline recovery, REST cross-process routing, durable action deduplication across worker deliveries, and reconnect replay.
+- Protect worker coordination routes with service-to-service authentication and prevent untrusted lease claims or forced reclamation.
+- Deploy the gateway/runtime split with Pub/Sub and Redis. Use a unique stable `WORKER_ID` per Cloud Run worker service, set each worker service max instances to 1 with min instances 1 and always-on CPU, grant least-privilege Pub/Sub/Firestore access, and provide Redis over a private VPC path. Pub/Sub must not become the state or balance authority.
 - Load-test Firestore transaction contention, quotas, recovery, and cost before claiming multi-worker or 1,000–10,000-player readiness.
+
+For the opt-in WebSocket routing implementation, set `PUBSUB_ROUTING_ENABLED=true`, `PUBSUB_RESOURCE_PREFIX`, `GOOGLE_CLOUD_PROJECT`, and `REDIS_URL`. Gateway services use `SERVICE_ROLE=gateway`; runtime services use `SERVICE_ROLE=worker` plus a stable `WORKER_ID`. Build the shared image with `gcloud builds submit --project="$PROJECT_ID" --config=cloudbuild.game-server.yaml .`. The application creates Pub/Sub topics and subscriptions at startup, so the service identities need the corresponding topic/subscription create, publish, consume, and gateway-subscription-delete permissions. Do not enable this for live tables until REST mutations are owner-routed and the remaining integration/load gates pass.
 
 ### Later
 
 - Close remaining security and economy gaps: owner-UID validation, idempotent platform club provisioning, full authorization review, cash-out/refund/reconciliation policy, and operational monitoring.
-- Add PLO/PLO5/PLO6 and Tongits only as separate verified engine milestones. Keep tournament scheduling and balancing in a separate tournament service, not in hand rules.
+- Prioritize verified PLO4, then PLO5 and PLO6, as separate engine milestones; preserve Omaha's exact-two-hole/exact-three-board rule. Tournament registration, scheduling, and balancing are deferred until after those variants and belong in a separate service, not hand rules. Keep unverified games unavailable.
 
 For Union table provisioning, endpoint flows, and shared settlement behavior, see [API.md](API.md). For persisted collection paths and document fields, see [database/README.md](database/README.md).

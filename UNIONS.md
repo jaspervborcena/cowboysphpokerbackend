@@ -101,7 +101,7 @@ The game currently charges no rake, so `rake_amount` is zero. The Union software
 - Union membership and Union Admin provisioning are manual; no formation, invitation, approval, or role-management API exists.
 - Union table listing reflects tables running in the current process. Firestore stores table configuration and closed status, but the game engine does not recover active tables after restart.
 - A seated table cannot be deleted. There is no leave-seat or cash-out route, so seats remain until those flows are designed and implemented.
-- The shared WebSocket namespace works within one process. Cross-instance ownership, locking, and durable single-writer behavior are not implemented.
+- The shared WebSocket namespace and live table state work within one process. Scoped union lease claims use Firestore-backed `TableRuntime` methods when enabled, but gameplay writes are not atomically fenced and cross-instance routing, locking, recovery, and durable single-writer behavior are not implemented.
 - Clearing positions are recorded by hand/day; club-to-club payout, reconciliation, cashier transfers, and automated daily close are not implemented.
 - Rake collection and rake allocation are not implemented.
 
