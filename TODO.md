@@ -10,7 +10,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Add self-service `POST /clubs`: derive the owner from the Firebase UID and grant 10,000 `CLUB_CHIPS` from the pre-provisioned giveaway reserve.
 - [x] Add club member role administration: owner/manager-only active member directory and audited promotion/demotion transitions; protect owner and block self-role changes.
 - [x] Provision the production `CLUB_CHIPS` giveaway reserve with a 1,000,000,000-chip opening allocation and audit record.
-- [x] Refresh the Firebase architecture diagram statuses for the current single-process runtime, implemented checkpoint primitive, and separate global/club-chip reserves; keep unfinished scaling and recovery components marked as targets.
+- [x] Refresh the Firebase architecture diagram statuses for the current single-instance recovery, implemented checkpoint primitive, and separate global/club-chip reserves; keep unfinished multi-worker scaling marked as a target.
 - [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records; operations with stable transaction IDs are retry-idempotent.
 - [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
@@ -45,7 +45,9 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Replace the PokerKit-based catalog and tests with the explicit first-party registry.
 - [x] Remove PokerKit imports and the `requirements.txt` dependency after a repository-wide search and full test suite pass without PokerKit.
 - [x] Add a Firestore emulator config and a focused first-party NLH settlement/idempotency integration test.
-- [x] Add versioned JSON checkpoint codecs for NLH hand/deck state and the enclosing table state, including seats, settings, button rotation, pre-actions, replay frames, engine events, and pending completed hands; persistence remains outstanding.
+- [x] Add versioned JSON checkpoint codecs for NLH hand/deck state and the enclosing table state, including seats, settings, button rotation, pre-actions, replay frames, engine events, and pending completed hands.
+- [x] Persist table snapshots after supported seat, settings, and game mutations; restore club and union tables at startup, resume active turns, and retry completed hands carried by checkpoints.
+- [x] Add Firestore checkpoint enumeration, sequence-incrementing snapshot saves, and checkpoint deletion for closed union tables.
 - [x] Add a Firestore transaction primitive that initializes versioned table checkpoints and atomically advances a checkpoint with a user/action-ID journal record, guarded by expected sequence and fencing epoch.
 - [x] Verify Firestore settlement against the emulator locally (2026-10-19: 1 passed with JDK 21); repeat as a release gate before production rollout.
 
@@ -72,7 +74,7 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 - [ ] Atomically couple buy-in debits and seat reservations with the table checkpoint; stage hand-start, action, pre-action, and timeout mutations and publish only after durable commit.
 - [ ] Add protected/encrypted checkpoint storage and turn-deadline recovery.
 - [ ] Add reconnect replay cursors and durable action idempotency.
-- [ ] Keep current live-table testing on one backend instance until ownership and recovery exist.
+- [ ] Keep live-table testing on one backend instance until durable lease ownership and action fencing are enforced by the runtime.
 - [ ] Add Pub/Sub only when gateway and runtime workers are separated; define command routing, event/reply routing, ordering, retries, and deduplication. Pub/Sub is backend-internal and must not own game state or balances.
 - [ ] Test Firestore contention, quotas, cost, recovery, and load before claiming multi-worker or 1,000-10,000-player capacity.
 

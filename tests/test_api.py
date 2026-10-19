@@ -9,6 +9,7 @@ from database import BuyInStatus, NullHandRepository, RoleChangeStatus, WalletTr
 from logic.connections import ConnectionManager
 from logic.first_party_table import FirstPartyNLHGame
 from logic.runtime import TableRuntime
+from logic.table_checkpoint import serialize_first_party_table
 from logic.auth import InvalidFirebaseToken
 
 
@@ -36,6 +37,7 @@ class FakeHandRepository:
         self.union_clubs: set[tuple[str, str]] = set()
         self.union_table_records: dict[tuple[str, str], dict[str, object]] = {}
         self.union_hand_summaries: list[dict[str, object]] = []
+        self.hand_summaries: list[dict[str, object]] = []
         self.wallet_calls: list[tuple[object, ...]] = []
         self.role_change_calls: list[tuple[str, str, str, str, str]] = []
         self.interclub_calls: list[tuple[object, ...]] = []
@@ -43,9 +45,49 @@ class FakeHandRepository:
         self.created_clubs: list[tuple[str, str, str, str]] = []
         self.in_play_balances: dict[str, int] = {}
         self.global_wallets: dict[str, dict[str, object]] = {}
+        self.recovery_calls = 0
+        self.table_checkpoints: dict[tuple[str, str, str], dict[str, object]] = {}
 
     def recover_pending_settlements(self) -> int:
+        self.recovery_calls += 1
         return 0
+
+    def list_table_checkpoints(self) -> list[dict[str, object]]:
+        return list(self.table_checkpoints.values())
+
+    def get_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> dict[str, object] | None:
+        return self.table_checkpoints.get((scope_type, scope_id, table_id))
+
+    def save_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        checkpoint: dict[str, object],
+    ) -> int:
+        key = (scope_type, scope_id, table_id)
+        sequence = int(self.table_checkpoints.get(key, {}).get("sequence", 0)) + 1
+        self.table_checkpoints[key] = {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "table_id": table_id,
+            "sequence": sequence,
+            "checkpoint": checkpoint,
+        }
+        return sequence
+
+    def delete_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> None:
+        self.table_checkpoints.pop((scope_type, scope_id, table_id), None)
 
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, object], bool]:
         wallet = self.global_wallets.get(user_id)
@@ -298,6 +340,7 @@ class FakeHandRepository:
         hand_summary: dict[str, object],
         chip_deltas: dict[str, int],
     ) -> bool:
+        self.hand_summaries.append(hand_summary)
         return True
 
     def persist_union_hand_history_and_ledgers(
@@ -335,6 +378,49 @@ def test_game_catalog_lists_only_first_party_supported_games() -> None:
             "create_supported": True,
         }
     ]
+
+
+def test_app_startup_recovers_pending_settlements(monkeypatch) -> None:
+    repository = FakeHandRepository({})
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app):
+        pass
+
+    assert repository.recovery_calls == 1
+
+
+def test_app_startup_restores_persisted_table(monkeypatch) -> None:
+    table_id = "startup-recovery-table"
+    table_key = ("startup-recovery-club", table_id)
+    game = FirstPartyNLHGame(table_id, 10, 20, 20, 1000)
+    assert game.add_player(0, "restart-player", "Restart Player", 500)
+    assert game.add_player(1, "other-player", "Other Player", 500)
+    assert game.start_new_hand()
+    actor = game.current_actor_user_id
+    assert actor is not None
+    game.handle_player_action(actor, "FOLD")
+    assert game.peek_completed_hand() is not None
+    repository = FakeHandRepository({})
+    repository.save_table_checkpoint(
+        "club",
+        table_key[0],
+        table_id,
+        serialize_first_party_table(game),
+    )
+    configure_test_dependencies(monkeypatch, repository)
+    tables.pop(table_key, None)
+
+    try:
+        with TestClient(app):
+            assert table_key in tables
+            assert tables[table_key].game.seats[0].user_id == "restart-player"
+            assert len(repository.hand_summaries) == 1
+            assert repository.table_checkpoints[("club", table_key[0], table_id)]["checkpoint"][
+                "runtime_state"
+            ]["completed_hand"] is None
+    finally:
+        tables.pop(table_key, None)
 
 
 def test_global_playmoney_wallet_is_provisioned_once_for_authenticated_user(monkeypatch) -> None:

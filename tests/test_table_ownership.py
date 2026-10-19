@@ -119,7 +119,7 @@ def test_runtime_enforces_worker_lease_and_generation_fencing() -> None:
     assert active.owner_worker_id == "worker-b"
 
 
-def test_runtime_recovers_persisted_checkpoint_and_lease() -> None:
+def test_runtime_recovers_persisted_checkpoint_without_reusing_old_lease() -> None:
     game = FirstPartyNLHGame("recovery-table", 10, 20, 20, 1000)
     game.add_player(0, "alice", "Alice", 500, "buy-in-a", "club-1")
     game.add_player(1, "bob", "Bob", 500, "buy-in-b", "club-1")
@@ -149,9 +149,7 @@ def test_runtime_recovers_persisted_checkpoint_and_lease() -> None:
     assert recovered is True
     assert runtime.game.table_id == "recovery-table"
     assert runtime.game.seats[0].user_id == "alice"
-    assert runtime.current_lease() is not None
-    assert runtime.current_lease().owner_worker_id == "worker-a"
-    assert runtime.current_lease().fencing_generation == 7
+    assert runtime.current_lease() is None
 
 
 def test_route_manager_assigns_unique_workers_across_100_tables() -> None:

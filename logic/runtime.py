@@ -5,7 +5,7 @@ from collections import OrderedDict
 
 from database import FirestoreHandRepository, NullHandRepository
 from logic.connections import ConnectionManager
-from logic.table_checkpoint import deserialize_first_party_table
+from logic.table_checkpoint import deserialize_first_party_table, serialize_first_party_table
 from logic.table_game_base import TableGameBase
 from logic.table_ownership import TableLease, TableLeaseManager
 
@@ -31,6 +31,8 @@ class TableRuntime:
         self.repository = repository
         self.turn_timeout_seconds = turn_timeout_seconds
         self.union_id = union_id
+        self.scope_type = "union" if union_id is not None else "club"
+        self.scope_id = union_id if union_id is not None else club_id
         self.connection_scope = f"union:{union_id}" if union_id else club_id
         self.lock = asyncio.Lock()
         self.lease_manager = lease_manager or TableLeaseManager()
@@ -67,13 +69,13 @@ class TableRuntime:
         return self.lease_manager._leases.get(self.game.table_id)
 
     async def load_persisted_state(self) -> bool:
-        if self.repository is None:
+        if self.repository is None or isinstance(self.repository, NullHandRepository):
             return False
 
         checkpoint_payload = await asyncio.to_thread(
             self.repository.get_table_checkpoint,
-            "club",
-            self.club_id,
+            self.scope_type,
+            self.scope_id,
             self.game.table_id,
         )
         if checkpoint_payload is None:
@@ -82,22 +84,39 @@ class TableRuntime:
         checkpoint = checkpoint_payload.get("checkpoint")
         if checkpoint is None:
             return False
+        if (
+            checkpoint_payload.get("scope_type", self.scope_type) != self.scope_type
+            or checkpoint_payload.get("scope_id", self.scope_id) != self.scope_id
+            or checkpoint_payload.get("table_id", self.game.table_id) != self.game.table_id
+        ):
+            raise ValueError("Persisted table checkpoint does not match its table scope.")
 
         restored_game = deserialize_first_party_table(checkpoint)
+        if restored_game.union_id != self.union_id:
+            raise ValueError("Persisted table checkpoint has an incompatible table scope.")
         self.game = restored_game
+        return True
 
-        owner_id = checkpoint_payload.get("owner_id")
-        fencing_epoch = checkpoint_payload.get("fencing_epoch")
-        if owner_id is None or fencing_epoch is None:
-            return True
-
-        lease = self.lease_manager.recover_lease(
+    async def persist_checkpoint(self) -> int:
+        if self.repository is None:
+            return 0
+        save_checkpoint = getattr(self.repository, "save_table_checkpoint", None)
+        if save_checkpoint is None:
+            return 0
+        checkpoint = serialize_first_party_table(self.game)
+        return await asyncio.to_thread(
+            save_checkpoint,
+            self.scope_type,
+            self.scope_id,
             self.game.table_id,
-            owner_id,
-            fencing_epoch,
+            checkpoint,
         )
-        self._worker_id = owner_id
-        return lease.owner_worker_id == owner_id and lease.fencing_generation == fencing_epoch
+
+    async def recover_pending_settlement(self) -> None:
+        await self._persist_completed_hand()
+
+    async def resume_after_restore(self) -> None:
+        await self._broadcast_and_reset_timer()
 
     async def start_hand(self, straddle_player_id: str | None = None) -> bool:
         async with self.lock:
@@ -108,6 +127,7 @@ class TableRuntime:
                 else self.game.start_new_hand(straddle_player_id)
             )
         if started:
+            await self.persist_checkpoint()
             await self._broadcast_and_reset_timer()
         return started
 
@@ -150,7 +170,9 @@ class TableRuntime:
 
     async def set_pre_action(self, user_id: str, option: str | None) -> str | None:
         async with self.lock:
-            return self.game.set_pre_action(user_id, option)
+            selected = self.game.set_pre_action(user_id, option)
+            await self.persist_checkpoint()
+            return selected
 
     async def _apply_pending_pre_actions(self) -> None:
         while self.game.is_hand_running:
@@ -163,7 +185,9 @@ class TableRuntime:
     async def _persist_completed_hand(self) -> None:
         hand = self.game.peek_completed_hand()
         if hand is None:
+            await self.persist_checkpoint()
             return
+        await self.persist_checkpoint()
         chip_deltas = {player["user_id"]: player["net_delta"] for player in hand["players"]}
         if self.union_id is not None:
             hand["union_id"] = self.union_id
@@ -189,6 +213,7 @@ class TableRuntime:
                 chip_deltas,
             )
         self.game.acknowledge_completed_hand(hand["hand_id"])
+        await self.persist_checkpoint()
 
     async def _broadcast_and_reset_timer(self) -> None:
         await self.connections.broadcast_table_state(

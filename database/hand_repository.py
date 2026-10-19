@@ -110,6 +110,26 @@ class NullHandRepository:
     def recover_pending_settlements(self) -> int:
         return 0
 
+    def list_table_checkpoints(self) -> list[dict[str, Any]]:
+        return []
+
+    def save_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        checkpoint: dict[str, Any],
+    ) -> int:
+        return 0
+
+    def delete_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> None:
+        return None
+
     def get_table_checkpoint(
         self,
         scope_type: str,
@@ -354,6 +374,62 @@ class FirestoreHandRepository:
         if not snapshot.exists:
             return None
         return snapshot.to_dict() or {}
+
+    def list_table_checkpoints(self) -> list[dict[str, Any]]:
+        snapshots = (
+            self._client.collection_group("runtime")
+            .where("schema_version", "==", 1)
+            .stream()
+        )
+        return [
+            data
+            for snapshot in snapshots
+            if (data := snapshot.to_dict() or {}).get("checkpoint") is not None
+        ]
+
+    def save_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+        checkpoint: dict[str, Any],
+    ) -> int:
+        _validate_table_checkpoint_write(
+            scope_type, scope_id, table_id, "single-instance", 1, 0, checkpoint
+        )
+        state_ref = self._table_runtime_state_ref(scope_type, scope_id, table_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def commit(transaction: Any) -> int:
+            snapshot = state_ref.get(transaction=transaction)
+            current = snapshot.to_dict() or {}
+            sequence = int(current.get("sequence", 0)) + 1
+            transaction.set(
+                state_ref,
+                {
+                    **current,
+                    "schema_version": 1,
+                    "scope_type": scope_type,
+                    "scope_id": scope_id,
+                    "table_id": table_id,
+                    "sequence": sequence,
+                    "checkpoint": checkpoint,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return sequence
+
+        return commit(transaction)
+
+    def delete_table_checkpoint(
+        self,
+        scope_type: str,
+        scope_id: str,
+        table_id: str,
+    ) -> None:
+        self._table_runtime_state_ref(scope_type, scope_id, table_id).delete()
+        self._table_runtime_lease_ref(scope_type, scope_id, table_id).delete()
 
     def initialize_table_checkpoint(
         self,

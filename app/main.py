@@ -62,6 +62,7 @@ from logic.table_ownership import (
     WorkerCoordinator,
     WorkerCoordinatorRegistry,
 )
+from logic.table_checkpoint import deserialize_first_party_table
 from logic.websocket_protocol import (
     MalformedWebSocketMessage,
     PROTOCOL_VERSION,
@@ -147,6 +148,39 @@ class GameCatalogResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await asyncio.to_thread(repository.recover_pending_settlements)
+    checkpoints = await asyncio.to_thread(repository.list_table_checkpoints)
+    for checkpoint_payload in checkpoints:
+        scope_type = checkpoint_payload["scope_type"]
+        scope_id = checkpoint_payload["scope_id"]
+        table_id = checkpoint_payload["table_id"]
+        checkpoint = checkpoint_payload["checkpoint"]
+        game = deserialize_first_party_table(checkpoint)
+        if scope_type == "club":
+            if game.union_id is not None:
+                raise ValueError("Club table checkpoint contains a union table.")
+            table_key = (scope_id, table_id)
+            club_id = scope_id
+        elif scope_type == "union":
+            if game.union_id != scope_id or game.origin_club_id is None:
+                raise ValueError("Union table checkpoint scope does not match its game state.")
+            table_key = union_table_key(scope_id, table_id)
+            club_id = game.origin_club_id
+        else:
+            raise ValueError("Persisted table checkpoint has an unsupported scope.")
+
+        runtime = TableRuntime(
+            club_id,
+            game,
+            connections,
+            repository,
+            turn_timeout_seconds,
+            union_id=game.union_id,
+            lease_manager=shared_table_lease_manager,
+        )
+        if await runtime.load_persisted_state():
+            tables[table_key] = runtime
+            await runtime.recover_pending_settlement()
+            await runtime.resume_after_restore()
     yield
 
 
@@ -430,6 +464,7 @@ async def update_club_table_settings(
         hand_of_day_target=request.hand_of_day_target,
         hand_of_day_prize=request.hand_of_day_prize,
     )
+    await runtime.persist_checkpoint()
     return {
         "table_id": table_id,
         "table_name": runtime.game.table_name,
@@ -460,6 +495,7 @@ async def update_union_table_settings(
         hand_of_day_target=request.hand_of_day_target,
         hand_of_day_prize=request.hand_of_day_prize,
     )
+    await runtime.persist_checkpoint()
     return {
         "union_id": union_id,
         "table_id": table_id,
@@ -495,7 +531,7 @@ async def create_table(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    tables[key] = TableRuntime(
+    runtime = TableRuntime(
         club_id,
         game,
         connections,
@@ -503,6 +539,12 @@ async def create_table(
         turn_timeout_seconds,
         lease_manager=shared_table_lease_manager,
     )
+    if not await runtime.load_persisted_state():
+        await runtime.persist_checkpoint()
+    else:
+        await runtime.recover_pending_settlement()
+        await runtime.resume_after_restore()
+    tables[key] = runtime
     return {
         "club_id": club_id,
         "table_id": table_id,
@@ -572,7 +614,7 @@ async def create_union_table(
         raise HTTPException(status_code=503, detail="Union table could not be persisted.") from error
     if not table_created:
         raise HTTPException(status_code=409, detail="Union table already exists.")
-    tables[key] = TableRuntime(
+    runtime = TableRuntime(
         request.origin_club_id,
         game,
         connections,
@@ -581,6 +623,12 @@ async def create_union_table(
         union_id=union_id,
         lease_manager=shared_table_lease_manager,
     )
+    if not await runtime.load_persisted_state():
+        await runtime.persist_checkpoint()
+    else:
+        await runtime.recover_pending_settlement()
+        await runtime.resume_after_restore()
+    tables[key] = runtime
     return {
         "union_id": union_id,
         "table_id": table_id,
@@ -734,6 +782,12 @@ async def delete_union_table(
         raise HTTPException(status_code=503, detail="Union table could not be closed.") from error
     if not table_closed:
         raise HTTPException(status_code=404, detail="Union table metadata not found.")
+    await asyncio.to_thread(
+        repository.delete_table_checkpoint,
+        "union",
+        union_id,
+        table_id,
+    )
     tables.pop(key, None)
     return Response(status_code=204)
 
@@ -760,6 +814,7 @@ async def seat_player(
                 and current_player.buy_in_id == buy_in_id
                 and current_player.buy_in_amount == request.buy_in_amount
             ):
+                await runtime.persist_checkpoint()
                 return runtime.game.get_masked_state_for_player(user_id)
             raise HTTPException(status_code=409, detail="Seat is already occupied.")
 
@@ -815,6 +870,7 @@ async def seat_player(
                 status_code=500,
                 detail="Buy-in was reserved but the in-memory seat could not be assigned. Retry with the same buy_in_id.",
             )
+        await runtime.persist_checkpoint()
         return runtime.game.get_masked_state_for_player(user_id)
 
 
@@ -845,6 +901,7 @@ async def seat_union_player(
                 and current_player.buy_in_id == buy_in_id
                 and current_player.buy_in_amount == request.buy_in_amount
             ):
+                await runtime.persist_checkpoint()
                 return runtime.game.get_masked_state_for_player(user_id)
             raise HTTPException(status_code=409, detail="Seat is already occupied.")
         if not runtime.game.can_add_player(
@@ -893,6 +950,7 @@ async def seat_union_player(
             accept_big_blind_post=request.accept_big_blind_post,
         ):
             raise HTTPException(status_code=500, detail="Buy-in was reserved but union seat could not be assigned.")
+        await runtime.persist_checkpoint()
         return runtime.game.get_masked_state_for_player(user_id)
 
 
