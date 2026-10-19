@@ -37,7 +37,6 @@ class WalletTransactionStatus(StrEnum):
     INVALID_AMOUNT = "invalid_amount"
     MEMBER_NOT_FOUND = "member_not_found"
     INSUFFICIENT_BALANCE = "insufficient_balance"
-    PLAYER_HAS_CHIPS_IN_PLAY = "player_has_chips_in_play"
     UNAUTHORIZED_DOWNLINE = "unauthorized_downline"
     INVALID_BALANCE = "invalid_balance"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
@@ -1811,8 +1810,6 @@ class FirestoreHandRepository:
             in_play = player.get("in_play_balance", 0)
             if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (balance, in_play)):
                 return WalletTransactionStatus.INVALID_BALANCE
-            if in_play > 0:
-                return WalletTransactionStatus.PLAYER_HAS_CHIPS_IN_PLAY
             if balance < amount:
                 return WalletTransactionStatus.INSUFFICIENT_BALANCE
 

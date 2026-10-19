@@ -38,7 +38,8 @@ def test_club_wallet_send_out_and_claim_back_are_atomic_and_safe() -> None:
     assert ledger.claim_back("club-1", "player-c", "owner-1", 10)
 
     ledger.set_member("club-1", "player-d", chip_balance=1000, in_play_balance=150, role="PLAYER", agent_id="agent-1")
-    assert ledger.claim_back("club-1", "player-d", "agent-1", 100) is False
-    assert ledger.get_member("club-1", "player-d")["chip_balance"] == 1000
+    assert ledger.claim_back("club-1", "player-d", "agent-1", 100)
+    assert ledger.get_member("club-1", "player-d")["chip_balance"] == 900
+    assert ledger.get_member("club-1", "player-d")["in_play_balance"] == 150
 
     assert ledger.send_out("club-1", "player-a", "player-b", 1) is False

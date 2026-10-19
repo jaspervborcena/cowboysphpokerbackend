@@ -157,8 +157,6 @@ def wallet_transaction_http_error(status: WalletTransactionStatus) -> HTTPExcept
         return HTTPException(status_code=403, detail="Only club owners and managers can transfer treasury funds.")
     if status is WalletTransactionStatus.UNAUTHORIZED_DOWNLINE:
         return HTTPException(status_code=403, detail="The operator is not authorized for this member.")
-    if status is WalletTransactionStatus.PLAYER_HAS_CHIPS_IN_PLAY:
-        return HTTPException(status_code=409, detail="Claim back is unavailable while the member has chips in play.")
     if status is WalletTransactionStatus.INSUFFICIENT_BALANCE:
         return HTTPException(status_code=409, detail="Insufficient available club chip balance.")
     if status is WalletTransactionStatus.INVALID_BALANCE:
@@ -621,13 +619,13 @@ async def send_out_club_chips(
     "/clubs/{club_id}/wallet/claim-back",
     tags=["Club wallets"],
     summary="Claim club chips back from a member",
-    description="Transfers a member's available club chips to the authenticated OWNER, MANAGER, or assigned AGENT. Rejected while the member has chips in play. Requires an idempotency transaction_id.",
+    description="Transfers only a member's available club chips to the authenticated OWNER, MANAGER, or assigned AGENT. In-play chips are never claimed; the member may keep chips in play while available chips are claimed. Requires an idempotency transaction_id.",
     response_model=MemberTransferResponse,
     responses={
         401: error_response("Missing or invalid Firebase ID token."),
         403: error_response("The operator is not authorized for the member."),
         404: error_response("The club member was not found."),
-        409: error_response("The member has chips in play, insufficient balance, or a transaction conflict."),
+        409: error_response("The member has insufficient available balance or the transaction conflicts."),
         422: error_response("The transfer request is invalid."),
         503: error_response("Club wallet storage is unavailable."),
     },

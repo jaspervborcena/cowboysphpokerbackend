@@ -281,7 +281,7 @@ Global-wallet grants debit the `GLOBAL_PLAYMONEY` reserve; platform-funded club-
 
 ### Club wallet transfers
 
-`POST /clubs/{club_id}/wallet/send-out` transfers available club chips from the authenticated `OWNER`, `MANAGER`, or `AGENT` to a member. An `AGENT` may only transfer to a member whose `agent_id` is the agent's user ID. `POST /clubs/{club_id}/wallet/claim-back` transfers available chips from a member back to the authenticated operator; claim-back is rejected while the member has a nonzero `in_play_balance`. Both operations require a unique `transaction_id` UUID and write balanced member updates plus a club-wide audit record in one Firestore transaction. Reuse the same ID only to safely retry the same transfer.
+`POST /clubs/{club_id}/wallet/send-out` transfers available club chips from the authenticated `OWNER`, `MANAGER`, or `AGENT` to a member. An `AGENT` may only transfer to a member whose `agent_id` is the agent's user ID. `POST /clubs/{club_id}/wallet/claim-back` transfers only available `chip_balance` from a member back to the authenticated operator; `in_play_balance` is never claimable and remains untouched. A member may keep chips in play while available chips are claimed. Both operations require a unique `transaction_id` UUID and write balanced member updates plus a club-wide audit record in one Firestore transaction. Reuse the same ID only to safely retry the same transfer.
 
 Request:
 
@@ -750,5 +750,5 @@ The configured turn timeout automatically checks when no bet is faced and folds 
 - Open local sockets at `/ws/table/{club_id}/{table_id}` and union sockets at `/ws/union/{union_id}/{table_id}`; send `{ type: 'authenticate', id_token }` immediately on `open`, adding `club_id` for union sockets. Do not put a user ID or token in the URL.
 - Load completed replays through the matching club or union replay endpoint; never read raw Firestore hand documents from a client.
 - Use a new UUID `buy_in_id` for each intentional purchase and reuse it only when retrying that purchase. The server checks funds and applies the debit; the client must not submit a chip stack.
-- Table lists cover only tables running in the current process. There are still no sit-out, leave-seat, top-up, cash-out, union formation/invitation, or rake-splitting routes. Initial buy-in is performed by the seat endpoint; game actions are sent over WebSocket.
+- Table lists cover only tables running in the current process. There are still no sit-out, leave-seat/stack-return, top-up, union formation/invitation, or rake-splitting routes. Operator claim-back of available member chips is a separate existing wallet route; any real-world cash/bank payment is outside the app. Initial buy-in is performed by the seat endpoint; game actions are sent over WebSocket.
 - State is held in memory. A process restart or routing a socket to another Cloud Run instance can lose or split a live table; session affinity is not durable storage.

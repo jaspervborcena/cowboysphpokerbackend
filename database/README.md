@@ -1,6 +1,6 @@
 # Firestore Data Model
 
-This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed money economy and are separate from the platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend. Global play-money wallets and reserve-backed initial grants are implemented; global-table gameplay, local club/table metadata, general member initialization, external payouts/refunds, and live table recovery are not. Club wallet cash-in and claim-back are operator-mediated transfers between member balances, not external cash payments.
+This document describes current Firestore writes and suggested metadata shapes. Club member balances represent the private club-managed chip economy and are separate from the platform-wide play-money wallet. Buy-ins debit the member's home-club balance and reserve a table seat in a Firestore transaction. Completed hands are first written as pending settlement audits, then an idempotent transaction applies net results to in-play balances and marks each audit settled. Startup retries pending audits. Union table metadata and per-hand clearing records are written by the backend. Global play-money wallets and reserve-backed initial grants are implemented; global-table gameplay, local club/table metadata, general member initialization, and live table recovery are not. Operator claim-back is an in-app transfer of available club chips; any real-world cash/bank payment is handled manually outside the app and is not processed or recorded here.
 
 Target wallet accounts are distinct by purpose:
 
@@ -8,7 +8,7 @@ Target wallet accounts are distinct by purpose:
 - `CLUB_TREASURY`: the shared club reserve controlled by authorized club operators.
 - `CLUB_AGENT`: an agent's operating/distribution balance within one club.
 - `CLUB_PLAYER`: a player's available balance within one club. The same Firebase user may have both `CLUB_AGENT` and `CLUB_PLAYER` accounts in that club.
-- `TABLE_ESCROW`: chips committed to a seat/table while in play. Buy-in moves value from the player's club wallet into the table; cash-out returns it through a recorded transaction.
+- `TABLE_ESCROW`: chips committed to a seat/table while in play. Buy-in moves value from the player's club wallet into the table; seat exit should return the remaining stack to the member's available chip balance through a recorded transaction. An authorized operator can then claim available chips back through the existing claim-back transfer; any fiat payment is off-platform.
 
 Each account must have an explicit `wallet_type`, scope, owner, and `currency_type`. Ledger transactions must identify source and destination accounts and balance per currency; never sum or implicitly transfer across global and club currencies. Cached balances may be maintained for reads, but ledger entries and account updates must commit atomically and idempotently.
 
@@ -113,13 +113,13 @@ Seat path: `clubs/{club_id}/tables/{table_id}/seats/{seat_index}`
 }
 ```
 
-The seat document stores the reserved stack and the idempotency key. Hand settlement updates this seat document's `stack` to the hand's final stack. Full table recovery and seat cash-out/removal are not implemented yet.
+The seat document stores the reserved stack and the idempotency key. Hand settlement updates this seat document's `stack` to the hand's final stack. Full table recovery and seat exit/stack return are not implemented yet.
 
 The same Firestore transaction also creates a club-wide audit entry at `clubs/{club_id}/transactions/{buy_in_id}` with `currency_type: "CLUB_CHIPS"` and `type: "BUY_IN"`. Send-out and claim-back use this collection for double-entry transfer records. Club transaction writes are server-only.
 
 ### Club wallet and treasury
 
-`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update both member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back is rejected if the member's `in_play_balance` is nonzero.
+`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back debits only available `chip_balance`; it never uses or changes `in_play_balance`, so a player may keep chips in play while available chips are claimed.
 
 The shared club treasury wallet is stored separately at `clubs/{club_id}/treasury/wallet`:
 
@@ -431,6 +431,6 @@ Path: `clubs/{club_id}/tables/{table_id}`
 - Keep hand audits server-written and admin-only: they contain all players' private hole cards.
 - Never trust a client-provided balance, hand result, or `net_delta`. The authoritative source is the server's completed first-party hand state.
 - Use Firestore transactions for ledger changes and make settlement idempotent by hand ID.
-- Cash-out is not implemented. Add an idempotent transaction that removes/releases the seat and moves its final stack from `in_play_balance` back to `chip_balance` before treating these fields as a complete wallet ledger.
+- Seat exit/stack return is not implemented. Add an idempotent transaction that removes/releases the seat and moves its final stack from `in_play_balance` back to `chip_balance`. The existing operator claim-back route then transfers available member chips to the authorized manager or assigned agent; real-world cash/bank payment remains manual and off-platform.
 - Firebase ID tokens are verified and active club membership is required. REST derives the user ID from the verified token; WebSockets authenticate in their first message. Review role assignments and Firestore rules before public use.
 - Live table state is currently held in process memory; this schema does not yet provide restart recovery or multi-instance single-writer coordination.

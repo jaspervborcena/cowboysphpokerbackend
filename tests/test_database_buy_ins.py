@@ -947,7 +947,7 @@ def test_send_out_is_double_entry_idempotent_and_limited_to_agent_downline(monke
     assert client.documents[sender]["chip_balance"] == 750
 
 
-def test_claim_back_rejects_in_play_balance_and_transfers_available_chips(monkeypatch) -> None:
+def test_claim_back_transfers_only_available_chips_with_balance_in_play(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     owner = ("clubs", "club-1", "members", "owner-1")
     active_player = ("clubs", "club-1", "members", "active-player")
@@ -955,16 +955,19 @@ def test_claim_back_rejects_in_play_balance_and_transfers_available_chips(monkey
     client = FakeFirestoreClient(
         {
             owner: {"role": "OWNER", "chip_balance": 200},
-            active_player: {"role": "PLAYER", "chip_balance": 500, "in_play_balance": 1},
+            active_player: {"role": "PLAYER", "chip_balance": 500, "in_play_balance": 300},
             player: {"role": "PLAYER", "chip_balance": 500, "in_play_balance": 0},
         }
     )
     repository = FirestoreHandRepository(client)
 
-    assert repository.claim_back_club_chips("club-1", "active-player", "owner-1", 100, "tx-active", "owner-1") == WalletTransactionStatus.PLAYER_HAS_CHIPS_IN_PLAY
+    assert repository.claim_back_club_chips("club-1", "active-player", "owner-1", 100, "tx-active", "owner-1") == WalletTransactionStatus.COMPLETED
+    assert client.documents[active_player]["chip_balance"] == 400
+    assert client.documents[active_player]["in_play_balance"] == 300
+    assert client.documents[owner]["chip_balance"] == 300
     assert repository.claim_back_club_chips("club-1", "player-1", "owner-1", 100, "tx-player", "owner-1") == WalletTransactionStatus.COMPLETED
     assert client.documents[player]["chip_balance"] == 400
-    assert client.documents[owner]["chip_balance"] == 300
+    assert client.documents[owner]["chip_balance"] == 400
 
 
 def test_inter_club_treasury_transfer_is_atomic_and_idempotent(monkeypatch) -> None:

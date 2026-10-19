@@ -92,7 +92,7 @@ For a club, let $N$ be the sum of its players' hand `net_delta` values. The reco
 - debt = $\max(-N, 0)$;
 - credit = $\max(N, 0)$.
 
-Example: if Club A's player loses 500 chips to Club B's player, A's debt increases by 500 and B's credit increases by 500. These records measure the clearing position; they do not transfer money between clubs or cash out player balances.
+Example: if Club A's player loses 500 chips to Club B's player, A's debt increases by 500 and B's credit increases by 500. These records measure the clearing position; they do not transfer money between clubs or return a player's in-play chips to their available club balance.
 
 The game currently charges no rake, so `rake_amount` is zero. The Union software fee and traffic-based rake split are not implemented; do not book or promise a rake share until the rate, eligible pot, rounding, and allocation policy are explicitly decided.
 
@@ -100,7 +100,7 @@ The game currently charges no rake, so `rake_amount` is zero. The Union software
 
 - Union membership and Union Admin provisioning are manual; no formation, invitation, approval, or role-management API exists.
 - Union table listing reflects tables running in the current process. Firestore stores table configuration and closed status, but the game engine does not recover active tables after restart.
-- A seated table cannot be deleted. There is no leave-seat or cash-out route, so seats remain until those flows are designed and implemented.
+- A seated table cannot be deleted. There is no leave-seat/stack-return route, so seats remain until that flow is designed and implemented. This is chip accounting only; real-world cash payment is handled outside the app.
 - The shared WebSocket namespace and live table state work within one process. Scoped union lease claims use Firestore-backed `TableRuntime` methods when enabled, but gameplay writes are not atomically fenced and cross-instance routing, locking, recovery, and durable single-writer behavior are not implemented.
 - Clearing positions are recorded by hand/day; club-to-club payout, reconciliation, cashier transfers, and automated daily close are not implemented.
 - Rake collection and rake allocation are not implemented.

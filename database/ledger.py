@@ -228,8 +228,6 @@ class ClubWalletLedger(WalletLedger):
             return False
         if role == "AGENT" and member.get("agent_id") != admin_user_id:
             return False
-        if int(member.get("in_play_balance", 0)) > 0:
-            return False
         if int(member.get("chip_balance", 0)) < amount:
             return False
         member["chip_balance"] = int(member.get("chip_balance", 0)) - amount

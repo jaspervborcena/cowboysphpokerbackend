@@ -30,10 +30,10 @@ Frontend work can proceed against typed API/WebSocket interfaces and fixture-bac
 
 - [ ] After sign-in, call `POST /me/wallets/global-playmoney/ensure` without a client-selected amount, then load `GET /me/wallets/global-playmoney`. Label it non-cash play money; global-play-money tables and transfers to club chips are not supported.
 - [ ] Load `GET /clubs/{club_id}/members/me/wallet` and show `available_balance` separately from `in_play_balance`. Load the separate club treasury through `GET /clubs/{club_id}/wallet` only for authorized owner/manager screens.
-- [ ] Add owner/manager or assigned-agent send-out and claim-back UI using the existing wallet routes and transaction UUIDs. Display server results as authoritative; explain that claim-back is unavailable while the member has chips in play.
+- [ ] Add owner/manager or assigned-agent send-out and claim-back UI using the existing wallet routes and transaction UUIDs. Display server results as authoritative; claim-back may use only the member's available wallet balance, never chips in play.
 - [ ] Do not present separate agent and player balances: the backend currently has one member balance pair per club membership. Keep composite wallet fixtures marked as mock.
 - [ ] Keep `POST /platform/clubs` in a trusted platform-admin bootstrap surface only; it creates a real club and reserve-funded treasury, not a normal self-service club request.
-- [ ] A player cash-out request may appear only as clearly labeled pending/mock UI until a request/approval API exists. Do not change balances locally.
+- [ ] Do not build a player cash-out request/approval or fiat payout flow unless requirements change. The intended flow is seat exit returning chips to the member's available balance, followed by an authorized manager/assigned-agent claim-back through the existing wallet route; any real-world cash/bank payment is handled manually outside the app.
 
 ### Tables and gameplay
 
@@ -64,9 +64,9 @@ Use distinct labels and never add balances from different scopes together:
 | Selected club, owner/manager tools | `CLUB_TREASURY` | `GET /clubs/{club_id}/wallet` reads the treasury. `POST /platform/clubs` creates a club with 10,000 treasury chips; the owner's personal member balance starts at zero. |
 | Active table | `TABLE_ESCROW` / seat stack | Show the player's stack for this table; do not treat it as another spendable wallet. |
 
-All wallet routes require a Firebase ID token. Club routes additionally require an active club membership; `GET /clubs/{club_id}/wallet` and inter-club treasury transfers require `OWNER` or `MANAGER`, while member send-out and claim-back permit `OWNER`, `MANAGER`, or an assigned `AGENT`. Claim-back is rejected while the member's `in_play_balance` is nonzero. Transfer requests require an idempotency `transaction_id`. `POST /platform/clubs` is a real platform-admin mutation that creates a club and reserve-funded treasury; it is not a non-authoritative proposal or draft flow.
+All wallet routes require a Firebase ID token. Club routes additionally require an active club membership; `GET /clubs/{club_id}/wallet` and inter-club treasury transfers require `OWNER` or `MANAGER`, while member send-out and claim-back permit `OWNER`, `MANAGER`, or an assigned `AGENT`. Claim-back debits only `chip_balance`; it can be used while `in_play_balance` is nonzero and must never alter that in-play amount. Transfer requests require an idempotency `transaction_id`. `POST /platform/clubs` is a real platform-admin mutation that creates a club and reserve-funded treasury; it is not a non-authoritative proposal or draft flow.
 
-The backend does not provide a player-initiated cash-out request/approval workflow. A UI may show a clearly labeled pending mock request, but must not change balances locally. An authorized operator can fulfill a claim-back through the existing endpoint. `GET /clubs/{club_id}/members/me` returns role/profile data; use the `/wallet` route for member balances.
+The backend does not provide seat exit/stack return. Once chips are available in the member balance, an authorized operator can claim them through the existing claim-back endpoint. The corresponding real-world cash/bank payment is outside the app. Do not imply the app processes or records fiat payouts. `GET /clubs/{club_id}/members/me` returns role/profile data; use the `/wallet` route for member balances.
 
 The same person may have both agent and player roles, but current balances are not separate by role. The wallet-dashboard fixture remains a conceptual composite, not a single API response; label its data as mock and use the live routes for real balances and club-chip movements.
 
@@ -102,7 +102,7 @@ Treat `game_id`, `display_name`, and `create_supported` as the UI-facing game ca
 
 - Do not offer PLO/PLO5/PLO6, Tongits, or any other game until its first-party engine is create-supported and its actions, snapshots, replay, and settlement behavior are documented.
 - Tournament registration, blind-level controls, eliminations, table balancing, and tournament prize views need a separately implemented tournament API and event contract.
-- Sit-out/sit-in, leave-seat, rebuy/top-up, and cash-out controls should wait for their server endpoints and idempotency rules.
+- Sit-out/sit-in, leave-seat/stack return, and rebuy/top-up controls should wait for their server endpoints and idempotency rules. Operator claim-back already has a server endpoint; real-world cash payment is off-platform.
 - Reconnect by `last_event_id`, state-version conflict handling, and cross-worker action routing are future protocols. Today, reconnect by authenticating again and replacing UI state with the full snapshot.
 - Do not call the game server's `/workers/{worker_id}/...` coordination routes from the client. They require an internal bearer token and remain process-local rather than a production worker control plane.
 - Do not assume that multi-worker table recovery, durable action deduplication, chat, or 1,000-10,000 player capacity is implemented.
