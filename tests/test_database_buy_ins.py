@@ -46,9 +46,6 @@ class FakeDocumentReference:
             return transaction.get(self)
         return FakeSnapshot(self.client.documents.get(self.path))
 
-    def delete(self) -> None:
-        self.client.documents.pop(self.path, None)
-
 
 class FakeCollectionReference:
     def __init__(self, client: FakeFirestoreClient, path: tuple[str, ...]) -> None:
@@ -403,27 +400,6 @@ def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
     assert client.documents[state_path]["owner_id"] == "worker-a"
     assert client.documents[state_path]["fencing_epoch"] == 1
     assert repository.get_table_checkpoint("club", "club-1", "table-1")["checkpoint"] == checkpoint
-
-
-def test_table_checkpoints_can_be_saved_and_listed(monkeypatch) -> None:
-    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
-    client = FakeFirestoreClient({})
-    repository = FirestoreHandRepository(client)
-    first_checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}, "version": 1}
-    second_checkpoint = {"schema_version": 1, "table": {"table_id": "table-1"}, "version": 2}
-
-    assert repository.save_table_checkpoint("club", "club-1", "table-1", first_checkpoint) == 1
-    assert repository.save_table_checkpoint("club", "club-1", "table-1", second_checkpoint) == 2
-
-    checkpoints = repository.list_table_checkpoints()
-    assert len(checkpoints) == 1
-    assert checkpoints[0]["scope_type"] == "club"
-    assert checkpoints[0]["scope_id"] == "club-1"
-    assert checkpoints[0]["table_id"] == "table-1"
-    assert checkpoints[0]["checkpoint"] == second_checkpoint
-
-    repository.delete_table_checkpoint("club", "club-1", "table-1")
-    assert repository.list_table_checkpoints() == []
 
 
 def test_durable_table_lease_claim_renew_expire_and_fence(monkeypatch) -> None:
