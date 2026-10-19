@@ -5,7 +5,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app import main as api_main
 from app.main import app, tables
-from database import BuyInStatus, NullHandRepository, WalletTransactionStatus
+from database import BuyInStatus, NullHandRepository, RoleChangeStatus, WalletTransactionStatus
 from logic.connections import ConnectionManager
 from logic.first_party_table import FirstPartyNLHGame
 from logic.runtime import TableRuntime
@@ -37,6 +37,7 @@ class FakeHandRepository:
         self.union_table_records: dict[tuple[str, str], dict[str, object]] = {}
         self.union_hand_summaries: list[dict[str, object]] = []
         self.wallet_calls: list[tuple[object, ...]] = []
+        self.role_change_calls: list[tuple[str, str, str, str, str]] = []
         self.interclub_calls: list[tuple[object, ...]] = []
         self.club_wallet_balances: dict[str, int] = {}
         self.created_clubs: list[tuple[str, str, str, str]] = []
@@ -127,6 +128,32 @@ class FakeHandRepository:
             "chip_balance": self.balances[user_id],
             "in_play_balance": self.in_play_balances.get(user_id, 0),
         }
+
+    def list_club_members(self, club_id: str) -> list[dict[str, str]]:
+        return [
+            {
+                "user_id": user_id,
+                "username": f"Display {user_id}",
+                "role": self.roles.get(user_id, "PLAYER"),
+                "status": "active",
+            }
+            for user_id in sorted(self.balances)
+        ]
+
+    def change_club_member_role(
+        self,
+        club_id: str,
+        actor_user_id: str,
+        target_user_id: str,
+        target_role: str,
+        transaction_id: str,
+    ) -> tuple[RoleChangeStatus, str | None]:
+        self.role_change_calls.append(
+            (club_id, actor_user_id, target_user_id, target_role, transaction_id)
+        )
+        previous_role = self.roles.get(target_user_id, "PLAYER")
+        self.roles[target_user_id] = target_role
+        return RoleChangeStatus.COMPLETED, previous_role
 
     def reserve_buy_in(
         self,
@@ -1522,6 +1549,88 @@ def test_authenticated_user_creates_funded_club_as_owner(monkeypatch) -> None:
         "regular-player",
         "regular-player",
     )
+
+
+def test_owner_lists_active_club_members_without_balances(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"owner": 1000, "player": 250},
+        {"owner": "OWNER", "player": "PLAYER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/clubs/role-club/members",
+            headers={"Authorization": "Bearer valid:owner"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"user_id": "owner", "username": "Display owner", "role": "OWNER"},
+        {"user_id": "player", "username": "Display player", "role": "PLAYER"},
+    ]
+    assert "chip_balance" not in response.text
+
+
+def test_manager_promotes_player_using_verified_actor_uid(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"manager": 1000, "target-player": 0},
+        {"manager": "MANAGER", "target-player": "PLAYER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/clubs/role-club/members/target-player/role",
+            json={
+                "role": "MANAGER",
+                "transaction_id": "00000000-0000-0000-0000-000000000123",
+            },
+            headers={"Authorization": "Bearer valid:manager"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "club_id": "role-club",
+        "user_id": "target-player",
+        "previous_role": "PLAYER",
+        "role": "MANAGER",
+        "transaction_id": "00000000-0000-0000-0000-000000000123",
+        "status": "completed",
+    }
+    assert repository.role_change_calls == [
+        (
+            "role-club",
+            "manager",
+            "target-player",
+            "MANAGER",
+            "00000000-0000-0000-0000-000000000123",
+        )
+    ]
+
+
+def test_player_cannot_list_members_or_change_roles(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"player": 1000, "target-player": 0},
+        {"player": "PLAYER", "target-player": "PLAYER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer valid:player"}
+        list_response = client.get("/clubs/role-club/members", headers=headers)
+        change_response = client.post(
+            "/clubs/role-club/members/target-player/role",
+            json={
+                "role": "AGENT",
+                "transaction_id": "00000000-0000-0000-0000-000000000124",
+            },
+            headers=headers,
+        )
+
+    assert list_response.status_code == 403
+    assert change_response.status_code == 403
+    assert repository.role_change_calls == []
 
 
 def test_inter_club_wallet_routes_are_limited_to_owners_and_managers(monkeypatch) -> None:

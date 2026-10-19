@@ -84,7 +84,17 @@ Membership roles are `OWNER` (Club owner), `MANAGER` (Manager), `AGENT` (Agent),
 | `AGENT` | Send chips to and claim chips back from assigned downline members, subject to the agent's available balance. |
 | `PLAYER` | Buy in, take a seat, and connect to play. |
 
-All roles require active membership. Role assignment is not exposed by this API.
+All roles require active membership. Owners and managers can list active club members with `GET /clubs/{club_id}/members` and administer roles with `POST /clubs/{club_id}/members/{user_id}/role`. Role changes are club-scoped, transactional, and audited; the actor UID always comes from the verified Firebase token.
+
+Promotion and demotion policy:
+
+| Actor | Allowed transitions |
+| --- | --- |
+| `OWNER` | `PLAYER` to `AGENT` or `MANAGER`; `AGENT` to `MANAGER`; `MANAGER` to `AGENT` or `PLAYER`; `AGENT` to `PLAYER`. |
+| `MANAGER` | `PLAYER` or `AGENT` to `MANAGER`; `MANAGER` to `AGENT` or `PLAYER`; `AGENT` to `PLAYER`. |
+| `AGENT` / `PLAYER` | Cannot change roles. |
+
+No actor can change their own role, assign `OWNER`, or change the current club owner's role. The member directory returns only `user_id`, `username`, and role for active members; it does not expose balances.
 
 `UNION_ADMIN` is a separate union-scoped authority, not a club role. It is assigned under `unions/{union_id}/admins/{user_id}` and does not grant extra privileges over the user's club. See [Union Tables and Settlement](#union-tables-and-settlement).
 
@@ -106,6 +116,48 @@ Requires a valid Firebase ID token and active membership. Response `200`:
 The `role` value is authoritative and is always one of the four role IDs listed above.
 
 Invalid/missing REST credentials return `401`; a valid Firebase user who is not an active club member returns `403`.
+
+### List active club members
+
+`GET /clubs/{club_id}/members`
+
+Requires an active `OWNER` or `MANAGER` membership. It returns active members only, with no wallet or balance fields. This directory is intended for the role-management UI.
+
+Response `200`:
+
+```json
+[
+  {"user_id":"player-a","username":"Alice","role":"PLAYER"},
+  {"user_id":"agent-a","username":"Bob","role":"AGENT"}
+]
+```
+
+### Change a club member role
+
+`POST /clubs/{club_id}/members/{user_id}/role`
+
+Requires an active `OWNER` or `MANAGER` membership. The server determines the actor from the Firebase token and enforces the transition matrix above inside the Firestore transaction. The request cannot choose the actor or set `OWNER`.
+
+Request:
+
+```json
+{"role":"MANAGER","transaction_id":"00000000-0000-0000-0000-000000000123"}
+```
+
+Response `200`:
+
+```json
+{
+  "club_id":"club-a",
+  "user_id":"player-a",
+  "previous_role":"PLAYER",
+  "role":"MANAGER",
+  "transaction_id":"00000000-0000-0000-0000-000000000123",
+  "status":"completed"
+}
+```
+
+Each successful change updates the member document and writes `clubs/{club_id}/role_changes/{transaction_id}` atomically. Reuse the same transaction ID only to retry the same actor, target, and target role; conflicting reuse returns `409`. Self-changes and unauthorized transitions return `403`; inactive targets return `409`; missing targets return `404`.
 
 ### Wallet summaries
 

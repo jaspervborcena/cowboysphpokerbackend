@@ -55,7 +55,7 @@ The role panel should also state: “Your current role is PLAYER. Role assignmen
 | `AGENT` | Agent | Send chips to and claim chips back from assigned downline members. |
 | `PLAYER` | Player | Buy in, take a seat, and connect to play. |
 
-All four roles require an active club membership. Role assignment itself is managed outside this API. See [API.md](API.md) for the client contract and route requirements.
+All four roles require an active club membership. Owners and managers can list active members and promote/demote roles under the transition rules in [API.md](API.md); the owner role itself cannot be assigned or changed through the member-role API. Every change is audited, and the UI must not allow users to change their own role.
 
 Union administration is separate from club roles. `UNION_ADMIN` is assigned per union and can create/start shared tables and delete empty shared tables; club `OWNER` and `MANAGER` roles do not grant those permissions. Active `PLAYER` members join shared tables through their home club, and chip balances remain in that club's ledger. See [UNIONS.md](UNIONS.md) for the domain model and current limits.
 
@@ -187,7 +187,7 @@ For a Cloud Run image, create the Artifact Registry repository `poker-services`,
 
 ### Firestore Emulator Settlement Test
 
-Install JDK 21 or newer, then run the focused settlement test against the local Firestore emulator:
+Install JDK 21 or newer and ensure `JAVA_HOME` points to it, with its `bin` directory first on `PATH` if older Java versions are also installed. Then run the focused settlement test against the local Firestore emulator:
 
 ```powershell
 firebase emulators:exec --only firestore --project demo-cowboys-ph-poker ".venv\Scripts\python.exe -m pytest tests\test_firestore_emulator.py -q"

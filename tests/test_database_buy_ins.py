@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -9,7 +10,9 @@ from database import (
     BuyInStatus,
     FirestoreRequiredError,
     FirestoreHandRepository,
+    RoleChangeStatus,
     TableActionCommitStatus,
+    TableLeaseOperationStatus,
     WalletTransactionStatus,
     table_action_fingerprint,
 )
@@ -17,9 +20,10 @@ from database import hand_repository
 
 
 class FakeSnapshot:
-    def __init__(self, data: dict[str, Any] | None) -> None:
+    def __init__(self, data: dict[str, Any] | None, document_id: str | None = None) -> None:
         self._data = data
         self.exists = data is not None
+        self.id = document_id
 
     def to_dict(self) -> dict[str, Any] | None:
         return dict(self._data) if self._data is not None else None
@@ -53,7 +57,7 @@ class FakeCollectionReference:
 
     def stream(self) -> list[FakeSnapshot]:
         return [
-            FakeSnapshot(data)
+            FakeSnapshot(data, path[-1])
             for path, data in self.client.documents.items()
             if path[:-1] == self.path
         ]
@@ -168,6 +172,143 @@ def test_buy_in_debits_balance_reserves_seat_and_is_idempotent(monkeypatch) -> N
     assert client.documents[member_path]["chip_balance"] == 600
 
 
+@pytest.mark.parametrize(
+    ("actor_role", "current_role", "target_role"),
+    [
+        ("OWNER", "PLAYER", "AGENT"),
+        ("OWNER", "PLAYER", "MANAGER"),
+        ("OWNER", "AGENT", "MANAGER"),
+        ("OWNER", "MANAGER", "AGENT"),
+        ("OWNER", "MANAGER", "PLAYER"),
+        ("OWNER", "AGENT", "PLAYER"),
+        ("MANAGER", "PLAYER", "MANAGER"),
+        ("MANAGER", "AGENT", "MANAGER"),
+        ("MANAGER", "MANAGER", "AGENT"),
+        ("MANAGER", "MANAGER", "PLAYER"),
+        ("MANAGER", "AGENT", "PLAYER"),
+    ],
+)
+def test_club_role_change_allows_policy_transitions(
+    monkeypatch,
+    actor_role: str,
+    current_role: str,
+    target_role: str,
+) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        ("clubs", club_id, "members", "actor"): {"status": "active", "role": actor_role},
+        ("clubs", club_id, "members", "target"): {"status": "active", "role": current_role},
+    })
+    repository = FirestoreHandRepository(client)
+
+    status, previous_role = repository.change_club_member_role(
+        club_id, "actor", "target", target_role, "role-change-1"
+    )
+
+    assert status is RoleChangeStatus.COMPLETED
+    assert previous_role == current_role
+    assert client.documents[("clubs", club_id, "members", "target")]["role"] == target_role
+    audit = client.documents[("clubs", club_id, "role_changes", "role-change-1")]
+    assert audit["from_role"] == current_role
+    assert audit["to_role"] == target_role
+    assert audit["performed_by"] == "actor"
+
+
+@pytest.mark.parametrize(
+    ("actor_role", "target_user_id", "current_role", "target_role", "expected"),
+    [
+        ("PLAYER", "target", "PLAYER", "AGENT", RoleChangeStatus.UNAUTHORIZED_ACTOR),
+        ("OWNER", "actor", "OWNER", "PLAYER", RoleChangeStatus.SELF_CHANGE),
+        ("MANAGER", "target", "PLAYER", "AGENT", RoleChangeStatus.INVALID_TRANSITION),
+        ("MANAGER", "owner", "OWNER", "PLAYER", RoleChangeStatus.OWNER_PROTECTED),
+    ],
+)
+def test_club_role_change_rejects_forbidden_transitions(
+    monkeypatch,
+    actor_role: str,
+    target_user_id: str,
+    current_role: str,
+    target_role: str,
+    expected: RoleChangeStatus,
+) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    members = {
+        "actor": {"status": "active", "role": actor_role},
+        "target": {"status": "active", "role": "PLAYER"},
+        "owner": {"status": "active", "role": "OWNER"},
+    }
+    members[target_user_id] = {"status": "active", "role": current_role}
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        **{
+            ("clubs", club_id, "members", user_id): member
+            for user_id, member in members.items()
+        },
+    })
+    repository = FirestoreHandRepository(client)
+
+    status, _ = repository.change_club_member_role(
+        club_id, "actor", target_user_id, target_role, "role-change-2"
+    )
+
+    assert status is expected
+    assert ("clubs", club_id, "role_changes", "role-change-2") not in client.documents
+
+
+def test_club_role_change_is_idempotent_and_detects_conflicting_reuse(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    club_id = "club-roles"
+    client = FakeFirestoreClient({
+        ("clubs", club_id): {"owner_user_id": "owner"},
+        ("clubs", club_id, "members", "owner"): {"status": "active", "role": "OWNER"},
+        ("clubs", club_id, "members", "player"): {"status": "active", "role": "PLAYER"},
+    })
+    repository = FirestoreHandRepository(client)
+    arguments = (club_id, "owner", "player", "AGENT", "role-change-3")
+
+    assert repository.change_club_member_role(*arguments) == (
+        RoleChangeStatus.COMPLETED,
+        "PLAYER",
+    )
+    assert repository.change_club_member_role(*arguments) == (
+        RoleChangeStatus.IDEMPOTENT_REPLAY,
+        "PLAYER",
+    )
+    assert repository.change_club_member_role(
+        club_id, "owner", "player", "MANAGER", "role-change-3"
+    )[0] is RoleChangeStatus.IDEMPOTENCY_CONFLICT
+
+
+def test_list_club_members_returns_only_safe_active_member_fields() -> None:
+    client = FakeFirestoreClient({
+        ("clubs", "club-roles", "members", "owner"): {
+            "username": "Club Owner",
+            "role": "OWNER",
+            "status": "active",
+            "chip_balance": 5000,
+        },
+        ("clubs", "club-roles", "members", "inactive"): {
+            "username": "Inactive Member",
+            "role": "PLAYER",
+            "status": "inactive",
+            "chip_balance": 2500,
+        },
+    })
+    repository = FirestoreHandRepository(client)
+
+    assert repository.list_club_members("club-roles") == [
+        {
+            "user_id": "owner",
+            "username": "Club Owner",
+            "role": "OWNER",
+            "status": "active",
+        }
+    ]
+
+
 def test_global_playmoney_wallet_grant_is_created_once(monkeypatch) -> None:
     monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
     client = FakeFirestoreClient({
@@ -259,6 +400,126 @@ def test_table_checkpoint_initialization_is_create_only(monkeypatch) -> None:
     assert client.documents[state_path]["owner_id"] == "worker-a"
     assert client.documents[state_path]["fencing_epoch"] == 1
     assert repository.get_table_checkpoint("club", "club-1", "table-1")["checkpoint"] == checkpoint
+
+
+def test_durable_table_lease_claim_renew_expire_and_fence(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client, now_factory=lambda: now)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-lease"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-lease", "table-lease", "worker-a", 1, checkpoint
+    )
+
+    lease_path = ("clubs", "club-lease", "tables", "table-lease", "runtime", "lease")
+    initial_expiry = client.documents[lease_path]["lease_expires_at"]
+    now += timedelta(seconds=5)
+    renewed = repository.claim_table_lease("club", "club-lease", "table-lease", "worker-a")
+    blocked = repository.claim_table_lease("club", "club-lease", "table-lease", "worker-b")
+    now += timedelta(seconds=1)
+    heartbeat = repository.renew_table_lease(
+        "club", "club-lease", "table-lease", "worker-a", 1
+    )
+
+    assert renewed.status is TableLeaseOperationStatus.RENEWED
+    assert renewed.fencing_epoch == 1
+    assert blocked.status is TableLeaseOperationStatus.HELD
+    assert client.documents[lease_path]["lease_expires_at"] > initial_expiry
+    state_path = ("clubs", "club-lease", "tables", "table-lease", "runtime", "state")
+    assert heartbeat.status is TableLeaseOperationStatus.RENEWED
+    assert client.documents[lease_path]["lease_expires_at"] == heartbeat.lease_expires_at
+    assert client.documents[state_path]["lease_expires_at"] == heartbeat.lease_expires_at
+
+    now += timedelta(seconds=31)
+    takeover = repository.claim_table_lease("club", "club-lease", "table-lease", "worker-b")
+    stale_renewal = repository.renew_table_lease(
+        "club", "club-lease", "table-lease", "worker-a", 1
+    )
+
+    assert takeover.status is TableLeaseOperationStatus.ACQUIRED
+    assert takeover.fencing_epoch == 2
+    assert stale_renewal.status is TableLeaseOperationStatus.FENCED
+    stale_action = repository.commit_table_action(
+        "club",
+        "club-lease",
+        "table-lease",
+        "worker-a",
+        1,
+        0,
+        "player-a",
+        "stale-action",
+        "0" * 64,
+        checkpoint,
+    )
+    assert stale_action.status is TableActionCommitStatus.FENCED
+    state = client.documents[("clubs", "club-lease", "tables", "table-lease", "runtime", "state")]
+    assert state["owner_id"] == "worker-b"
+    assert state["fencing_epoch"] == 2
+
+    released = repository.release_table_lease(
+        "club", "club-lease", "table-lease", "worker-b", 2
+    )
+    assert released.status is TableLeaseOperationStatus.RELEASED
+    assert client.documents[lease_path]["lease_status"] == "released"
+    assert state["lease_status"] == "released"
+    assert state["lease_expires_at"] == client.documents[lease_path]["lease_expires_at"]
+    reclaimed = repository.claim_table_lease("club", "club-lease", "table-lease", "worker-a")
+    assert reclaimed.fencing_epoch == 3
+
+
+def test_table_lease_release_rejects_checkpoint_epoch_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client, now_factory=lambda: now)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-release-fence"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-release-fence", "table-release-fence", "worker-a", 1, checkpoint
+    )
+
+    lease_path = (
+        "clubs", "club-release-fence", "tables", "table-release-fence", "runtime", "lease"
+    )
+    state_path = (
+        "clubs", "club-release-fence", "tables", "table-release-fence", "runtime", "state"
+    )
+    original_lease = dict(client.documents[lease_path])
+    client.documents[state_path]["fencing_epoch"] = 2
+
+    result = repository.release_table_lease(
+        "club", "club-release-fence", "table-release-fence", "worker-a", 1
+    )
+
+    assert result.status is TableLeaseOperationStatus.FENCED
+    assert client.documents[lease_path] == original_lease
+
+
+def test_checkpoint_action_commit_rejects_expired_durable_lease(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    client = FakeFirestoreClient({})
+    repository = FirestoreHandRepository(client, now_factory=lambda: now)
+    checkpoint = {"schema_version": 1, "table": {"table_id": "table-expired"}}
+    assert repository.initialize_table_checkpoint(
+        "club", "club-expired", "table-expired", "worker-a", 1, checkpoint
+    )
+    now += timedelta(seconds=31)
+
+    result = repository.commit_table_action(
+        "club",
+        "club-expired",
+        "table-expired",
+        "worker-a",
+        1,
+        0,
+        "player-a",
+        "action-a",
+        "0" * 64,
+        checkpoint,
+    )
+
+    assert result.status is TableActionCommitStatus.FENCED
 
 
 def test_table_action_commit_atomically_advances_checkpoint_and_replays(monkeypatch) -> None:

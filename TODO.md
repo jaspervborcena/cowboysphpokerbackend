@@ -1,6 +1,6 @@
 # Project TODO
 
-Last reviewed: 2026-10-18
+Last reviewed: 2026-10-19
 
 This list tracks repository work, not just architecture proposals. A completed diagram or document does not mean its runtime components are implemented.
 
@@ -8,6 +8,7 @@ This list tracks repository work, not just architecture proposals. A completed d
 
 - [x] Implement separate currency-scoped reserves for global play-money grants and 10,000-chip club-creation giveaways, with atomic debit, destination credit, and ledger logging.
 - [x] Add self-service `POST /clubs`: derive the owner from the Firebase UID and grant 10,000 `CLUB_CHIPS` from the pre-provisioned giveaway reserve.
+- [x] Add club member role administration: owner/manager-only active member directory and audited promotion/demotion transitions; protect owner and block self-role changes.
 - [x] Provision the production `CLUB_CHIPS` giveaway reserve with a 1,000,000,000-chip opening allocation and audit record.
 - [x] Refresh the Firebase architecture diagram statuses for the current single-process runtime, implemented checkpoint primitive, and separate global/club-chip reserves; keep unfinished scaling and recovery components marked as targets.
 - [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records; operations with stable transaction IDs are retry-idempotent.
@@ -46,11 +47,12 @@ This list tracks repository work, not just architecture proposals. A completed d
 - [x] Add a Firestore emulator config and a focused first-party NLH settlement/idempotency integration test.
 - [x] Add versioned JSON checkpoint codecs for NLH hand/deck state and the enclosing table state, including seats, settings, button rotation, pre-actions, replay frames, engine events, and pending completed hands; persistence remains outstanding.
 - [x] Add a Firestore transaction primitive that initializes versioned table checkpoints and atomically advances a checkpoint with a user/action-ID journal record, guarded by expected sequence and fencing epoch.
-- [ ] Run the Firestore emulator settlement test before production rollout. Firebase CLI requires JDK 21; the current environment only has JDK 17.
+- [x] Verify Firestore settlement against the emulator locally (2026-10-19: 1 passed with JDK 21); repeat as a release gate before production rollout.
 
 ## UI: Can Proceed Now
 
 - [ ] Implement Firebase sign-in, membership/role display, club and union lobbies, and NLH table creation.
+- [ ] Add owner/manager member directory and role-change controls using `GET /clubs/{club_id}/members` and `POST /clubs/{club_id}/members/{user_id}/role`; display authoritative role changes after successful responses.
 - [ ] Implement buy-in/seat flows, current v1 WebSocket authentication/actions/pre-actions, snapshots, errors, wallet views, and replay using the documented contracts.
 - [ ] After Firebase sign-up/sign-in, call `POST /me/wallets/global-playmoney/ensure` to provision the authenticated user's persistent `GLOBAL_PLAYMONEY` wallet with 20,000 chips, then load it with `GET /me/wallets/global-playmoney`. Keep it isolated from club chips and do not offer client-controlled grant amounts.
 - [ ] For player-created clubs, call `POST /clubs` with the club name and signed-in user's Firebase ID token. Use the response's `club_id` and `treasury_balance` (10,000 `CLUB_CHIPS`) for initial UI state, then refresh with `GET /clubs/{club_id}/wallet`. Prevent duplicate submits; the create route has no idempotency key. Do not display the treasury grant as the owner's personal member balance.
@@ -65,8 +67,9 @@ The UI can proceed against the stable REST, WebSocket, snapshot, and replay cont
 ## Before Multi-Worker Live Tables
 
 - [x] Add a Firestore transaction primitive that atomically advances a table checkpoint and records the action fingerprint, guarded by expected sequence and fencing epoch.
-- [ ] Design and implement one authoritative owner per table with durable leases and fencing generations.
-- [ ] Wire checkpoint/action transactions into table creation, seating, hand start, player actions, pre-actions, and timeout actions. Stage mutations and publish/acknowledge only after commit; atomically couple buy-in debits with seat/checkpoint updates.
+- [x] Add Firestore-backed lease claim, renewal, and release transactions with TTLs, monotonically increasing fencing epochs, and stale-epoch rejection in checkpoint action commits.
+- [ ] Wire durable worker identity and lease heartbeat into each runtime; require the current fenced owner for table mutations and gate action publish/acknowledgement on checkpoint commit.
+- [ ] Atomically couple buy-in debits and seat reservations with the table checkpoint; stage hand-start, action, pre-action, and timeout mutations and publish only after durable commit.
 - [ ] Add protected/encrypted checkpoint storage and turn-deadline recovery.
 - [ ] Add reconnect replay cursors and durable action idempotency.
 - [ ] Keep current live-table testing on one backend instance until ownership and recovery exist.

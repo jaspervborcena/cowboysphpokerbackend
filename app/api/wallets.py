@@ -19,6 +19,7 @@ from app.auth.roles import (
 from database import (
     FirestoreRequiredError,
     INITIAL_CLUB_TREASURY_FUNDS,
+    RoleChangeStatus,
     WalletTransactionStatus,
 )
 
@@ -40,6 +41,11 @@ class ClubTreasuryTransferRequest(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class ClubRoleChangeRequest(BaseModel):
+    role: Literal["MANAGER", "AGENT", "PLAYER"]
+    transaction_id: UUID
+
+
 class CreateClubRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
@@ -50,6 +56,21 @@ class PlatformCreateClubRequest(CreateClubRequest):
 
 class ClubMembershipResponse(BaseModel):
     club_id: str
+    user_id: str
+    username: str
+    role: Literal["OWNER", "MANAGER", "AGENT", "PLAYER"]
+
+
+class ClubRoleChangeResponse(BaseModel):
+    club_id: str
+    user_id: str
+    previous_role: Literal["MANAGER", "AGENT", "PLAYER"]
+    role: Literal["MANAGER", "AGENT", "PLAYER"]
+    transaction_id: str
+    status: Literal["completed", "idempotent_replay"]
+
+
+class ClubMemberDirectoryEntry(BaseModel):
     user_id: str
     username: str
     role: Literal["OWNER", "MANAGER", "AGENT", "PLAYER"]
@@ -211,6 +232,96 @@ async def get_my_club_wallet_summary(
         "available_balance": available,
         "in_play_balance": in_play,
     }
+
+
+@router.get(
+    "/clubs/{club_id}/members",
+    tags=["Membership"],
+    summary="List active club members",
+    description="Lists active members for club OWNER and MANAGER role administration. Wallet balances are not included.",
+    response_model=list[ClubMemberDirectoryEntry],
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("An active OWNER or MANAGER membership is required."),
+        503: error_response("Membership storage is unavailable."),
+    },
+)
+async def list_club_members(
+    club_id: str,
+    request: Request,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> list[dict[str, str]]:
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER}:
+        raise HTTPException(status_code=403, detail="Only club owners and managers can list members.")
+    try:
+        members = await asyncio.to_thread(
+            request.app.state.repository.list_club_members,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Membership storage is unavailable.") from error
+    return sorted(members, key=lambda member: (member["username"].casefold(), member["user_id"]))
+
+
+@router.post(
+    "/clubs/{club_id}/members/{user_id}/role",
+    tags=["Membership"],
+    summary="Change a club member role",
+    description="Applies owner/manager role transition rules and writes a role-change audit entry atomically.",
+    response_model=ClubRoleChangeResponse,
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("The actor is not authorized for this role change."),
+        404: error_response("The club or target member was not found."),
+        409: error_response("The role change conflicts with the current membership or transaction."),
+        503: error_response("Role storage is unavailable."),
+    },
+)
+async def change_club_member_role(
+    club_id: str,
+    user_id: str,
+    change_request: ClubRoleChangeRequest,
+    request: Request,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, str]:
+    if membership.role not in {ClubRole.OWNER, ClubRole.MANAGER}:
+        raise HTTPException(status_code=403, detail="Only club owners and managers can change member roles.")
+    try:
+        status, previous_role = await asyncio.to_thread(
+            request.app.state.repository.change_club_member_role,
+            club_id,
+            membership.user.uid,
+            user_id,
+            change_request.role,
+            str(change_request.transaction_id),
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Role storage is unavailable.") from error
+
+    if status in {RoleChangeStatus.COMPLETED, RoleChangeStatus.IDEMPOTENT_REPLAY}:
+        return {
+            "club_id": club_id,
+            "user_id": user_id,
+            "previous_role": previous_role or change_request.role,
+            "role": change_request.role,
+            "transaction_id": str(change_request.transaction_id),
+            "status": status.value,
+        }
+    if status is RoleChangeStatus.CLUB_NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Club not found.")
+    if status is RoleChangeStatus.TARGET_NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Club member not found.")
+    if status is RoleChangeStatus.TARGET_INACTIVE:
+        raise HTTPException(status_code=409, detail="Inactive club members cannot have their role changed.")
+    if status is RoleChangeStatus.IDEMPOTENCY_CONFLICT:
+        raise HTTPException(status_code=409, detail="transaction_id was already used for a different role change.")
+    if status is RoleChangeStatus.SELF_CHANGE:
+        raise HTTPException(status_code=403, detail="Members cannot change their own role.")
+    if status is RoleChangeStatus.OWNER_PROTECTED:
+        raise HTTPException(status_code=403, detail="The OWNER role cannot be changed through this route.")
+    if status is RoleChangeStatus.INVALID_TRANSITION:
+        raise HTTPException(status_code=403, detail="This actor cannot make the requested role transition.")
+    raise HTTPException(status_code=403, detail="The actor is not authorized for this role change.")
 
 
 @router.post(
