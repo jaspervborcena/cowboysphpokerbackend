@@ -28,6 +28,7 @@ def test_nlh_uncalled_return_settlement_is_atomic_and_idempotent() -> None:
     player_ids = (f"player-a-{suffix}", f"player-b-{suffix}")
 
     game = FirstPartyNLHGame(table_id, 50, 100, 100, 1000)
+    game.update_table_settings(jackpot_enabled=False)
     for seat, player_id in enumerate(player_ids):
         assert game.add_player(seat, player_id, player_id, 500, club_id=club_id)
     assert game.start_new_hand()
