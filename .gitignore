@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .env
+node_modules/
+*-debug.log

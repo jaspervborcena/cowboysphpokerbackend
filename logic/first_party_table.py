@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -26,30 +25,38 @@ def _attribute_rake_by_contribution(
     contributions: dict[str, int],
     seat_order: tuple[str, ...],
 ) -> dict[str, int]:
-    if isinstance(rake_amount, bool) or not isinstance(rake_amount, int) or rake_amount < 0:
-        raise ValueError("Rake amount must be a non-negative integer.")
-    if len(set(seat_order)) != len(seat_order) or set(contributions) != set(seat_order):
-        raise ValueError("Seat order must contain each contributing player exactly once.")
-    if any(
-        isinstance(amount, bool) or not isinstance(amount, int) or amount < 0
-        for amount in contributions.values()
-    ):
-        raise ValueError("Player contributions must be non-negative integers.")
+    return _allocate_amount_by_weight(rake_amount, contributions, seat_order)
 
-    total_contribution = sum(contributions.values())
-    if rake_amount > total_contribution:
-        raise ValueError("Rake cannot exceed the contestable contribution total.")
-    if total_contribution == 0:
+
+def _allocate_amount_by_weight(
+    amount: int,
+    weights: dict[str, int],
+    seat_order: tuple[str, ...],
+) -> dict[str, int]:
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise ValueError("Amount must be a non-negative integer.")
+    if len(set(seat_order)) != len(seat_order) or set(weights) != set(seat_order):
+        raise ValueError("Seat order must contain each weighted player exactly once.")
+    if any(
+        isinstance(weight, bool) or not isinstance(weight, int) or weight < 0
+        for weight in weights.values()
+    ):
+        raise ValueError("Weights must be non-negative integers.")
+
+    total_weight = sum(weights.values())
+    if amount > total_weight:
+        raise ValueError("Allocated amount cannot exceed the total weight.")
+    if total_weight == 0:
         return {player_id: 0 for player_id in seat_order}
 
     shares: dict[str, int] = {}
     remainders: dict[str, int] = {}
-    for player_id, contribution in contributions.items():
+    for player_id, weight in weights.items():
         shares[player_id], remainders[player_id] = divmod(
-            rake_amount * contribution, total_contribution
+            amount * weight, total_weight
         )
 
-    remaining_chips = rake_amount - sum(shares.values())
+    remaining_chips = amount - sum(shares.values())
     remainder_order = sorted(
         seat_order,
         key=lambda player_id: (-remainders[player_id], seat_order.index(player_id)),
@@ -417,25 +424,47 @@ class FirstPartyNLHGame(TableGameBase):
         hand_of_day = self.calculate_hand_of_day_accounting(pot_total)
         house_take = min(pot_total, rake["rake_amount"] + jackpot["fee_collected"])
         player_payout_total = max(pot_total - house_take, 0)
-        winner_entries = [
-            {"user_id": player_id, "amount": amount}
-            for player_id, amount in gross_awards.items()
-            if amount > 0
+        winner_order = tuple(
+            self.seats[seat].user_id
+            for seat in self._player_order
+            if gross_awards.get(self.seats[seat].user_id, 0) > 0
+        )
+        winner_gross_awards = {
+            player_id: gross_awards[player_id] for player_id in winner_order
+        }
+        rake_deductions = _allocate_amount_by_weight(
+            rake["rake_amount"], winner_gross_awards, winner_order
+        )
+        after_rake_awards = {
+            player_id: winner_gross_awards[player_id] - rake_deductions[player_id]
+            for player_id in winner_order
+        }
+        bbj_drop_deductions = _allocate_amount_by_weight(
+            jackpot["fee_collected"], after_rake_awards, winner_order
+        )
+        adjusted_winners = [
+            {
+                "user_id": player_id,
+                "gross_award": winner_gross_awards[player_id],
+                "rake_deduction": rake_deductions[player_id],
+                "bbj_drop_deduction": bbj_drop_deductions[player_id],
+                "amount": (
+                    after_rake_awards[player_id]
+                    - bbj_drop_deductions[player_id]
+                ),
+            }
+            for player_id in winner_order
         ]
-        adjusted_winners = []
-        remaining = player_payout_total
-        for index, entry in enumerate(winner_entries):
-            adjusted_amount = (
-                remaining
-                if index == len(winner_entries) - 1
-                else math.floor(entry["amount"] * player_payout_total / pot_total)
-            )
-            remaining -= adjusted_amount
-            adjusted_winners.append(
-                {"user_id": entry["user_id"], "amount": adjusted_amount}
-            )
         adjusted_awards = {
             entry["user_id"]: entry["amount"] for entry in adjusted_winners
+        }
+        rake_deductions_by_player = {
+            player["user_id"]: player["rake_deduction"]
+            for player in adjusted_winners
+        }
+        bbj_deductions_by_player = {
+            player["user_id"]: player["bbj_drop_deduction"]
+            for player in adjusted_winners
         }
         players_by_id = {player.player_id: player for player in state.players}
         settled_players = []
@@ -463,6 +492,12 @@ class FirstPartyNLHGame(TableGameBase):
                     "uncalled_return": uncalled_returns.get(seat_player.user_id, 0),
                     "gross_award": gross_award,
                     "payout_after_fees": adjusted_awards.get(
+                        seat_player.user_id, 0
+                    ),
+                    "rake_deduction": rake_deductions_by_player.get(
+                        seat_player.user_id, 0
+                    ),
+                    "bbj_drop_deduction": bbj_deductions_by_player.get(
                         seat_player.user_id, 0
                     ),
                     "rake_eligible": rake_eligible[seat_player.user_id],

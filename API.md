@@ -298,7 +298,7 @@ Both endpoints return the transfer type, amount, transaction ID, and server-deri
 
 ### Player rake and winnings reports
 
-`GET /clubs/{club_id}/rake/players` returns cumulative per-player hand results and contribution-weighted rake attribution. Rake is collected once per hand; it is not split into street-specific pools. Players who fold preflop are excluded from the hand's rake split. Players who fold on the flop, turn, or river remain eligible based on their contestable contributions. Active `OWNER` and `MANAGER` members receive the club's total collected rake, the total attributed to players, any unattributed legacy amount, and player summaries sorted by rake generated. An active `AGENT` receives only currently active assigned players and their rake-generated total; the response omits club-wide rake totals. `PLAYER` members receive `403`.
+`GET /clubs/{club_id}/rake/players?limit=50&before_total_rake_generated={amount}&before_user_id={user_id}` returns cumulative per-player hand results and contribution-weighted rake attribution. `limit` defaults to 50 and is capped at 200. The two cursor parameters must be supplied together. Rows are ordered by total rake generated descending, then user ID ascending; the response returns `next_before_total_rake_generated` and `next_before_user_id`, or both as `null` when there is no next page. Owner/manager totals use Firestore aggregation; agent totals and pages are scoped to the current active downline, whose summary documents are batch-read. Rake is collected once per hand; it is not split into street-specific pools. Players who fold preflop are excluded from the hand's rake split. Players who fold on the flop, turn, or river remain eligible based on their contestable contributions. Active `OWNER` and `MANAGER` members receive the club's total collected rake, the total attributed to players, any unattributed legacy amount, and player summaries. An active `AGENT` receives only currently active assigned players and their rake-generated total; the response omits club-wide rake totals. `PLAYER` members receive `403`.
 
 Owner/manager response:
 
@@ -310,6 +310,8 @@ Owner/manager response:
   "total_rake_collected": 100,
   "attributed_rake_total": 100,
   "unattributed_rake_total": 0,
+  "next_before_total_rake_generated": null,
+  "next_before_user_id": null,
   "players": [
     {
       "user_id": "player-a",
@@ -332,9 +334,9 @@ Owner/manager response:
 
 Agent responses use `"scope": "assigned_players"`, include `rake_generated_total` for the agent's active assigned players, and omit `total_rake_collected`, `attributed_rake_total`, and `unattributed_rake_total` so they do not reveal the club-wide rake total. The player list is ordered by `total_rake_generated` descending.
 
-`GET /clubs/{club_id}/rake/players/{user_id}/hands?limit=50&before={timestamp}` is the current paginated per-hand detail endpoint. It returns rake eligibility, contestable contribution, uncalled return, gross award, payout after fees, attributed rake, and net result. Owners/managers can access members in their club; agents can access only their currently assigned active players; players receive `403`. The current `before` cursor is timestamp-only and can skip records if multiple hands have the same timestamp. A composite `(timestamp, hand_id)` cursor is a required follow-up before relying on complete pagination at scale; see [jackpot.md](jackpot.md). These endpoints are for private club accounting; they do not pay rakeback or change any player balance. Union rake is not attributed until a union policy is implemented.
+`GET /clubs/{club_id}/rake/players/{user_id}/hands?limit=50&before_timestamp={timestamp}&before_hand_id={hand_id}` is the paginated per-hand detail endpoint. The two cursor parameters must either both be present or both be omitted. Records are ordered by timestamp descending, then hand ID descending; the next page starts strictly after that tuple. The response returns both `next_before_timestamp` and `next_before_hand_id`, or both as `null` when there is no next page. It returns rake eligibility, contestable contribution, uncalled return, gross award, payout after fees, attributed rake, and net result. Owners/managers can access members in their club; agents can access only their currently assigned active players; players receive `403`. These endpoints are for private club accounting; they do not pay rakeback or change any player balance. Union rake is not attributed until a union policy is implemented.
 
-Each record includes `hand_id`, `table_id`, `timestamp`, `user_id`, `username`, `rake_eligible`, `contestable_contribution`, `uncalled_return`, `gross_award`, `payout_after_fees`, `rake_attributed`, and `net_delta`. `rake_eligible` is false for a preflop folder; a later fold does not revoke it. Gross award is before fees; payout is what was added to the table stack after fees; net result is the change in the player's stack for that hand. Rake attribution is based on eligible players' contestable contributions after uncalled returns, allocated with largest-remainder whole-chip rounding and seat order as the tie-break. It is rake only, not the BBJ drop. Rakeback and agent/manager/owner share distributions are not part of these records yet.
+Each current record includes `hand_id`, `table_id`, `timestamp`, `user_id`, `username`, `rake_eligible`, `contestable_contribution`, `uncalled_return`, `gross_award`, `rake_deduction`, `bbj_drop_deduction`, `payout_after_fees`, `rake_attributed`, and `net_delta`. Older records may not contain the two deduction fields. `rake_eligible` is false for a preflop folder; a later fold does not revoke it. Gross award is before fees; `payout_after_fees = gross_award - rake_deduction - bbj_drop_deduction`; net result is the change in the player's stack for that hand. Winner fee deductions use largest-remainder integer allocation in table hand order, applying rake first and BBJ drop to the remaining award. Rake attribution is based on eligible players' contestable contributions after uncalled returns and is not the same as a winner's rake deduction. Rakeback and agent/manager/owner share distributions are not part of these records yet.
 
 Paginated response:
 
@@ -353,12 +355,15 @@ Paginated response:
       "contestable_contribution": 500,
       "uncalled_return": 0,
       "gross_award": 700,
+      "rake_deduction": 25,
+      "bbj_drop_deduction": 25,
       "payout_after_fees": 650,
       "rake_attributed": 25,
       "net_delta": 150
     }
   ],
-  "next_before": null
+  "next_before_timestamp": null,
+  "next_before_hand_id": null
 }
 ```
 

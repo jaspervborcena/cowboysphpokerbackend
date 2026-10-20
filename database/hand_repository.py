@@ -155,31 +155,33 @@ def _player_rake_hand_records(
             player.get("payout_after_fees", winners.get(user_id, 0))
         )
         contestable_contribution = contestable_contributions[user_id]
-        records.append(
-            {
-                "hand_id": str(hand_summary["hand_id"]),
-                "table_id": str(hand_summary["table_id"]),
-                "timestamp": hand_summary.get("timestamp"),
-                "user_id": user_id,
-                "username": str(player.get("username") or user_id),
-                "contestable_contribution": contestable_contribution,
-                "uncalled_return": int(
-                    player.get("uncalled_return", uncalled_returns.get(user_id, 0))
-                ),
-                "gross_award": int(
-                    player.get(
-                        "gross_award",
-                        legacy_gross_awards[index]
-                        if index < len(legacy_gross_awards)
-                        else 0,
-                    )
-                ),
-                "payout_after_fees": payout_after_fees,
-                "rake_eligible": rake_eligibility[user_id],
-                "rake_attributed": attributions[user_id],
-                "net_delta": int(player.get("net_delta", 0)),
-            }
-        )
+        record = {
+            "hand_id": str(hand_summary["hand_id"]),
+            "table_id": str(hand_summary["table_id"]),
+            "timestamp": hand_summary.get("timestamp"),
+            "user_id": user_id,
+            "username": str(player.get("username") or user_id),
+            "contestable_contribution": contestable_contribution,
+            "uncalled_return": int(
+                player.get("uncalled_return", uncalled_returns.get(user_id, 0))
+            ),
+            "gross_award": int(
+                player.get(
+                    "gross_award",
+                    legacy_gross_awards[index]
+                    if index < len(legacy_gross_awards)
+                    else 0,
+                )
+            ),
+            "payout_after_fees": payout_after_fees,
+            "rake_eligible": rake_eligibility[user_id],
+            "rake_attributed": attributions[user_id],
+            "net_delta": int(player.get("net_delta", 0)),
+        }
+        for field in ("rake_deduction", "bbj_drop_deduction"):
+            if field in player:
+                record[field] = int(player[field])
+        records.append(record)
     return records
 
 
@@ -2681,39 +2683,95 @@ class FirestoreHandRepository:
         return commit(transaction)
 
     def get_club_player_rake_report(
-        self, club_id: str, *, agent_user_id: str | None = None
+        self,
+        club_id: str,
+        *,
+        agent_user_id: str | None = None,
+        limit: int = 50,
+        before_total_rake_generated: int | None = None,
+        before_user_id: str | None = None,
     ) -> dict[str, Any]:
+        if (before_total_rake_generated is None) != (before_user_id is None):
+            raise ValueError("Both report cursor fields must be provided together.")
         club_ref = self._client.collection("clubs").document(club_id)
         pool_snapshot = (
             club_ref.collection("treasury").document("pools").get()
         )
         pool_data = pool_snapshot.to_dict() or {}
+        stats_collection = club_ref.collection("player_rake_stats")
+        if agent_user_id is None:
+            aggregate_results = stats_collection.sum(
+                "total_rake_generated", alias="rake_generated_total"
+            ).get()
+            attributed_total = (
+                int(aggregate_results[0][0].value) if aggregate_results else 0
+            )
+            stats_query = (
+                stats_collection.order_by(
+                    "total_rake_generated", direction=firestore.Query.DESCENDING
+                )
+                .order_by("user_id", direction=firestore.Query.ASCENDING)
+            )
+            if (
+                before_total_rake_generated is not None
+                and before_user_id is not None
+            ):
+                stats_query = stats_query.start_after(
+                    {
+                        "total_rake_generated": before_total_rake_generated,
+                        "user_id": before_user_id,
+                    }
+                )
+            stats_snapshots = stats_query.limit(limit + 1).stream()
+        else:
+            assigned_members = (
+                club_ref.collection("members")
+                .where("status", "==", "active")
+                .where("agent_id", "==", agent_user_id)
+                .stream()
+            )
+            stats_refs = [
+                stats_collection.document(snapshot.id) for snapshot in assigned_members
+            ]
+            stats_snapshots = self._client.get_all(stats_refs)
+
         player_stats = []
-        for snapshot in club_ref.collection("player_rake_stats").stream():
+        for snapshot in stats_snapshots:
+            if not snapshot.exists:
+                continue
             stats = snapshot.to_dict() or {}
             player_id = str(stats.get("user_id") or snapshot.id)
-            if agent_user_id is not None:
-                member = self.get_club_member(club_id, player_id)
-                if (
-                    member is None
-                    or member.get("status") != "active"
-                    or member.get("agent_id") != agent_user_id
-                ):
-                    continue
             stats["user_id"] = player_id
             player_stats.append(stats)
 
-        player_stats.sort(
-            key=lambda stats: (
-                -int(stats.get("total_rake_generated", 0)),
-                str(stats.get("username", "")).casefold(),
-                stats["user_id"],
+        if agent_user_id is not None:
+            player_stats.sort(
+                key=lambda stats: (
+                    -int(stats.get("total_rake_generated", 0)),
+                    stats["user_id"],
+                )
             )
-        )
-        attributed_total = sum(
-            int(stats.get("total_rake_generated", 0)) for stats in player_stats
-        )
+            attributed_total = sum(
+                int(stats.get("total_rake_generated", 0)) for stats in player_stats
+            )
         club_total = int(pool_data.get("total_rake_collected", 0))
+        if (
+            agent_user_id is not None
+            and before_total_rake_generated is not None
+            and before_user_id is not None
+        ):
+            cursor_key = (-before_total_rake_generated, before_user_id)
+            player_stats = [
+                stats
+                for stats in player_stats
+                if (
+                    -int(stats.get("total_rake_generated", 0)),
+                    stats["user_id"],
+                ) > cursor_key
+            ]
+        has_more = len(player_stats) > limit
+        page = player_stats[:limit]
+        last_player = page[-1] if has_more and page else None
         return {
             "club_id": club_id,
             "scope": "assigned_players" if agent_user_id is not None else "club",
@@ -2725,7 +2783,15 @@ class FirestoreHandRepository:
                 if agent_user_id is None
                 else None
             ),
-            "players": player_stats,
+            "players": page,
+            "next_before_total_rake_generated": (
+                int(last_player.get("total_rake_generated", 0))
+                if last_player is not None
+                else None
+            ),
+            "next_before_user_id": (
+                last_player["user_id"] if last_player is not None else None
+            ),
         }
 
     def get_player_rake_hand_records(
@@ -2734,8 +2800,11 @@ class FirestoreHandRepository:
         user_id: str,
         *,
         limit: int = 50,
-        before: str | None = None,
+        before_timestamp: str | None = None,
+        before_hand_id: str | None = None,
     ) -> dict[str, Any]:
+        if (before_timestamp is None) != (before_hand_id is None):
+            raise ValueError("Both cursor fields must be provided together.")
         hand_collection = (
             self._client.collection("clubs")
             .document(club_id)
@@ -2743,20 +2812,30 @@ class FirestoreHandRepository:
             .document(user_id)
             .collection("hands")
         )
-        query = hand_collection
-        if before is not None:
-            query = query.where("timestamp", "<", before)
+        query = (
+            hand_collection.order_by(
+                "timestamp", direction=firestore.Query.DESCENDING
+            )
+            .order_by("hand_id", direction=firestore.Query.DESCENDING)
+        )
+        if before_timestamp is not None and before_hand_id is not None:
+            query = query.start_after(
+                {"timestamp": before_timestamp, "hand_id": before_hand_id}
+            )
         snapshots = (
-            query.order_by("timestamp", direction=firestore.Query.DESCENDING)
-            .limit(limit + 1)
-            .stream()
+            query.limit(limit + 1).stream()
         )
         records = [snapshot.to_dict() or {} for snapshot in snapshots]
         has_more = len(records) > limit
         page = records[:limit]
         return {
             "records": page,
-            "next_before": page[-1].get("timestamp") if has_more and page else None,
+            "next_before_timestamp": (
+                page[-1].get("timestamp") if has_more and page else None
+            ),
+            "next_before_hand_id": (
+                page[-1].get("hand_id") if has_more and page else None
+            ),
         }
 
 

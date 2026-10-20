@@ -682,8 +682,19 @@ async def claim_back_club_chips(
 async def get_club_player_rake_report(
     club_id: str,
     request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    before_total_rake_generated: int | None = Query(default=None, ge=0),
+    before_user_id: str | None = Query(default=None),
     membership: ClubMembership = Depends(get_active_club_member),
 ) -> dict[str, Any]:
+    if (before_total_rake_generated is None) != (before_user_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Both before_total_rake_generated and before_user_id are "
+                "required together."
+            ),
+        )
     if membership.role is ClubRole.PLAYER:
         raise HTTPException(status_code=403, detail="Players cannot view club rake reports.")
     agent_user_id = (
@@ -694,6 +705,9 @@ async def get_club_player_rake_report(
             request.app.state.repository.get_club_player_rake_report,
             club_id,
             agent_user_id=agent_user_id,
+            limit=limit,
+            before_total_rake_generated=before_total_rake_generated,
+            before_user_id=before_user_id,
         )
     except (FirestoreRequiredError, GoogleAPICallError) as error:
         raise HTTPException(status_code=503, detail="Club rake report is unavailable.") from error
@@ -712,6 +726,10 @@ async def get_club_player_rake_report(
         "club_id": club_id,
         "scope": report["scope"],
         "rake_generated_total": report["rake_generated_total"],
+        "next_before_total_rake_generated": report[
+            "next_before_total_rake_generated"
+        ],
+        "next_before_user_id": report["next_before_user_id"],
         "players": [
             {
                 "user_id": player["user_id"],
@@ -754,9 +772,15 @@ async def get_player_rake_hand_history(
     user_id: str,
     request: Request,
     limit: int = Query(default=50, ge=1, le=200),
-    before: str | None = Query(default=None),
+    before_timestamp: str | None = Query(default=None),
+    before_hand_id: str | None = Query(default=None),
     membership: ClubMembership = Depends(get_active_club_member),
 ) -> dict[str, Any]:
+    if (before_timestamp is None) != (before_hand_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Both before_timestamp and before_hand_id are required together.",
+        )
     if membership.role is ClubRole.AGENT:
         try:
             member = await asyncio.to_thread(
@@ -781,7 +805,8 @@ async def get_player_rake_hand_history(
             club_id,
             user_id,
             limit=limit,
-            before=before,
+            before_timestamp=before_timestamp,
+            before_hand_id=before_hand_id,
         )
     except (FirestoreRequiredError, GoogleAPICallError) as error:
         raise HTTPException(status_code=503, detail="Player rake history is unavailable.") from error

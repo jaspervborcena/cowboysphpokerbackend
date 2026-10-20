@@ -150,7 +150,13 @@ class FakeHandRepository:
         }
 
     def get_club_player_rake_report(
-        self, club_id: str, *, agent_user_id: str | None = None
+        self,
+        club_id: str,
+        *,
+        agent_user_id: str | None = None,
+        limit: int = 50,
+        before_total_rake_generated: int | None = None,
+        before_user_id: str | None = None,
     ) -> dict[str, object]:
         self.rake_report_calls.append((club_id, agent_user_id))
         return self.rake_report
@@ -161,7 +167,8 @@ class FakeHandRepository:
         user_id: str,
         *,
         limit: int = 50,
-        before: str | None = None,
+        before_timestamp: str | None = None,
+        before_hand_id: str | None = None,
     ) -> dict[str, object]:
         return self.rake_hand_records
 
@@ -456,6 +463,8 @@ def test_rake_reports_are_private_and_agents_are_limited_to_downline(monkeypatch
         "total_rake_collected": None,
         "attributed_rake_total": 4,
         "unattributed_rake_total": None,
+        "next_before_total_rake_generated": None,
+        "next_before_user_id": None,
         "players": [
             {
                 "user_id": "player-a",

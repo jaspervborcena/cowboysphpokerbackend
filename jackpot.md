@@ -171,7 +171,7 @@ Current order in the hand adapter is:
 
 1. Calculate `rake_amount` from the contestable pot using table rake settings.
 2. Calculate BBJ eligibility/`fee_collected` from the pot remaining after rake; the drop is capped by the remaining pot.
-3. Deduct the combined rake and BBJ drop from the total player payout, then distribute the remaining payout across gross winners proportionally. Whole-chip rounding is deterministic; the last winner entry receives the residual. Current code does not yet persist separate per-winner rake and BBJ deduction fields.
+3. Allocate rake over gross winner awards using largest-remainder whole-chip rounding in table hand order, beginning at the button. Allocate the BBJ drop over the post-rake awards using the same rule. Persist each winner's `gross_award`, `rake_deduction`, `bbj_drop_deduction`, and `payout_after_fees`.
 
 The client/API fee display must use the same order: rake first, then BBJ drop. For an auditable promotion settlement, store hand-level `rake_amount` and `bbj_drop`, and per winner store `gross_award`, `rake_deduction`, `bbj_drop_deduction`, and `payout_after_fees`. The two deduction fields are the winner's share of the hand-level fees; do not subtract the whole hand's fee from every winner. Require:
 
@@ -183,9 +183,9 @@ payout_after_fees[player] = gross_award[player]
 					  - bbj_drop_deduction[player]
 ```
 
-Use a deterministic whole-chip allocation and document its tie-break so each hand can be reconstructed exactly. `rake_attributed` is a different measure: it tracks which eligible players generated rake for reports and can include non-winners. It must not be presented as the winner's `rake_deduction`.
+The implemented deterministic whole-chip allocation uses largest remainder and table hand order, beginning at the button, so each hand can be reconstructed exactly. `rake_attributed` is a different measure: it tracks which eligible players generated rake for reports and can include non-winners. It must not be presented as the winner's `rake_deduction`.
 
-The existing API currently exposes `gross_award` and `payout_after_fees` in private audit records but does not expose per-winner `rake_deduction` and `bbj_drop_deduction`; adding those fields and aligning all clients is implementation work, not current behavior.
+Current private hand and rake-history records expose `gross_award`, `rake_deduction`, `bbj_drop_deduction`, and `payout_after_fees`. Historical records written before the fields were added may omit the separate deductions.
 
 A promotion contribution and any award should be represented by immutable ledger/audit entries keyed by a stable hand/promotion/award ID. In one transaction:
 
@@ -200,7 +200,7 @@ Promotion records and private hand cards must be server-only. Add Firestore rule
 
 ### Composite Report Cursor
 
-The current player rake-hand report uses a timestamp-only `before` cursor and can skip records when several hands share a completion timestamp. Before relying on pagination at scale, change it to a composite descending cursor `(timestamp, hand_id)`. Return both values as `next_before_timestamp` and `next_before_hand_id`; the next query must select records strictly older by that tuple. This prevents duplicate/omitted records when timestamps collide. Use the same rule for any future paginated promotion history. This composite cursor is a requirement, not current implementation.
+The player rake-hand report uses a composite descending cursor `(timestamp, hand_id)`. It returns both values as `next_before_timestamp` and `next_before_hand_id`; the next query starts strictly after that tuple. The player summary report uses `(total_rake_generated DESC, user_id ASC)` and returns `next_before_total_rake_generated` plus `next_before_user_id`. Use stable composite cursors for future paginated promotion history too.
 
 ### Agent Assignment History
 

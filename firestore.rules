@@ -1,0 +1,17 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /clubs/{clubId}/player_rake_stats/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /clubs/{clubId}/tables/{tableId}/hands/{handId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "player_rake_stats",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "total_rake_generated",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "user_id",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "hands",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "timestamp",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "hand_id",
+          "order": "DESCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

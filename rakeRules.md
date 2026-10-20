@@ -87,11 +87,13 @@ The private hand audit at `clubs/{club_id}/tables/{table_id}/hands/{hand_id}` re
 - `contestable_contribution`: total contribution less uncalled returns.
 - `uncalled_return`: chips returned because no opponent matched the contribution.
 - `gross_award`: gross pot award before rake and other fees.
+- `rake_deduction`: this winner's integer-chip share of the hand's collected rake.
+- `bbj_drop_deduction`: this winner's integer-chip share of the BBJ drop.
 - `payout_after_fees`: amount added to the player's stack after fees/drops.
 - `rake_attributed`: the player's share of collected rake, not a payment.
 - `net_delta`: `final_stack - starting_stack`, the player's actual stack change for the hand.
 
-The hand summary separately records hand-level `rake_amount` and `jackpot.fee_collected`. `rake_attributed` is generated-rake reporting, not a fee deducted from this player's award. Gross award, post-fee payout, and net result are different measures. Do not describe all three as simply "winnings." `rake_attributed` also does not indicate that rakeback was paid.
+The hand summary separately records hand-level `rake_amount` and `jackpot.fee_collected`. Winner rake deductions are allocated across gross awards first; the BBJ drop is then allocated across the remaining awards. Each allocation uses largest-remainder whole-chip rounding with the table hand order as its deterministic tie-break. For each current record, `payout_after_fees = gross_award - rake_deduction - bbj_drop_deduction`. `rake_attributed` is generated-rake reporting, not a fee deducted from this player's award. Gross award, post-fee payout, and net result are different measures. Do not describe all three as simply "winnings." `rake_attributed` also does not indicate that rakeback was paid. Older records may not contain the new fee-deduction fields.
 
 ## Cumulative Club Records
 
@@ -108,19 +110,18 @@ The transaction that settles the hand updates the member's in-play balance, seat
 
 ## Reports and Visibility
 
-- `GET /clubs/{club_id}/rake/players`: owners/managers see the club total, attributed/unattributed totals, and player summaries sorted by rake generated. Agents see only active assigned players and their rake-generated total; their response does not include club-wide rake totals.
-- `GET /clubs/{club_id}/rake/players/{user_id}/hands`: owners/managers can inspect club member hand records; an agent can inspect only a currently active player assigned to that agent. The current endpoint paginates with `limit` and a timestamp-only `before` cursor. This may skip same-timestamp records; a composite `(timestamp, hand_id)` cursor is a required follow-up, not implemented behavior. See [jackpot.md](jackpot.md).
+- `GET /clubs/{club_id}/rake/players`: owners/managers see the club total, attributed/unattributed totals, and paginated player summaries sorted by rake generated then user ID. Owner totals use a Firestore aggregate query. Agents see only active assigned players and their rake-generated total; their response does not include club-wide rake totals. Agent stats are batch-read for the current downline to preserve exact scope totals and ranking; page-scoped agent reads remain follow-up work.
+- `GET /clubs/{club_id}/rake/players/{user_id}/hands`: owners/managers can inspect club member hand records; an agent can inspect only a currently active player assigned to that agent. Pagination uses the composite descending `(timestamp, hand_id)` cursor; both `before_timestamp` and `before_hand_id` must be supplied together. See [API.md](API.md) for the response fields.
 - Players receive `403` for both report routes. Player wallet, public snapshots, and replay responses do not expose rake attribution.
 - These routes require an authenticated active club membership. The backend enforces report permissions; deployed Firestore rules must also deny direct client reads/writes to `player_rake_stats` and private hand audits before direct client access is permitted.
 
 ## Settlement and Balance Boundary
 
-Rake attribution is a report/statistic. It does not pay a player, agent, manager, or owner. It does not alter `chip_balance` or `in_play_balance`. Collected rake is separately added to the club's `treasury/pools.total_rake_collected` and recorded in the club transaction ledger by the hand settlement transaction. Current hand settlement deducts rake and the jackpot fee from the total winner payout and distributes the remaining payout proportionally across gross winners. It does not yet persist each winner's separate `rake_deduction` and `bbj_drop_deduction`; the proposed audit equation and fee order are documented in [jackpot.md](jackpot.md).
+Rake attribution is a report/statistic. It does not pay a player, agent, manager, or owner. It does not alter `chip_balance` or `in_play_balance`. Collected rake is separately added to the club's `treasury/pools.total_rake_collected` and recorded in the club transaction ledger by the hand settlement transaction. Winner rake deductions are allocated over gross awards first; the jackpot fee is then allocated over the remaining awards. These fee deductions are separate from generated-rake attribution.
 
 ## Not Implemented
 
 - Street-by-street rake buckets. Current rake is collected once per hand and distributed once across eligible players.
-- Separate per-winner `rake_deduction` and `bbj_drop_deduction` fields for reconstructing the post-fee payout.
 - Promotion-specific fixed integer drops split among BBJ, Single Jackpot, and High Hand pools; current `jackpot_fee` only updates the BBJ pool.
 - Player rakeback balances or payments.
 - Agent, manager, or owner commission/profit shares.

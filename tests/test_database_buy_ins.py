@@ -78,6 +78,22 @@ class FakeCollectionReference:
     def limit(self, count: int) -> FakeCollectionQuery:
         return FakeCollectionQuery(self.client, self.path).limit(count)
 
+    def sum(self, field: str, alias: str | None = None) -> FakeAggregationQuery:
+        return FakeAggregationQuery(self, field)
+
+
+class FakeAggregationQuery:
+    def __init__(self, collection: FakeCollectionReference, field: str) -> None:
+        self.collection = collection
+        self.field = field
+
+    def get(self) -> list[list[Any]]:
+        total = sum(
+            int((snapshot.to_dict() or {}).get(self.field, 0))
+            for snapshot in self.collection.stream()
+        )
+        return [[type("FakeAggregationValue", (), {"value": total})()]]
+
 
 class FakeCollectionQuery:
     def __init__(
@@ -86,8 +102,8 @@ class FakeCollectionQuery:
         self.client = client
         self.path = path
         self.filters: list[tuple[str, str, Any]] = []
-        self.order_field: str | None = None
-        self.descending = False
+        self.order_fields: list[tuple[str, bool]] = []
+        self.cursor: dict[str, Any] | None = None
         self.count: int | None = None
 
     def where(
@@ -99,8 +115,11 @@ class FakeCollectionQuery:
     def order_by(
         self, field: str, direction: str = firestore.Query.ASCENDING
     ) -> FakeCollectionQuery:
-        self.order_field = field
-        self.descending = direction == firestore.Query.DESCENDING
+        self.order_fields.append((field, direction == firestore.Query.DESCENDING))
+        return self
+
+    def start_after(self, document_fields: dict[str, Any]) -> FakeCollectionQuery:
+        self.cursor = document_fields
         return self
 
     def limit(self, count: int) -> FakeCollectionQuery:
@@ -114,7 +133,13 @@ class FakeCollectionQuery:
             if path[:-1] == self.path
         ]
         for field, operator, expected_value in self.filters:
-            if operator == "<":
+            if operator == "==":
+                documents = [
+                    (path, data)
+                    for path, data in documents
+                    if data.get(field) == expected_value
+                ]
+            elif operator == "<":
                 documents = [
                     (path, data)
                     for path, data in documents
@@ -122,11 +147,30 @@ class FakeCollectionQuery:
                 ]
             else:
                 raise AssertionError(f"Unsupported query operator: {operator}")
-        if self.order_field is not None:
+        for field, descending in reversed(self.order_fields):
             documents.sort(
-                key=lambda item: item[1].get(self.order_field, ""),
-                reverse=self.descending,
+                key=lambda item: item[1].get(field, ""),
+                reverse=descending,
             )
+        if self.cursor is not None:
+            cursor_values = tuple(
+                self.cursor[field] for field, _ in self.order_fields
+            )
+
+            def after_cursor(data: dict[str, Any]) -> bool:
+                for (field, descending), cursor_value in zip(
+                    self.order_fields, cursor_values
+                ):
+                    value = data.get(field, "")
+                    if value != cursor_value:
+                        return value < cursor_value if descending else value > cursor_value
+                return False
+
+            documents = [
+                (path, data)
+                for path, data in documents
+                if after_cursor(data)
+            ]
         if self.count is not None:
             documents = documents[:self.count]
         return [FakeSnapshot(data, path[-1]) for path, data in documents]
@@ -208,6 +252,14 @@ class FakeFirestoreClient:
 
     def collection_group(self, name: str) -> FakeCollectionGroupReference:
         return FakeCollectionGroupReference(self, name)
+
+    def get_all(
+        self, references: list[FakeDocumentReference]
+    ) -> list[FakeSnapshot]:
+        return [
+            FakeSnapshot(self.documents.get(reference.path), reference.path[-1])
+            for reference in references
+        ]
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -1251,33 +1303,81 @@ def test_club_player_rake_report_scopes_agent_to_current_downline() -> None:
     assert len(owner_report["players"]) == 2
 
 
-def test_player_rake_hand_history_uses_timestamp_cursor_and_limit() -> None:
+def test_club_player_rake_report_uses_stable_summary_cursor() -> None:
+    pool_path = ("clubs", "club-1", "treasury", "pools")
+    player_stats = {
+        ("clubs", "club-1", "player_rake_stats", user_id): {
+            "user_id": user_id,
+            "total_rake_generated": rake_total,
+        }
+        for user_id, rake_total in (
+            ("player-a", 8),
+            ("player-b", 8),
+            ("player-c", 4),
+        )
+    }
+    client = FakeFirestoreClient(
+        {pool_path: {"total_rake_collected": 20}, **player_stats}
+    )
+    repository = FirestoreHandRepository(client)
+
+    first_page = repository.get_club_player_rake_report("club-1", limit=2)
+    second_page = repository.get_club_player_rake_report(
+        "club-1",
+        limit=2,
+        before_total_rake_generated=first_page[
+            "next_before_total_rake_generated"
+        ],
+        before_user_id=first_page["next_before_user_id"],
+    )
+
+    assert [player["user_id"] for player in first_page["players"]] == [
+        "player-a", "player-b",
+    ]
+    assert first_page["next_before_total_rake_generated"] == 8
+    assert first_page["next_before_user_id"] == "player-b"
+    assert [player["user_id"] for player in second_page["players"]] == ["player-c"]
+    assert second_page["next_before_total_rake_generated"] is None
+    assert second_page["next_before_user_id"] is None
+    assert first_page["attributed_rake_total"] == 20
+
+
+def test_player_rake_hand_history_uses_composite_cursor_for_equal_timestamps() -> None:
+    shared_timestamp = "2026-10-20T10:00:00Z"
     client = FakeFirestoreClient(
         {
             (
                 "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-1"
-            ): {"hand_id": "hand-1", "timestamp": "2026-10-18T10:00:00Z"},
+            ): {"hand_id": "hand-1", "timestamp": shared_timestamp},
             (
                 "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-2"
-            ): {"hand_id": "hand-2", "timestamp": "2026-10-19T10:00:00Z"},
+            ): {"hand_id": "hand-2", "timestamp": shared_timestamp},
             (
                 "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-3"
-            ): {"hand_id": "hand-3", "timestamp": "2026-10-20T10:00:00Z"},
+            ): {"hand_id": "hand-3", "timestamp": shared_timestamp},
         }
     )
     repository = FirestoreHandRepository(client)
 
-    first_page = repository.get_player_rake_hand_records("club-1", "player-1", limit=2)
+    first_page = repository.get_player_rake_hand_records(
+        "club-1", "player-1", limit=2
+    )
     second_page = repository.get_player_rake_hand_records(
-        "club-1", "player-1", limit=2, before=first_page["next_before"]
+        "club-1",
+        "player-1",
+        limit=2,
+        before_timestamp=first_page["next_before_timestamp"],
+        before_hand_id=first_page["next_before_hand_id"],
     )
 
     assert [record["hand_id"] for record in first_page["records"]] == [
-        "hand-3", "hand-2"
+        "hand-3", "hand-2",
     ]
-    assert first_page["next_before"] == "2026-10-19T10:00:00Z"
+    assert first_page["next_before_timestamp"] == shared_timestamp
+    assert first_page["next_before_hand_id"] == "hand-2"
     assert [record["hand_id"] for record in second_page["records"]] == ["hand-1"]
-    assert second_page["next_before"] is None
+    assert second_page["next_before_timestamp"] is None
+    assert second_page["next_before_hand_id"] is None
 
 
 def test_pending_hand_settlement_recovers_and_applies_once(monkeypatch) -> None:

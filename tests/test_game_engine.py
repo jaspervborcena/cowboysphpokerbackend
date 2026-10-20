@@ -1,4 +1,8 @@
-from logic.first_party_table import FirstPartyNLHGame, _attribute_rake_by_contribution
+from logic.first_party_table import (
+    FirstPartyNLHGame,
+    _allocate_amount_by_weight,
+    _attribute_rake_by_contribution,
+)
 from game_engine.nlh_state import NLHStreet
 
 
@@ -275,6 +279,16 @@ def test_rake_attribution_uses_seat_order_to_break_rounding_ties() -> None:
     assert rake_shares == {"player-a": 1, "player-b": 0, "player-c": 1}
 
 
+def test_fee_allocation_uses_hand_order_to_break_rounding_ties() -> None:
+    fee_shares = _allocate_amount_by_weight(
+        2,
+        {"player-a": 1, "player-b": 1, "player-c": 1},
+        ("player-c", "player-a", "player-b"),
+    )
+
+    assert fee_shares == {"player-a": 1, "player-b": 0, "player-c": 1}
+
+
 def test_completed_hand_records_each_players_contribution_rake_and_result() -> None:
     game = make_game()
     game.update_table_settings(
@@ -370,6 +384,14 @@ def test_hand_summary_applies_rake_and_jackpot_before_player_payouts() -> None:
     assert summary["jackpot"]["fee_collected"] == 25
     assert summary["settlement"]["house_take"] == 35
     assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 35
+    assert sum(player["rake_deduction"] for player in summary["players"]) == 10
+    assert sum(player["bbj_drop_deduction"] for player in summary["players"]) == 25
+    for player in summary["players"]:
+        assert player["payout_after_fees"] == (
+            player["gross_award"]
+            - player["rake_deduction"]
+            - player["bbj_drop_deduction"]
+        )
     assert sum(player["net_delta"] for player in summary["players"]) == -35
     assert sum(player["final_stack"] for player in summary["players"]) == 965
 
