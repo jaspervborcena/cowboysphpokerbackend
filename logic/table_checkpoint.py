@@ -31,10 +31,10 @@ def serialize_first_party_table(game: FirstPartyNLHGame) -> dict[str, Any]:
             "table_name": game.table_name,
         },
         "settings": game.table_settings.as_dict(),
+        "club_rake_rate_overridden": game.club_rake_rate_overridden,
         "pools": {
             "jackpot_pool": game.jackpot_pool,
             "rake_pool": game.rake_pool,
-            "hand_of_day_pool": game.hand_of_day_pool,
         },
         "seats": [
             {
@@ -94,10 +94,13 @@ def deserialize_first_party_table(checkpoint: object) -> FirstPartyNLHGame:
         game_id=game_id,
     )
     game.table_settings = _deserialize_settings(root.get("settings"))
+    game.club_rake_rate_overridden = _boolean(
+        root.get("club_rake_rate_overridden", False),
+        "club_rake_rate_overridden",
+    )
     pools = _object(root.get("pools"), "pools")
     game.jackpot_pool = _integer(pools.get("jackpot_pool"), "pools.jackpot_pool", minimum=0)
     game.rake_pool = _integer(pools.get("rake_pool"), "pools.rake_pool", minimum=0)
-    game.hand_of_day_pool = _integer(pools.get("hand_of_day_pool"), "pools.hand_of_day_pool", minimum=0)
     game.seats = _deserialize_seats(root.get("seats"), game.max_seats)
 
     hand_state_data = root.get("hand_state")
@@ -127,28 +130,45 @@ def deserialize_first_party_table(checkpoint: object) -> FirstPartyNLHGame:
 def _deserialize_settings(value: object) -> TableSettings:
     settings = _object(value, "settings")
     expected = TableSettings().as_dict()
-    if set(settings) != set(expected):
+    legacy_fields = {
+        "hand_of_day_enabled",
+        "hand_of_day_target",
+        "hand_of_day_prize",
+    }
+    fields = set(settings) - legacy_fields
+    old_fields = set(expected) - {"jackpot_rate"}
+    has_jackpot_rate = "jackpot_rate" in fields
+    if fields != (set(expected) if has_jackpot_rate else old_fields):
         raise ValueError("Checkpoint table settings do not match the supported schema.")
-    for field in ("jackpot_enabled", "no_flop_no_drop", "hand_of_day_enabled"):
+    for field in ("jackpot_enabled", "no_flop_no_drop"):
         _boolean(settings[field], f"settings.{field}")
-    for field in ("jackpot_fee", "jackpot_min_pot", "rake_cap", "rake_min_pot", "hand_of_day_target", "hand_of_day_prize"):
+    for field in ("jackpot_fee", "jackpot_min_pot", "rake_cap", "rake_min_pot"):
         _integer(settings[field], f"settings.{field}", minimum=0)
     rate = settings["rake_rate"]
     if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 0.1:
         raise ValueError("settings.rake_rate must be between 0 and 0.1.")
+    jackpot_rate = settings.get("jackpot_rate", 0.03)
+    if (
+        isinstance(jackpot_rate, bool)
+        or not isinstance(jackpot_rate, (int, float))
+        or not 0 <= jackpot_rate <= 0.1
+    ):
+        raise ValueError("settings.jackpot_rate must be between 0 and 0.1.")
     qualifying_hand = _optional_string(settings["jackpot_qualifying_hand"], "settings.jackpot_qualifying_hand")
     return TableSettings(
         jackpot_enabled=settings["jackpot_enabled"],
         jackpot_fee=settings["jackpot_fee"],
+        jackpot_rate=(
+            jackpot_rate
+            if has_jackpot_rate
+            else (0.0 if settings["jackpot_fee"] > 0 else 0.03)
+        ),
         jackpot_min_pot=settings["jackpot_min_pot"],
         jackpot_qualifying_hand=qualifying_hand,
         rake_rate=float(rate),
         rake_cap=settings["rake_cap"],
         rake_min_pot=settings["rake_min_pot"],
         no_flop_no_drop=settings["no_flop_no_drop"],
-        hand_of_day_enabled=settings["hand_of_day_enabled"],
-        hand_of_day_target=settings["hand_of_day_target"],
-        hand_of_day_prize=settings["hand_of_day_prize"],
     )
 
 

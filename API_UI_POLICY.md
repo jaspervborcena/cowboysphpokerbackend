@@ -74,6 +74,11 @@ These are UI-safe reads and flows when authenticated:
 
 These reads and actions are safe for the UI because the backend remains the authority and validates every request.
 
+The following rake-report reads are restricted operator views, not player-safe routes: owners/managers can see club-wide player summaries; agents can see only their currently assigned active players; players are denied. Do not include rake-attribution data in player wallet or replay responses.
+
+- `GET /clubs/{club_id}/rake/players`
+- `GET /clubs/{club_id}/rake/players/{user_id}/hands`
+
 ### 2.2 Owner/admin bootstrap-only routes
 
 These are not normal player routes and must be protected behind a strict bootstrap/admin path:
@@ -99,7 +104,7 @@ Why these remain authoritative:
 
 - they move chips between balances
 - they enforce role and downline rules
-- they validate available balance and in-play balance constraints
+- they validate and debit `available_balance`; claim-back never changes `in_play_balance`
 - they use transaction boundaries and idempotency rules
 - they create audit history and ledger records
 
@@ -158,6 +163,8 @@ These must remain under internal administrative or owner-controlled flows.
 | `POST /clubs/{club_id}/wallet/send-out` | UI may trigger, but backend must enforce | Authoritative money move | Owner/manager/assigned agent |
 | `POST /clubs/{club_id}/wallet/claim-back` | UI may trigger, but backend must enforce | Authoritative money move | Owner/manager/assigned agent |
 | `POST /clubs/{club_id}/wallet/transfers` | No general UI access | Authoritative treasury move | Owner/manager |
+| `GET /clubs/{club_id}/rake/players` | Restricted operator report; never expose to players | Read-only private club accounting | Owner/manager; agents see assigned players only |
+| `GET /clubs/{club_id}/rake/players/{user_id}/hands` | Restricted operator report; never expose to players | Read-only private club accounting | Owner/manager/assigned agent |
 
 ---
 

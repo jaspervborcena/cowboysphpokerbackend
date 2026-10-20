@@ -35,9 +35,6 @@ def make_game() -> FirstPartyNLHGame:
         rake_rate=0.05,
         rake_cap=25,
         rake_min_pot=50,
-        hand_of_day_enabled=True,
-        hand_of_day_target=500,
-        hand_of_day_prize=50,
     )
     return game
 
@@ -109,3 +106,21 @@ def test_table_checkpoint_rejects_unknown_version() -> None:
 
     with pytest.raises(ValueError, match="Unsupported table checkpoint version"):
         deserialize_first_party_table(checkpoint)
+
+
+def test_table_checkpoint_ignores_legacy_table_level_hand_of_day_settings() -> None:
+    checkpoint = serialize_first_party_table(make_game())
+    checkpoint["pools"]["hand_of_day_pool"] = 50
+    checkpoint["settings"].update(
+        {
+            "hand_of_day_enabled": True,
+            "hand_of_day_target": 500,
+            "hand_of_day_prize": 50,
+        }
+    )
+
+    restored = deserialize_first_party_table(checkpoint)
+
+    serialized = serialize_first_party_table(restored)
+    assert "hand_of_day_enabled" not in serialized["settings"]
+    assert "hand_of_day_pool" not in serialized["pools"]

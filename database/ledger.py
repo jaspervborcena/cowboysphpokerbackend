@@ -56,18 +56,18 @@ class WalletLedger:
         self.members: dict[str, dict[str, Any]] = {}
         self.transactions: list[LedgerEntry] = []
 
-    def set_member(self, user_id: str, *, chip_balance: int = 0, in_play_balance: int = 0, **extra: Any) -> dict[str, Any]:
+    def set_member(self, user_id: str, *, available_balance: int = 0, in_play_balance: int = 0, **extra: Any) -> dict[str, Any]:
         member = self.members.setdefault(
             user_id,
             {
                 "user_id": user_id,
-                "chip_balance": 0,
+                "available_balance": 0,
                 "in_play_balance": 0,
                 "credit_limit": 0,
                 "role": "PLAYER",
             },
         )
-        member["chip_balance"] = int(chip_balance)
+        member["available_balance"] = int(available_balance)
         member["in_play_balance"] = int(in_play_balance)
         member.setdefault("role", extra.pop("role", "PLAYER"))
         member.setdefault("credit_limit", 0)
@@ -75,7 +75,7 @@ class WalletLedger:
         return member
 
     def get_member(self, user_id: str) -> dict[str, Any]:
-        return self.members.setdefault(user_id, {"user_id": user_id, "chip_balance": 0, "in_play_balance": 0})
+        return self.members.setdefault(user_id, {"user_id": user_id, "available_balance": 0, "in_play_balance": 0})
 
     def add_transaction(self, *, amount: int, type: str, currency_type: str, from_user_id: str | None = None, to_user_id: str | None = None, performed_by: str | None = None, note: str = "") -> LedgerEntry:
         entry = LedgerEntry(
@@ -94,9 +94,9 @@ class WalletLedger:
     def debit_user(self, user_id: str, amount: int, *, currency_type: str = "GLOBAL_PLAYMONEY", note: str = "") -> bool:
         member = self.get_member(user_id)
         amount = int(amount)
-        if amount < 0 or member.get("chip_balance", 0) < amount:
+        if amount < 0 or member.get("available_balance", 0) < amount:
             return False
-        member["chip_balance"] = int(member.get("chip_balance", 0)) - amount
+        member["available_balance"] = int(member.get("available_balance", 0)) - amount
         self.add_transaction(
             amount=amount,
             type="DEBIT",
@@ -112,7 +112,7 @@ class WalletLedger:
         amount = int(amount)
         if amount < 0:
             return False
-        member["chip_balance"] = int(member.get("chip_balance", 0)) + amount
+        member["available_balance"] = int(member.get("available_balance", 0)) + amount
         self.add_transaction(
             amount=amount,
             type="CREDIT",
@@ -129,7 +129,7 @@ class GlobalWalletLedger(WalletLedger):
         super().__init__()
 
     def get_balance(self, user_id: str) -> int:
-        return int(self.get_member(user_id).get("chip_balance", 0))
+        return int(self.get_member(user_id).get("available_balance", 0))
 
     def debit(self, user_id: str, amount: int) -> bool:
         return self.debit_user(user_id, amount, currency_type="GLOBAL_PLAYMONEY", note="global_wallet_debit")
@@ -144,21 +144,21 @@ class ClubWalletLedger(WalletLedger):
         self.club_pool_state: dict[str, dict[str, int]] = {}
         self.clubs: dict[str, dict[str, Any]] = {}
 
-    def set_member(self, club_id: str, user_id: str, *, chip_balance: int = 0, in_play_balance: int = 0, **extra: Any) -> dict[str, Any]:
+    def set_member(self, club_id: str, user_id: str, *, available_balance: int = 0, in_play_balance: int = 0, **extra: Any) -> dict[str, Any]:
         club_members = self.clubs.setdefault(club_id, {})
         member = club_members.setdefault(
             user_id,
             {
                 "user_id": user_id,
                 "club_id": club_id,
-                "chip_balance": 0,
+                "available_balance": 0,
                 "in_play_balance": 0,
                 "credit_limit": 0,
                 "role": "PLAYER",
             },
         )
         member["club_id"] = club_id
-        member["chip_balance"] = int(chip_balance)
+        member["available_balance"] = int(available_balance)
         member["in_play_balance"] = int(in_play_balance)
         member["role"] = extra.pop("role", member.get("role", "PLAYER"))
         member.setdefault("credit_limit", 0)
@@ -169,7 +169,7 @@ class ClubWalletLedger(WalletLedger):
         if user_id is None:
             return self.clubs.get(club_id, {})
         club_members = self.clubs.setdefault(club_id, {})
-        return club_members.setdefault(user_id, {"user_id": user_id, "club_id": club_id, "chip_balance": 0, "in_play_balance": 0})
+        return club_members.setdefault(user_id, {"user_id": user_id, "club_id": club_id, "available_balance": 0, "in_play_balance": 0})
 
     def get_pool(self, club_id: str) -> dict[str, int]:
         return self.club_pool_state.setdefault(
@@ -199,10 +199,10 @@ class ClubWalletLedger(WalletLedger):
             return False
         if role == "AGENT" and recipient.get("agent_id") != sender_user_id:
             return False
-        if sender.get("chip_balance", 0) < amount:
+        if sender.get("available_balance", 0) < amount:
             return False
-        sender["chip_balance"] = int(sender.get("chip_balance", 0)) - amount
-        recipient["chip_balance"] = int(recipient.get("chip_balance", 0)) + amount
+        sender["available_balance"] = int(sender.get("available_balance", 0)) - amount
+        recipient["available_balance"] = int(recipient.get("available_balance", 0)) + amount
         self.transactions.append(
             LedgerEntry(
                 transaction_id=f"tx-{len(self.transactions) + 1}",
@@ -228,10 +228,10 @@ class ClubWalletLedger(WalletLedger):
             return False
         if role == "AGENT" and member.get("agent_id") != admin_user_id:
             return False
-        if int(member.get("chip_balance", 0)) < amount:
+        if int(member.get("available_balance", 0)) < amount:
             return False
-        member["chip_balance"] = int(member.get("chip_balance", 0)) - amount
-        admin["chip_balance"] = int(admin.get("chip_balance", 0)) + amount
+        member["available_balance"] = int(member.get("available_balance", 0)) - amount
+        admin["available_balance"] = int(admin.get("available_balance", 0)) + amount
         self.transactions.append(
             LedgerEntry(
                 transaction_id=f"tx-{len(self.transactions) + 1}",

@@ -75,7 +75,7 @@ at `unions/{union_id}/admins/{user_id}`, and:
 
 at `unions/{union_id}/clubs/{club_id}`.
 
-Table configuration is persisted under `unions/{union_id}/tables/{table_id}`. Deleting an empty table marks its metadata `closed`; it does not erase its audit trail. Buy-in transactions debit the selected home club's `chip_balance`, increase its `in_play_balance`, and reserve a Union seat that includes `club_id`. This makes the club identity durable for settlement and audit.
+Table configuration is persisted under `unions/{union_id}/tables/{table_id}`. Deleting an empty table marks its metadata `closed`; it does not erase its audit trail. Buy-in transactions debit the selected home club member's `available_balance`, increase its `in_play_balance`, and reserve a Union seat that includes `club_id`. This makes the club identity durable for settlement and audit.
 
 ## Inter-club clearing
 

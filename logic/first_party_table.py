@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -18,7 +17,70 @@ from game_engine import (
     start_nlh_hand,
     visible_hole_cards,
 )
+from game_engine.jackpot import (
+    evaluate_bad_beat_qualification,
+    evaluate_hand_of_day,
+)
 from logic.table_game_base import TableGameBase
+
+
+def _attribute_rake_by_contribution(
+    rake_amount: int,
+    contributions: dict[str, int],
+    seat_order: tuple[str, ...],
+) -> dict[str, int]:
+    return _allocate_amount_by_weight(rake_amount, contributions, seat_order)
+
+
+def _allocate_amount_by_weight(
+    amount: int,
+    weights: dict[str, int],
+    seat_order: tuple[str, ...],
+) -> dict[str, int]:
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise ValueError("Amount must be a non-negative integer.")
+    if len(set(seat_order)) != len(seat_order) or set(weights) != set(seat_order):
+        raise ValueError("Seat order must contain each weighted player exactly once.")
+    if any(
+        isinstance(weight, bool) or not isinstance(weight, int) or weight < 0
+        for weight in weights.values()
+    ):
+        raise ValueError("Weights must be non-negative integers.")
+
+    total_weight = sum(weights.values())
+    if amount > total_weight:
+        raise ValueError("Allocated amount cannot exceed the total weight.")
+    if total_weight == 0:
+        return {player_id: 0 for player_id in seat_order}
+
+    shares: dict[str, int] = {}
+    remainders: dict[str, int] = {}
+    for player_id, weight in weights.items():
+        shares[player_id], remainders[player_id] = divmod(
+            amount * weight, total_weight
+        )
+
+    remaining_chips = amount - sum(shares.values())
+    remainder_order = sorted(
+        seat_order,
+        key=lambda player_id: (-remainders[player_id], seat_order.index(player_id)),
+    )
+    for player_id in remainder_order[:remaining_chips]:
+        shares[player_id] += 1
+    return shares
+
+
+def _preflop_folded_player_ids(
+    replay_frames: list[dict[str, Any]],
+) -> set[str]:
+    return {
+        str(last_action["user_id"])
+        for frame in replay_frames
+        if isinstance((last_action := frame.get("last_action")), dict)
+        and last_action.get("action") == "FOLD"
+        and last_action.get("street") == int(NLHStreet.PREFLOP)
+        and last_action.get("user_id") is not None
+    }
 
 
 class FirstPartyNLHGame(TableGameBase):
@@ -140,6 +202,7 @@ class FirstPartyNLHGame(TableGameBase):
                 "user_id": user_id,
                 "action": action,
                 "amount": action_amount,
+                "street": int(state.street),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -329,31 +392,93 @@ class FirstPartyNLHGame(TableGameBase):
         rake = self.calculate_rake_accounting(
             pot_total, dealt_flop=len(state.community_cards) >= 3
         )
-        jackpot = self.calculate_jackpot_accounting(
-            max(pot_total - rake["rake_amount"], 0)
+        uncalled_returns = {
+            award.player_id: award.amount for award in outcome.uncalled_returns
+        }
+        contestable_contributions = {
+            player.player_id: player.total_contribution
+            - uncalled_returns.get(player.player_id, 0)
+            for player in state.players
+        }
+        preflop_folded = _preflop_folded_player_ids(self._replay_frames)
+        rake_eligible = {
+            player.player_id: player.player_id not in preflop_folded
+            for player in state.players
+        }
+        eligible_contributions = {
+            player_id: contribution
+            for player_id, contribution in contestable_contributions.items()
+            if rake_eligible[player_id]
+        }
+        eligible_seat_order = tuple(
+            self.seats[seat].user_id
+            for seat in self._player_order
+            if rake_eligible[self.seats[seat].user_id]
         )
-        hand_of_day = self.calculate_hand_of_day_accounting(pot_total)
+        attributed_eligible = _attribute_rake_by_contribution(
+            rake["rake_amount"], eligible_contributions, eligible_seat_order
+        )
+        rake_attributions = {
+            player.player_id: attributed_eligible.get(player.player_id, 0)
+            for player in state.players
+        }
+        jackpot = (
+            self.calculate_jackpot_accounting(
+                pot_total,
+                rake_amount=rake["rake_amount"],
+            )
+            if self.union_id is None
+            else {
+                "eligible": False,
+                "fee_collected": 0,
+                "qualifying_hand": None,
+                "pool_after_hand": self.jackpot_pool,
+                "reason_code": "UNION_BBJ_NOT_SUPPORTED",
+            }
+        )
         house_take = min(pot_total, rake["rake_amount"] + jackpot["fee_collected"])
         player_payout_total = max(pot_total - house_take, 0)
-        winner_entries = [
-            {"user_id": player_id, "amount": amount}
-            for player_id, amount in gross_awards.items()
-            if amount > 0
+        winner_order = tuple(
+            self.seats[seat].user_id
+            for seat in self._player_order
+            if gross_awards.get(self.seats[seat].user_id, 0) > 0
+        )
+        winner_gross_awards = {
+            player_id: gross_awards[player_id] for player_id in winner_order
+        }
+        rake_deductions = _allocate_amount_by_weight(
+            rake["rake_amount"], winner_gross_awards, winner_order
+        )
+        after_rake_awards = {
+            player_id: winner_gross_awards[player_id] - rake_deductions[player_id]
+            for player_id in winner_order
+        }
+        bbj_drop_deductions = _allocate_amount_by_weight(
+            jackpot["fee_collected"], after_rake_awards, winner_order
+        )
+        adjusted_winners = [
+            {
+                "user_id": player_id,
+                "gross_award": winner_gross_awards[player_id],
+                "rake_deduction": rake_deductions[player_id],
+                "bbj_drop_deduction": bbj_drop_deductions[player_id],
+                "amount": (
+                    after_rake_awards[player_id]
+                    - bbj_drop_deductions[player_id]
+                ),
+            }
+            for player_id in winner_order
         ]
-        adjusted_winners = []
-        remaining = player_payout_total
-        for index, entry in enumerate(winner_entries):
-            adjusted_amount = (
-                remaining
-                if index == len(winner_entries) - 1
-                else math.floor(entry["amount"] * player_payout_total / pot_total)
-            )
-            remaining -= adjusted_amount
-            adjusted_winners.append(
-                {"user_id": entry["user_id"], "amount": adjusted_amount}
-            )
         adjusted_awards = {
             entry["user_id"]: entry["amount"] for entry in adjusted_winners
+        }
+        rake_deductions_by_player = {
+            player["user_id"]: player["rake_deduction"]
+            for player in adjusted_winners
+        }
+        bbj_deductions_by_player = {
+            player["user_id"]: player["bbj_drop_deduction"]
+            for player in adjusted_winners
         }
         players_by_id = {player.player_id: player for player in state.players}
         settled_players = []
@@ -375,6 +500,22 @@ class FirstPartyNLHGame(TableGameBase):
                     "club_id": seat_player.club_id,
                     "starting_stack": engine_player.starting_stack,
                     "final_stack": final_stack,
+                    "contestable_contribution": contestable_contributions[
+                        seat_player.user_id
+                    ],
+                    "uncalled_return": uncalled_returns.get(seat_player.user_id, 0),
+                    "gross_award": gross_award,
+                    "payout_after_fees": adjusted_awards.get(
+                        seat_player.user_id, 0
+                    ),
+                    "rake_deduction": rake_deductions_by_player.get(
+                        seat_player.user_id, 0
+                    ),
+                    "bbj_drop_deduction": bbj_deductions_by_player.get(
+                        seat_player.user_id, 0
+                    ),
+                    "rake_eligible": rake_eligible[seat_player.user_id],
+                    "rake_attributed": rake_attributions[seat_player.user_id],
                     "net_delta": final_stack - engine_player.starting_stack,
                     "hole_cards": [card.code for card in engine_player.hole_cards],
                     "mucked": player_mucked[seat_player.user_id],
@@ -387,6 +528,44 @@ class FirstPartyNLHGame(TableGameBase):
             }
             for frame_player in self._replay_frames[-1]["players"]:
                 frame_player["stack"] = final_stacks[frame_player["user_id"]]
+
+        is_showdown = any(
+            player.player_id in state.publicly_revealed_player_ids
+            and not player.folded
+            for player in state.players
+        )
+        hand_of_day = evaluate_hand_of_day(
+            [
+                {
+                    "user_id": player.player_id,
+                    "username": self.seats[player.seat_index].username,
+                    "seat": player.seat_index,
+                    "hole_cards": [card.code for card in player.hole_cards],
+                    "folded": player.folded,
+                }
+                for player in state.players
+            ],
+            [card.code for card in state.community_cards],
+            self.game_id,
+            is_showdown,
+        )
+        jackpot["qualification"] = evaluate_bad_beat_qualification(
+            [
+                {
+                    "user_id": player.player_id,
+                    "seat": player.seat_index,
+                    "hole_cards": [card.code for card in player.hole_cards],
+                    "folded": player.folded,
+                    "rake_eligible": rake_eligible[player.player_id],
+                }
+                for player in state.players
+            ],
+            [card.code for card in state.community_cards],
+            pot_total,
+            self.big_blind,
+            is_showdown,
+            self.union_id is None and self.table_settings.jackpot_enabled,
+        )
 
         operation_names = {
             PokerEventKind.PLAYER_FOLDED: "Folding",
@@ -427,6 +606,9 @@ class FirstPartyNLHGame(TableGameBase):
             "hand_id": self._current_hand_id,
             "table_id": self.table_id,
             "table_name": self.table_name,
+            "game_id": self.game_id,
+            "small_blind": self.small_blind,
+            "big_blind": self.big_blind,
             "is_union_table": self.union_id is not None,
             "union_id": self.union_id,
             "origin_club_id": self.origin_club_id,
@@ -451,11 +633,7 @@ class FirstPartyNLHGame(TableGameBase):
                 "player_payout_total": player_payout_total,
                 "adjusted_winners": adjusted_winners,
             },
-            "is_showdown": any(
-                player.player_id in state.publicly_revealed_player_ids
-                and not player.folded
-                for player in state.players
-            ),
+            "is_showdown": is_showdown,
             "winners": adjusted_winners,
             "pot_distributions": ([{
                 "pot_index": 0,

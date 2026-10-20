@@ -281,7 +281,7 @@ Global-wallet grants debit the `GLOBAL_PLAYMONEY` reserve; platform-funded club-
 
 ### Club wallet transfers
 
-`POST /clubs/{club_id}/wallet/send-out` transfers available club chips from the authenticated `OWNER`, `MANAGER`, or `AGENT` to a member. An `AGENT` may only transfer to a member whose `agent_id` is the agent's user ID. `POST /clubs/{club_id}/wallet/claim-back` transfers only available `chip_balance` from a member back to the authenticated operator; `in_play_balance` is never claimable and remains untouched. A member may keep chips in play while available chips are claimed. Both operations require a unique `transaction_id` UUID and write balanced member updates plus a club-wide audit record in one Firestore transaction. Reuse the same ID only to safely retry the same transfer.
+`POST /clubs/{club_id}/wallet/send-out` transfers available club chips from the authenticated `OWNER`, `MANAGER`, or `AGENT` to a member. An `AGENT` may only transfer to a member whose `agent_id` is the agent's user ID. `POST /clubs/{club_id}/wallet/claim-back` transfers only `available_balance` from a member back to the authenticated operator; `in_play_balance` is never claimable and remains untouched. A member may keep chips in play while available chips are claimed. Both operations require a unique `transaction_id` UUID and write balanced member updates plus a club-wide audit record in one Firestore transaction. Reuse the same ID only to safely retry the same transfer.
 
 Request:
 
@@ -294,7 +294,91 @@ Request:
 }
 ```
 
-Both endpoints return the transfer type, amount, transaction ID, and server-derived source/destination IDs. Insufficient balance, unauthorized downline, in-play funds, and reused IDs with different transfer details return `409` or `403` as appropriate. Club wallet routes only manage private club chips; they do not transfer to or from global play money.
+Both endpoints return the transfer type, amount, transaction ID, and server-derived source/destination IDs. Insufficient available balance, unauthorized downline, and reused IDs with different transfer details return `409` or `403` as appropriate. Claim-back debits only `available_balance`; it can happen while `in_play_balance` is nonzero and never touches in-play chips. Club wallet routes only manage private club chips; they do not transfer to or from global play money.
+
+### Hand-of-the-Day
+
+Hand-of-the-Day is configured and tracked separately for each club, supported game variant, and small/big-blind pair. The prize is 100 times the big blind (for example, a 1/5 table has a 500-chip prize). Currently only `no_limit_texas_holdem` is supported; PLO variants remain unavailable until their game engines and evaluators are implemented. For NLH, each fixed 3-hour cycle records the strongest showdown hand of four-of-a-kind or better. A stronger hand replaces the current leader without restarting the timer. Equal-strength leaders share the prize equally, with any indivisible chip remainder assigned by seat order. Folded hands do not qualify, and no minimum-pot threshold is applied.
+
+The configured prize is reserved from `hand_of_the_day_pool` when a cycle starts. Club owners/managers fund that pool from the club treasury; the winner claims the prize to their `available_balance`, not `in_play_balance`. A claim is available only after the cycle expires. Each tied winner must claim their share; the next 3-hour cycle starts after all tied winners claim. If a cycle has no qualifying hand, the reserved prize rolls forward to the next cycle. If there is not enough unreserved pool balance for the next configured prize, the promotion waits for additional funding.
+
+- `GET /clubs/{club_id}/hand-of-the-day/{game_id}?small_blind=1&big_blind=5` returns the enabled state, configured prize, current leader(s), cycle ID and end time, remaining seconds, and unreserved pool balance for that blind level. Active club members may read it.
+- `PATCH /clubs/{club_id}/hand-of-the-day/{game_id}` configures one blind level; owners/managers send `{"enabled": true, "small_blind": 1, "big_blind": 5}`. The prize is derived as 100 times the big blind, and enabling requires the shared pool to contain at least that amount.
+- `POST /clubs/{club_id}/hand-of-the-day/{game_id}/fund` moves chips from the shared club treasury to the pool. Owners/managers send `{"amount": 1000, "transaction_id": "<uuid>", "small_blind": 1, "big_blind": 5}`. The blind pair identifies which awaiting cycle may start after funding. Reuse the same ID only to safely retry the same contribution.
+- `POST /clubs/{club_id}/hand-of-the-day/{game_id}/claim` is available to any tied winner after expiry. Send `{"cycle_id": "<cycle UUID from the status response>", "small_blind": 1, "big_blind": 5}` and reuse that cycle ID when retrying an uncertain claim.
+
+Prize reservations, member credits, and ledger records are transactional. Hand rankings and award evidence are server-derived; clients cannot submit a hand result or winner. Union tables are not included. See [highhandRules.md](highhandRules.md) for the complete qualification, cycle, payout, and funding rules.
+
+### Player rake and winnings reports
+
+`GET /clubs/{club_id}/rake/players?limit=50&before_total_rake_generated={amount}&before_user_id={user_id}` returns cumulative per-player hand results and contribution-weighted rake attribution. `limit` defaults to 50 and is capped at 200. The two cursor parameters must be supplied together. Rows are ordered by total rake generated descending, then user ID ascending; the response returns `next_before_total_rake_generated` and `next_before_user_id`, or both as `null` when there is no next page. Owner/manager totals use Firestore aggregation; agent totals and pages are scoped to the current active downline, whose summary documents are batch-read. Rake is collected once per hand; it is not split into street-specific pools. Players who fold preflop are excluded from the hand's rake split. Players who fold on the flop, turn, or river remain eligible based on their contestable contributions. Active `OWNER` and `MANAGER` members receive the club's total collected rake, the total attributed to players, any unattributed legacy amount, and player summaries. An active `AGENT` receives only currently active assigned players and their rake-generated total; the response omits club-wide rake totals. `PLAYER` members receive `403`.
+
+Owner/manager response:
+
+```json
+{
+  "club_id": "club-a",
+  "scope": "club",
+  "rake_generated_total": 100,
+  "total_rake_collected": 100,
+  "attributed_rake_total": 100,
+  "unattributed_rake_total": 0,
+  "next_before_total_rake_generated": null,
+  "next_before_user_id": null,
+  "players": [
+    {
+      "user_id": "player-a",
+      "username": "Alice",
+      "hands_played": 12,
+      "rake_eligible_hands": 10,
+      "hands_with_award": 5,
+      "positive_net_hands": 4,
+      "total_contestable_contribution": 5000,
+      "total_gross_awards": 6200,
+      "total_payout_after_fees": 6100,
+      "total_net_result": 1100,
+      "total_rake_generated": 50,
+      "last_hand_id": "hand-12",
+      "last_hand_at": "2026-10-20T12:00:00+00:00"
+    }
+  ]
+}
+```
+
+Agent responses use `"scope": "assigned_players"`, include `rake_generated_total` for the agent's active assigned players, and omit `total_rake_collected`, `attributed_rake_total`, and `unattributed_rake_total` so they do not reveal the club-wide rake total. The player list is ordered by `total_rake_generated` descending.
+
+`GET /clubs/{club_id}/rake/players/{user_id}/hands?limit=50&before_timestamp={timestamp}&before_hand_id={hand_id}` is the paginated per-hand detail endpoint. The two cursor parameters must either both be present or both be omitted. Records are ordered by timestamp descending, then hand ID descending; the next page starts strictly after that tuple. The response returns both `next_before_timestamp` and `next_before_hand_id`, or both as `null` when there is no next page. It returns rake eligibility, contestable contribution, uncalled return, gross award, payout after fees, attributed rake, and net result. Owners/managers can access members in their club; agents can access only their currently assigned active players; players receive `403`. These endpoints are for private club accounting; they do not pay rakeback or change any player balance. Union rake is not attributed until a union policy is implemented.
+
+Each current record includes `hand_id`, `table_id`, `timestamp`, `user_id`, `username`, `rake_eligible`, `contestable_contribution`, `uncalled_return`, `gross_award`, `rake_deduction`, `bbj_drop_deduction`, `payout_after_fees`, `rake_attributed`, and `net_delta`. Older records may not contain the two deduction fields. `rake_eligible` is false for a preflop folder; a later fold does not revoke it. Gross award is before fees; `payout_after_fees = gross_award - rake_deduction - bbj_drop_deduction`; net result is the change in the player's stack for that hand. Winner fee deductions use largest-remainder integer allocation in table hand order, applying rake first and BBJ drop to the remaining award. Rake attribution is based on eligible players' contestable contributions after uncalled returns and is not the same as a winner's rake deduction. Rakeback and agent/manager/owner share distributions are not part of these records yet.
+
+Paginated response:
+
+```json
+{
+  "club_id": "club-a",
+  "user_id": "player-a",
+  "records": [
+    {
+      "hand_id": "hand-12",
+      "table_id": "table-3",
+      "timestamp": "2026-10-20T12:00:00+00:00",
+      "user_id": "player-a",
+      "username": "Alice",
+      "rake_eligible": true,
+      "contestable_contribution": 500,
+      "uncalled_return": 0,
+      "gross_award": 700,
+      "rake_deduction": 25,
+      "bbj_drop_deduction": 25,
+      "payout_after_fees": 650,
+      "rake_attributed": 25,
+      "net_delta": 150
+    }
+  ],
+  "next_before_timestamp": null,
+  "next_before_hand_id": null
+}
+```
 
 ### Club treasury transfers
 
@@ -399,7 +483,7 @@ The `201` response includes `union_id`, `table_id`, `game_id`, `origin_club_id`,
 
 ### Seat and play
 
-`POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` requires an active `PLAYER` membership in the path club and an active union-club link. Its body is the same as the local seat request (`seat_index`, `buy_in_amount`, `buy_in_id`, and optional `accept_big_blind_post`); it does not accept a user ID or stack. The authenticated UID and username come from Firebase/member data. The Firestore transaction debits that member's home-club `chip_balance`, increments its `in_play_balance`, and reserves the seat under the union table.
+`POST /unions/{union_id}/tables/{table_id}/clubs/{club_id}/seats` requires an active `PLAYER` membership in the path club and an active union-club link. Its body is the same as the local seat request (`seat_index`, `buy_in_amount`, `buy_in_id`, and optional `accept_big_blind_post`); it does not accept a user ID or stack. The authenticated UID and username come from Firebase/member data. The Firestore transaction debits that member's home-club `available_balance`, increments its `in_play_balance`, and reserves the seat under the union table.
 
 `POST /unions/{union_id}/tables/{table_id}/hands` requires `UNION_ADMIN`. Shared WebSockets connect to:
 
@@ -520,9 +604,15 @@ Response `201`:
 
 ### Update table financial settings
 
-`PATCH /clubs/{club_id}/tables/{table_id}/settings` requires `OWNER` or `MANAGER`. The union equivalent requires `UNION_ADMIN`. `rake_rate` accepts values from `0` through `0.1` (including `0.075`); `rake_cap` and `rake_min_pot` are integer chip amounts. `no_flop_no_drop` disables rake when the hand ends before a flop. BBJ fee collection honors `jackpot_min_pot`. On local club tables, actual rake and BBJ drops reduce winner stacks and update the club treasury in the same idempotent settlement transaction.
+`GET /clubs/{club_id}/financial-settings` returns the club's saved `default_rake_rate`. `PATCH /clubs/{club_id}/financial-settings` requires `OWNER` or `MANAGER` and accepts `{"default_rake_rate": 0.06}` (0 through 0.1). This changes the club default for new tables and existing tables that inherit it; per-table overrides are preserved. The default is stored at `clubs/{club_id}/settings/financial`.
 
-BBJ qualifying-hand evaluation/payout, Hand-of-the-Day funding and awards, union fee allocation, and global-play-money tables are not implemented. Global play-money wallet provisioning and reads are implemented by the endpoints in [Global play-money wallet](#global-play-money-wallet); they cannot be used to join club tables or transfer funds to club wallets.
+New local club NLH tables default to 7% rake and an additional 3% BBJ contribution from the contestable pot (10% combined before any rake cap; the rake cap does not cap the BBJ contribution). Both rates are configurable from 0 through 10%; `jackpot_min_pot` and `rake_min_pot` are integer chip amounts. Rake has a 0-chip default cap and `no_flop_no_drop` defaults to enabled. A legacy nonzero `jackpot_fee` remains a fixed-chip BBJ contribution and overrides the default percentage unless `jackpot_rate` is also supplied. The BBJ pool is initialized at `clubs/{club_id}/treasury/pools` and receives the per-hand contribution transactionally. Club owners may additionally contribute chips from their member `available_balance` using `POST /clubs/{club_id}/jackpot/contributions` with `{"amount": 1000, "transaction_id": "<uuid>"}`; retries with the same ID are idempotent. On local club NLH tables, the versioned BBJ rule requires a showdown, at least four dealt-in players, a pot of at least 20 big blinds, an Aces-Full-or-better losing hand, and a Four-of-a-Kind-or-better winning hand. Qualifying awards use a stake-based pool-access rate capped at 15%, split 50% to losing qualifiers, 25% to winning qualifiers, and 25% to other eligible dealt-in players; each share is divided equally with seat-order odd-chip allocation. All player shares credit member `in_play_balance`, not `available_balance`. The drop, pool update, award audit, and credits are atomic and idempotent. The natural-language `jackpot_qualifying_hand` setting is descriptive only. BBJ drops/awards are disabled on union tables until union-wide pool accounting is defined.
+
+`PATCH /clubs/{club_id}/tables/{table_id}/settings` can set a table-specific `rake_rate` override (0 through 0.1), which persists separately and takes precedence over the club default. Omit `rake_rate` when changing other table settings. The union equivalent requires `UNION_ADMIN` and does not use club rake defaults.
+
+`POST /clubs/{club_id}/jackpot/contributions` is owner-only. It transfers the requested amount from the owner's club-member `available_balance` to the club BBJ pool and writes an idempotent ledger transaction. Owners must not submit a payment confirmation or alter the pool balance directly.
+
+Single-Hand Jackpot, union BBJ allocation, and global-play-money tables are not implemented. BBJ award and qualification evidence is private server-side accounting; there is no public BBJ report or announcement endpoint. Global play-money wallet provisioning and reads are implemented by the endpoints in [Global play-money wallet](#global-play-money-wallet); they cannot be used to join club tables or transfer funds to club wallets.
 
 ### Seat a player
 
@@ -541,7 +631,7 @@ Request:
 }
 ```
 
-`buy_in_amount` is the requested amount, not an assigned stack. The server checks the table's buy-in limits and the member's Firestore `chip_balance`, then atomically debits that balance and reserves the seat. `buy_in_id` is a client-generated UUID idempotency key; generate it once for a purchase and reuse the same value if retrying after a timeout or network error. Do not generate a new key for a retry. `accept_big_blind_post` defaults to `false`; a new player may set it to `true` to join before the big blind and post one live big blind. The post is not charged twice when the player is already in the natural big-blind seat.
+`buy_in_amount` is the requested amount, not an assigned stack. The server checks the table's buy-in limits and the member's Firestore `available_balance`, then atomically debits that balance and reserves the seat. The member's buy-in audit records `available_balance_delta` and `in_play_balance_delta`. `buy_in_id` is a client-generated UUID idempotency key; generate it once for a purchase and reuse the same value if retrying after a timeout or network error. Do not generate a new key for a retry. `accept_big_blind_post` defaults to `false`; a new player may set it to `true` to join before the big blind and post one live big blind. The post is not charged twice when the player is already in the natural big-blind seat.
 
 Response `201`: a table-state snapshot. Before a hand starts, `hand_id` is `null`, `is_hand_running` is `false`, and the seated player has an empty `hole_cards` array. The server assigns `stack` equal to the verified `buy_in_amount`.
 

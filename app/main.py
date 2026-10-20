@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from google.api_core.exceptions import GoogleAPICallError
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError
@@ -115,15 +115,41 @@ class CreateUnionTableRequest(CreateTableRequest):
 class UpdateTableSettingsRequest(BaseModel):
     jackpot_enabled: bool | None = None
     jackpot_fee: int | None = Field(default=None, ge=0)
+    jackpot_rate: float | None = Field(default=None, ge=0, le=0.1)
     jackpot_min_pot: int | None = Field(default=None, ge=0)
     jackpot_qualifying_hand: str | None = Field(default=None, min_length=1, max_length=80)
     rake_rate: float | None = Field(default=None, ge=0, le=0.1)
     rake_cap: int | None = Field(default=None, ge=0)
     rake_min_pot: int | None = Field(default=None, ge=0)
     no_flop_no_drop: bool | None = None
-    hand_of_day_enabled: bool | None = None
-    hand_of_day_target: int | None = Field(default=None, ge=0)
-    hand_of_day_prize: int | None = Field(default=None, ge=0)
+
+
+class HandOfDayConfigRequest(BaseModel):
+    enabled: bool
+    small_blind: int = Field(gt=0, strict=True)
+    big_blind: int = Field(gt=0, strict=True)
+
+
+class HandOfDayFundRequest(BaseModel):
+    amount: int = Field(gt=0, strict=True)
+    transaction_id: UUID
+    small_blind: int = Field(gt=0, strict=True)
+    big_blind: int = Field(gt=0, strict=True)
+
+
+class HandOfDayClaimRequest(BaseModel):
+    cycle_id: UUID
+    small_blind: int = Field(gt=0, strict=True)
+    big_blind: int = Field(gt=0, strict=True)
+
+
+class JackpotContributionRequest(BaseModel):
+    amount: int = Field(gt=0, strict=True)
+    transaction_id: UUID
+
+
+class ClubFinancialSettingsRequest(BaseModel):
+    default_rake_rate: float = Field(ge=0, le=0.1)
 
 
 class UnionAdminProvisionRequest(BaseModel):
@@ -405,6 +431,7 @@ def table_lobby_entry(game: TableGameBase) -> dict[str, Any]:
         "max_seats": game.max_seats,
         "seated_count": len(game.seats),
         "is_hand_running": game.is_hand_running,
+        "club_rake_rate_overridden": game.club_rake_rate_overridden,
         **game.table_settings.as_dict(),
     }
 
@@ -466,6 +493,10 @@ async def get_or_restore_scoped_runtime(
                     ) from error
             if os.getenv("SERVICE_ROLE", "gateway") == "worker":
                 runtime.on_state_change = publish_masked_table_snapshots
+            if scope_type == "club":
+                await apply_club_rake_default(
+                    runtime.game, scope_id, runtime.game.table_id
+                )
             return runtime
         if not isinstance(repository, FirestoreHandRepository):
             raise HTTPException(status_code=404, detail="Table not found.")
@@ -504,8 +535,41 @@ async def get_or_restore_scoped_runtime(
                 raise HTTPException(status_code=409, detail="Table checkpoint could not be restored.")
         except (FirestoreRequiredError, GoogleAPICallError, ValueError) as error:
             raise HTTPException(status_code=503, detail="Table checkpoint recovery failed.") from error
+        if scope_type == "club":
+            await apply_club_rake_default(
+                runtime.game, scope_id, runtime.game.table_id
+            )
         tables[key] = runtime
         return runtime
+
+
+async def apply_club_rake_default(
+    game: TableGameBase,
+    club_id: str,
+    table_id: str | None = None,
+) -> None:
+    if (
+        not isinstance(repository, FirestoreHandRepository)
+        or not hasattr(repository, "_client")
+    ):
+        return
+    if table_id is not None:
+        override = await asyncio.to_thread(
+            repository.get_table_rake_override,
+            club_id,
+            table_id,
+        )
+        if override is not None:
+            game.table_settings.rake_rate = override
+            game.club_rake_rate_overridden = True
+            return
+    if game.club_rake_rate_overridden:
+        return
+    settings = await asyncio.to_thread(
+        repository.get_club_financial_settings,
+        club_id,
+    )
+    game.table_settings.rake_rate = float(settings["default_rake_rate"])
 
 
 async def route_gateway_event(event: dict[str, Any]) -> None:
@@ -835,6 +899,65 @@ async def provision_union_club(
     }
 
 
+@app.get("/clubs/{club_id}/financial-settings")
+async def get_club_financial_settings(
+    club_id: str,
+    request: Request,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            request.app.state.repository.get_club_financial_settings,
+            club_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Club financial settings are unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.patch("/clubs/{club_id}/financial-settings")
+async def update_club_financial_settings(
+    club_id: str,
+    settings: ClubFinancialSettingsRequest,
+    request: Request,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(
+            request.app.state.repository.update_club_rake_default,
+            club_id,
+            settings.default_rake_rate,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Club financial settings could not be updated.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if result["status"] == "unauthorized_operator":
+        raise HTTPException(
+            status_code=403,
+            detail="An active club OWNER or MANAGER membership is required.",
+        )
+
+    for (runtime_club_id, _), runtime in tuple(tables.items()):
+        if (
+            runtime_club_id == club_id
+            and runtime.game.origin_club_id == club_id
+            and not runtime.game.club_rake_rate_overridden
+        ):
+            runtime.game.table_settings.rake_rate = settings.default_rake_rate
+    return {"club_id": club_id, **result}
+
+
 @app.patch("/clubs/{club_id}/tables/{table_id}/settings")
 async def update_club_table_settings(
     club_id: str,
@@ -845,24 +968,302 @@ async def update_club_table_settings(
     ),
 ) -> dict[str, Any]:
     runtime = get_table(club_id, table_id)
+    if (
+        request.rake_rate is not None
+        and isinstance(repository, FirestoreHandRepository)
+        and hasattr(repository, "_client")
+    ):
+        try:
+            override_result = await asyncio.to_thread(
+                repository.update_table_rake_override,
+                club_id,
+                table_id,
+                request.rake_rate,
+                membership.user.uid,
+            )
+        except (FirestoreRequiredError, GoogleAPICallError) as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Table rake override could not be saved.",
+            ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if override_result["status"] == "unauthorized_operator":
+            raise HTTPException(
+                status_code=403,
+                detail="An active club OWNER or MANAGER membership is required.",
+            )
     payload = runtime.game.update_table_settings(
         jackpot_enabled=request.jackpot_enabled,
         jackpot_fee=request.jackpot_fee,
+        jackpot_rate=request.jackpot_rate,
         jackpot_min_pot=request.jackpot_min_pot,
         jackpot_qualifying_hand=request.jackpot_qualifying_hand,
         rake_rate=request.rake_rate,
         rake_cap=request.rake_cap,
         rake_min_pot=request.rake_min_pot,
         no_flop_no_drop=request.no_flop_no_drop,
-        hand_of_day_enabled=request.hand_of_day_enabled,
-        hand_of_day_target=request.hand_of_day_target,
-        hand_of_day_prize=request.hand_of_day_prize,
     )
     return {
         "table_id": table_id,
         "table_name": runtime.game.table_name,
+        "club_rake_rate_overridden": runtime.game.club_rake_rate_overridden,
         **payload,
     }
+
+
+@app.get("/clubs/{club_id}/hand-of-the-day/{game_id}")
+async def get_hand_of_the_day(
+    club_id: str,
+    game_id: str,
+    request: Request,
+    small_blind: int = Query(gt=0),
+    big_blind: int = Query(gt=0),
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    if not is_game_create_supported(game_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Hand-of-the-Day is unavailable for unsupported game variants.",
+        )
+    try:
+        return await asyncio.to_thread(
+            request.app.state.repository.get_hand_of_the_day,
+            club_id,
+            game_id,
+            small_blind,
+            big_blind,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Hand-of-the-Day storage is unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.patch("/clubs/{club_id}/hand-of-the-day/{game_id}")
+async def configure_hand_of_the_day(
+    club_id: str,
+    game_id: str,
+    config: HandOfDayConfigRequest,
+    request: Request,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    if not is_game_create_supported(game_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Hand-of-the-Day is unavailable for unsupported game variants.",
+        )
+    try:
+        result = await asyncio.to_thread(
+            request.app.state.repository.configure_hand_of_the_day,
+            club_id,
+            game_id,
+            config.small_blind,
+            config.big_blind,
+            config.enabled,
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Hand-of-the-Day storage is unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result["status"] == "insufficient_pool":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The Hand-of-the-Day pool must be funded with at least "
+                f"{result['required_amount']} chips before enabling this prize."
+            ),
+        )
+    if result["status"] == "cycle_in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="The current Hand-of-the-Day cycle must finish before it can be disabled.",
+        )
+    if result["status"] == "unauthorized_operator":
+        raise HTTPException(
+            status_code=403,
+            detail="An active club OWNER or MANAGER membership is required.",
+        )
+    return {
+        "club_id": club_id,
+        "game_id": game_id,
+        **result,
+    }
+
+
+@app.post("/clubs/{club_id}/hand-of-the-day/{game_id}/fund")
+async def fund_hand_of_the_day(
+    club_id: str,
+    game_id: str,
+    funding: HandOfDayFundRequest,
+    request: Request,
+    membership: ClubMembership = Depends(
+        require_club_role([ClubRole.OWNER, ClubRole.MANAGER])
+    ),
+) -> dict[str, Any]:
+    if not is_game_create_supported(game_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Hand-of-the-Day is unavailable for unsupported game variants.",
+        )
+    try:
+        result = await asyncio.to_thread(
+            request.app.state.repository.fund_hand_of_the_day,
+            club_id,
+            game_id,
+            funding.small_blind,
+            funding.big_blind,
+            funding.amount,
+            str(funding.transaction_id),
+            membership.user.uid,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Hand-of-the-Day funding is unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result["status"] == "insufficient_treasury":
+        raise HTTPException(
+            status_code=409,
+            detail="The club treasury has insufficient funds for this pool contribution.",
+        )
+    if result["status"] == "idempotency_conflict":
+        raise HTTPException(
+            status_code=409,
+            detail="transaction_id was already used for a different funding request.",
+        )
+    if result["status"] == "unauthorized_operator":
+        raise HTTPException(
+            status_code=403,
+            detail="An active club OWNER or MANAGER membership is required.",
+        )
+    return {
+        "club_id": club_id,
+        "game_id": game_id,
+        **result,
+    }
+
+
+@app.post("/clubs/{club_id}/hand-of-the-day/{game_id}/claim")
+async def claim_hand_of_the_day(
+    club_id: str,
+    game_id: str,
+    claim_request: HandOfDayClaimRequest,
+    request: Request,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    if not is_game_create_supported(game_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Hand-of-the-Day is unavailable for unsupported game variants.",
+        )
+    try:
+        result = await asyncio.to_thread(
+            request.app.state.repository.claim_hand_of_the_day,
+            club_id,
+            game_id,
+            claim_request.small_blind,
+            claim_request.big_blind,
+            membership.user.uid,
+            str(claim_request.cycle_id),
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Hand-of-the-Day claim is unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    status = result.get("status")
+    if status == "not_configured":
+        raise HTTPException(status_code=404, detail="Hand-of-the-Day is not configured.")
+    if status == "not_ready":
+        raise HTTPException(
+            status_code=409,
+            detail="The current Hand-of-the-Day cycle has not ended.",
+        )
+    if status == "not_winner":
+        raise HTTPException(
+            status_code=403,
+            detail="Only a current Hand-of-the-Day winner can claim the prize.",
+        )
+    if status == "stale_cycle":
+        raise HTTPException(
+            status_code=409,
+            detail="This claim refers to an expired Hand-of-the-Day cycle.",
+        )
+    if status == "not_claimable":
+        raise HTTPException(
+            status_code=409,
+            detail="There is no expired Hand-of-the-Day prize to claim.",
+        )
+    if status == "no_qualifying_hand":
+        raise HTTPException(
+            status_code=409,
+            detail="No quads-or-better hand qualified in this cycle.",
+        )
+    if status in {"member_not_found", "member_not_active"}:
+        raise HTTPException(
+            status_code=403,
+            detail="An active club membership is required to claim this prize.",
+        )
+    if status in {"already_claimed", "idempotency_conflict"}:
+        raise HTTPException(
+            status_code=409,
+            detail="This Hand-of-the-Day claim has already been processed.",
+        )
+    return result
+
+
+@app.post("/clubs/{club_id}/jackpot/contributions")
+async def contribute_to_bad_beat_jackpot(
+    club_id: str,
+    contribution: JackpotContributionRequest,
+    request: Request,
+    membership: ClubMembership = Depends(require_club_role([ClubRole.OWNER])),
+) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(
+            request.app.state.repository.contribute_to_bad_beat_jackpot,
+            club_id,
+            membership.user.uid,
+            contribution.amount,
+            str(contribution.transaction_id),
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="BBJ pool contribution is unavailable.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result["status"] == "insufficient_balance":
+        raise HTTPException(
+            status_code=409,
+            detail="The club owner's available balance is insufficient.",
+        )
+    if result["status"] == "unauthorized_operator":
+        raise HTTPException(
+            status_code=403,
+            detail="An active club OWNER membership is required.",
+        )
+    if result["status"] == "idempotency_conflict":
+        raise HTTPException(
+            status_code=409,
+            detail="transaction_id was already used for a different contribution.",
+        )
+    return {"club_id": club_id, **result}
 
 
 @app.patch("/unions/{union_id}/tables/{table_id}/settings")
@@ -875,18 +1276,30 @@ async def update_union_table_settings(
     runtime = tables.get(union_table_key(union_id, table_id))
     if runtime is None:
         raise HTTPException(status_code=404, detail="Union table not found.")
+    if (
+        request.jackpot_enabled is True
+        or (request.jackpot_fee is not None and request.jackpot_fee > 0)
+        or (request.jackpot_rate is not None and request.jackpot_rate > 0)
+        or (
+            request.jackpot_min_pot is not None
+            and request.jackpot_min_pot > 0
+        )
+        or request.jackpot_qualifying_hand is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="BBJ settings are unavailable on union tables until union pool accounting is defined.",
+        )
     payload = runtime.game.update_table_settings(
         jackpot_enabled=request.jackpot_enabled,
         jackpot_fee=request.jackpot_fee,
+        jackpot_rate=request.jackpot_rate,
         jackpot_min_pot=request.jackpot_min_pot,
         jackpot_qualifying_hand=request.jackpot_qualifying_hand,
         rake_rate=request.rake_rate,
         rake_cap=request.rake_cap,
         rake_min_pot=request.rake_min_pot,
         no_flop_no_drop=request.no_flop_no_drop,
-        hand_of_day_enabled=request.hand_of_day_enabled,
-        hand_of_day_target=request.hand_of_day_target,
-        hand_of_day_prize=request.hand_of_day_prize,
     )
     return {
         "union_id": union_id,
@@ -925,6 +1338,14 @@ async def create_table(
         raise HTTPException(status_code=422, detail=str(error)) from error
     if isinstance(repository, FirestoreHandRepository):
         try:
+            if hasattr(repository, "_client"):
+                club_settings = await asyncio.to_thread(
+                    repository.get_club_financial_settings,
+                    club_id,
+                )
+                game.table_settings.rake_rate = float(
+                    club_settings["default_rake_rate"]
+                )
             checkpoint_initialized = await asyncio.to_thread(
                 repository.initialize_table_checkpoint,
                 "club",
@@ -936,6 +1357,8 @@ async def create_table(
             )
         except (FirestoreRequiredError, GoogleAPICallError) as error:
             raise HTTPException(status_code=503, detail="Table checkpoint could not be initialized.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if not checkpoint_initialized:
             raise HTTPException(status_code=409, detail="Table already exists.")
     tables[key] = TableRuntime(

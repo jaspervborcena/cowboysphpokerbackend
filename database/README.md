@@ -12,7 +12,7 @@ Target wallet accounts are distinct by purpose:
 
 Each account must have an explicit `wallet_type`, scope, owner, and `currency_type`. Ledger transactions must identify source and destination accounts and balance per currency; never sum or implicitly transfer across global and club currencies. Cached balances may be maintained for reads, but ledger entries and account updates must commit atomically and idempotently.
 
-These are the target account concepts, but not all have distinct account documents today. `GLOBAL_PLAYMONEY` has a persistent wallet document and reserve-backed initial grant. Club members still have one `chip_balance`/`in_play_balance` pair rather than separate `CLUB_AGENT`, `CLUB_PLAYER`, and `TABLE_ESCROW` accounts. Keep the current-field descriptions below as the existing club-member implementation until that account migration is designed and shipped.
+These are the target account concepts, but not all have distinct account documents today. `GLOBAL_PLAYMONEY` has a persistent wallet document and reserve-backed initial grant. Club members still have one `available_balance`/`in_play_balance` pair rather than separate `CLUB_AGENT`, `CLUB_PLAYER`, and `TABLE_ESCROW` accounts. Keep the current-field descriptions below as the existing club-member implementation until that account migration is designed and shipped.
 
 ## Collection Layout
 
@@ -26,6 +26,8 @@ clubs/{club_id}
   transactions/{transaction_id}
   treasury/wallet
   treasury/pools
+  player_rake_stats/{user_id}
+    hands/{hand_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
@@ -56,7 +58,7 @@ The repository provides Firestore transaction operations for `tables/{table_id}/
 
 Path: `clubs/{club_id}/members/{user_id}`
 
-`chip_balance` is the member's available off-table balance. `in_play_balance` tracks chips currently held at tables. A buy-in decreases `chip_balance` and increases `in_play_balance`; hand settlement applies `net_delta` only to `in_play_balance`. The sample includes profile metadata for context; the current repository changes the two balance fields but does not create or initialize member accounts.
+`available_balance` is the member's available off-table balance. `in_play_balance` tracks chips currently held at tables. A buy-in decreases `available_balance` and increases `in_play_balance`; hand settlement applies `net_delta` only to `in_play_balance`. The sample includes profile metadata for context; the current repository changes the two balance fields but does not create or initialize member accounts.
 
 ```json
 {
@@ -64,7 +66,7 @@ Path: `clubs/{club_id}/members/{user_id}`
   "username": "Alice",
   "status": "active",
   "role": "PLAYER",
-  "chip_balance": 12500,
+  "available_balance": 12500,
   "in_play_balance": 500
 }
 ```
@@ -75,10 +77,21 @@ Path: `clubs/{club_id}/members/{user_id}`
 | `username` | string | Display name. |
 | `status` | string | Membership must be `active` for API access; other values are denied. |
 | `role` | string | One of `OWNER`, `MANAGER`, `AGENT`, or `PLAYER`. `OWNER`, `MANAGER`, and `AGENT` can operate wallet transfers; agents are limited to assigned downline members. |
-| `chip_balance` | integer | Available balance. Buy-in atomically subtracts the requested amount. |
+| `available_balance` | integer | Available balance. Buy-in atomically subtracts the requested amount. |
 | `in_play_balance` | integer | Chips currently held at tables. Buy-in adds the amount; hand settlement applies the player's net result here. |
 
-Current limitation: a club member has one `role` and one `chip_balance`/`in_play_balance` pair. Agent send-out and claim-back operate on that same member balance, while table buy-in requires the `PLAYER` role. This does not support one Firebase identity acting as both an agent and a player with separate wallets. The target model requires separately scoped agent-operating and personal-player accounts, explicit transfer rules, and distinct audit/idempotency records; do not treat the current member balance as both wallets.
+Current limitation: a club member has one `role` and one `available_balance`/`in_play_balance` pair. Agent send-out and claim-back operate on that same member balance, while table buy-in requires the `PLAYER` role. This does not support one Firebase identity acting as both an agent and a player with separate wallets. The target model requires separately scoped agent-operating and personal-player accounts, explicit transfer rules, and distinct audit/idempotency records; do not treat the current member balance as both wallets.
+
+The Firestore member schema uses `available_balance` as the only available member-balance field. Wallet APIs and ledger operations use the same name. Treasury, platform reserve, and global-wallet documents are separate account types and retain their own `chip_balance` fields.
+
+Before deploying this schema change to an existing Firestore project, pause application writes and run a dry run followed by the migration:
+
+```powershell
+python -m database.migrate_member_available_balance --project YOUR_FIREBASE_PROJECT_ID
+python -m database.migrate_member_available_balance --project YOUR_FIREBASE_PROJECT_ID --apply
+```
+
+The script migrates each `clubs/{club_id}/members/{user_id}` field and its nested buy-in transaction's `chip_balance_delta`, preserving values and removing the legacy field. It is idempotent; it aborts on conflicting values instead of choosing one. Deploy the new backend after the migration completes. The demo seed fixture already uses the new names.
 
 ### Buy-in transaction and seat reservation
 
@@ -93,7 +106,7 @@ Transaction path: `clubs/{club_id}/members/{user_id}/transactions/{buy_in_id}`
   "table_id": "table-1",
   "seat_index": 0,
   "amount": 500,
-  "chip_balance_delta": -500,
+  "available_balance_delta": -500,
   "in_play_balance_delta": 500,
   "created_at": "Firestore server timestamp"
 }
@@ -119,7 +132,7 @@ The same Firestore transaction also creates a club-wide audit entry at `clubs/{c
 
 ### Club wallet and treasury
 
-`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back debits only available `chip_balance`; it never uses or changes `in_play_balance`, so a player may keep chips in play while available chips are claimed.
+`POST /clubs/{club_id}/wallet/send-out` and `POST /clubs/{club_id}/wallet/claim-back` use Firestore transactions to update member balances and write an idempotent audit entry at `clubs/{club_id}/transactions/{transaction_id}`. Agents can only transact with members assigned to them by `agent_id`. Claim-back debits only `available_balance`; it never uses or changes `in_play_balance`, so a player may keep chips in play while available chips are claimed.
 
 The shared club treasury wallet is stored separately at `clubs/{club_id}/treasury/wallet`:
 
@@ -133,7 +146,7 @@ The shared club treasury wallet is stored separately at `clubs/{club_id}/treasur
 
 `GET /clubs/{club_id}/wallet` exposes this balance to active owners and managers. `POST /clubs/{club_id}/wallet/transfers` transfers funds from this wallet to another existing club's wallet. The source operator must be an active `OWNER` or `MANAGER`; the transaction checks the role and both club documents, debits and credits balances atomically, and writes matching `INTER_CLUB_SEND_OUT` / `INTER_CLUB_RECEIVE` records under each club's `transactions` collection. Newly provisioned clubs receive the initial 10,000 balance; older clubs are not automatically funded. Debit/credit card and PayPal funding are deferred; no client-supplied payment result can credit this balance.
 
-The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
+The treasury aggregate is created with each new club at `clubs/{club_id}/treasury/pools`; existing clubs gain missing pool fields transactionally when rake, BBJ drops, or Hand-of-the-Day funding is recorded:
 
 ```json
 {
@@ -143,7 +156,11 @@ The treasury aggregate is stored at `clubs/{club_id}/treasury/pools`:
 }
 ```
 
-For local club hands, rake and BBJ drops update these fields atomically with the hand audit and member settlement. Each contribution also gets a server-written club transaction entry keyed by hand ID and type, so a retried hand does not double-count pools. The Hand-of-the-Day field is reserved, but contributions and awards are not applied until their funding and winner rules are defined. Union-wide fee allocation remains undefined and is not applied to these club pools. Global play-money wallets are implemented, but global-table buy-ins are not.
+New local club NLH tables default to 7% rake and a separate 3% BBJ contribution from each eligible contestable pot. Rake and BBJ contributions update the aggregate atomically with the hand audit and member settlement; each hand contribution also gets a server-written club transaction entry. The BBJ pool can also be funded by an active club owner transferring chips from their member `available_balance`, recorded as `BBJ_OWNER_CONTRIBUTION`. A qualified local-club NLH BBJ hand writes a `BBJ_AWARD` transaction keyed by hand ID, credits eligible player shares to member `in_play_balance` (not `available_balance`), and debits the pool in that same settlement transaction. Qualification evidence and award calculations are stored in the private hand audit. Union-wide fee allocation remains undefined, so union hands do not collect BBJ drops or award the pool.
+
+The club's configurable default rake rate is stored at `clubs/{club_id}/settings/financial.default_rake_rate` (default `0.07`). A table-specific override is stored at `clubs/{club_id}/tables/{table_id}/settings/financial.rake_rate_override` and takes precedence. Changing the club default updates currently loaded tables that inherit it; unloaded tables use the saved default when restored. Updating a table's rate creates an explicit override.
+
+Hand-of-the-Day uses the `hand_of_the_day_pool` as a separately funded, per-club prize source shared by supported game variants and blind levels. The `clubs/{club_id}/hand_of_the_day/{game_id}_{small_blind}_{big_blind}` document stores the 3-hour cycle, strongest qualifying NLH hand, reserved prize, and per-winner claim state. The prize is 100 times the big blind. Funding transfers chips from the club treasury into the pool; starting a cycle reserves that blind level's calculated prize. An expired winner's claim credits the member's `available_balance`, records a `HAND_OF_THE_DAY_AWARD` transaction, and starts the next cycle only after all tied winners claim. If no player qualifies, the reservation rolls forward. Only currently supported variants can be configured; PLO4/5/6 are not yet implemented. See [highhandRules.md](../highhandRules.md) for qualification, tie, and cycle details. Global play-money wallets are implemented, but global-table buy-ins are not.
 
 ### Completed hand audit
 
@@ -249,7 +266,7 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `final_board` | array of strings | Final public community cards, used by replay summary. |
 | `pot_total`, `rake_amount` | integer | Total chips pushed to pots and amount not paid to players. |
 | `settlement_status` | string | `pending` after the durable hand audit is enqueued; `settled` after player/pool ledger updates commit atomically. |
-| `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred and gross chip awards by winner. |
+| `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred; `winners[].amount` is the winner's post-fee payout. Gross awards are recorded in `players[].gross_award` and `pot_distributions`. |
 | `pot_distributions` | array | Gross award totals by player for the NLH hand. |
 | `uncalled_returns` | array | Chips returned because no opponent matched a player's contribution. |
 | `deck_state` | object | Remaining, burn, mucked, and reserved cards; restricted audit data. |
@@ -257,11 +274,39 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `players` | array of objects | Per-player seat, identity, stacks, net result, and hole cards. |
 | `players[].starting_stack` | integer | Stack at the start of the hand. |
 | `players[].final_stack` | integer | Stack after the hand completes. |
+| `players[].contestable_contribution` | integer | Player's total contribution after uncalled returns; the basis for rake attribution. |
+| `players[].uncalled_return` | integer | Contribution returned because no opponent matched it; excluded from rake attribution. |
+| `players[].gross_award` | integer | Gross pot award before rake and other fees. |
+| `players[].payout_after_fees` | integer | Award credited to the player's table stack after rake and configured drops. |
+| `players[].rake_eligible` | boolean | Whether the player stayed in through preflop. A preflop folder is excluded; folding on the flop, turn, or river does not revoke eligibility. |
+| `players[].rake_attributed` | integer | Contribution-weighted share of the hand's collected local-club rake, excluding BBJ drops. Shares are allocated only among eligible players and sum exactly to `rake_amount`; whole-chip rounding uses largest remainder, with seat order breaking equal-remainder ties. |
 | `players[].net_delta` | integer | First-party settlement result (`final_stack - starting_stack`); this delta is applied to `in_play_balance`, not the available wallet. |
 | `players[].hole_cards` | array of strings | Player's private cards. These must not be exposed through public client reads. |
 | `operations` | array of objects | Ordered first-party engine event audit, including player IDs, amounts, and dealt cards where applicable. |
 
 The repository checks whether the hand document already exists inside the Firestore transaction. If it exists, it skips the hand write, in-play balance deltas, and seat stack updates, preventing a retry from applying the same hand twice. Firestore security rules must deny direct client reads to `hands` documents; clients use only the authenticated replay endpoint.
+
+### Per-player rake and winnings
+
+For each participant in a settled local-club NLH hand, the server calculates `contestable_contribution = total_contribution - uncalled_return`. The player is rake-eligible unless they folded preflop. Thus, a preflop folder receives no rake attribution; a player who folds on the flop, turn, or river remains eligible for the hand. The hand's collected rake is allocated once, at settlement, in proportion to eligible players' contestable contributions. This is not a separate rake pool per street. For example, if three eligible players contributed 500/300/200 chips and the hand collected 100 rake, their attribution is 50/30/20. A fourth player who folded preflop is excluded from the split. Uncalled returns are excluded from contribution weights. The resulting integer shares sum exactly to the collected rake.
+
+Local club hand settlement writes `clubs/{club_id}/player_rake_stats/{user_id}/hands/{hand_id}` for every participant, including zero-rake hands. Each immutable current hand record contains the contestable contribution, uncalled return, gross award before fees, separate winner rake and BBJ deductions, payout after fees, attributed rake, net result, table, and timestamp. Winner deductions use largest-remainder allocation in table hand order, applying rake before BBJ; older records may not have the separate deduction fields. In the same transaction, `clubs/{club_id}/player_rake_stats/{user_id}` accumulates these summary fields:
+
+| Summary field | Meaning |
+| --- | --- |
+| `hands_played` | Settled local-club hands in which the member participated. |
+| `rake_eligible_hands` | Hands in which the member did not fold preflop and was included in rake attribution. |
+| `hands_with_award` | Hands where the member received a gross pot award. |
+| `positive_net_hands` | Hands where `net_delta` was greater than zero. |
+| `total_contestable_contribution` | Sum of contributions left in contestable pots after uncalled returns. |
+| `total_gross_awards` | Sum of gross pot awards before fees. |
+| `total_payout_after_fees` | Sum of awards added to stacks after fees/drops. |
+| `total_net_result` | Sum of `final_stack - starting_stack`; this includes losses and fees and is not a wallet balance. |
+| `total_rake_generated` | Sum of contribution-weighted `rake_attributed` from rake-eligible hands; excludes BBJ drops and rakeback. |
+
+The unique hand document plus the pending-to-settled hand guard prevents retries from double-counting. Pre-feature pending settlements derive contribution attribution from stored stack/result fields when available. Historical rake already in the club pool but not represented by player stats is reported as `unattributed_rake_total`; it is not fabricated or retroactively assigned.
+
+`GET /clubs/{club_id}/rake/players` returns the club-wide pool total and player summaries to owners/managers; assigned agents receive only their active downline's summaries and their rake-generated total. `GET /clubs/{club_id}/rake/players/{user_id}/hands` returns paginated hand detail to owners/managers and that player's currently assigned agent. Players cannot read these reports. Firestore security rules must deny direct client reads to `player_rake_stats`; access is through the authenticated API. Rakeback and role-share accrual/distribution are not implemented, and these statistics do not change wallet or in-play balances. Union hand rake is excluded until a union allocation policy exists.
 
 ### Union memberships and shared table metadata
 
@@ -431,6 +476,6 @@ Path: `clubs/{club_id}/tables/{table_id}`
 - Keep hand audits server-written and admin-only: they contain all players' private hole cards.
 - Never trust a client-provided balance, hand result, or `net_delta`. The authoritative source is the server's completed first-party hand state.
 - Use Firestore transactions for ledger changes and make settlement idempotent by hand ID.
-- Seat exit/stack return is not implemented. Add an idempotent transaction that removes/releases the seat and moves its final stack from `in_play_balance` back to `chip_balance`. The existing operator claim-back route then transfers available member chips to the authorized manager or assigned agent; real-world cash/bank payment remains manual and off-platform.
+- Seat exit/stack return is not implemented. Add an idempotent transaction that removes/releases the seat and moves its final stack from `in_play_balance` back to `available_balance`. The existing operator claim-back route then transfers available member chips to the authorized manager or assigned agent; real-world cash/bank payment remains manual and off-platform.
 - Firebase ID tokens are verified and active club membership is required. REST derives the user ID from the verified token; WebSockets authenticate in their first message. Review role assignments and Firestore rules before public use.
 - Live table state is currently held in process memory; this schema does not yet provide restart recovery or multi-instance single-writer coordination.

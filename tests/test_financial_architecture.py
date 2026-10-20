@@ -17,29 +17,29 @@ def test_calculate_hand_settlement_finances_matches_two_tier_economy_rules() -> 
 
 def test_club_wallet_send_out_and_claim_back_are_atomic_and_safe() -> None:
     ledger = ClubWalletLedger()
-    ledger.set_member("club-1", "agent-1", chip_balance=1000, in_play_balance=0, role="AGENT")
-    ledger.set_member("club-1", "manager-1", chip_balance=100, in_play_balance=0, role="MANAGER")
-    ledger.set_member("club-1", "owner-1", chip_balance=100, in_play_balance=0, role="OWNER")
-    ledger.set_member("club-1", "player-a", chip_balance=300, in_play_balance=0, role="PLAYER", agent_id="agent-1")
-    ledger.set_member("club-1", "player-b", chip_balance=100, in_play_balance=0, role="PLAYER", agent_id="agent-2")
-    ledger.set_member("club-1", "player-c", chip_balance=0, in_play_balance=0, role="PLAYER")
+    ledger.set_member("club-1", "agent-1", available_balance=1000, in_play_balance=0, role="AGENT")
+    ledger.set_member("club-1", "manager-1", available_balance=100, in_play_balance=0, role="MANAGER")
+    ledger.set_member("club-1", "owner-1", available_balance=100, in_play_balance=0, role="OWNER")
+    ledger.set_member("club-1", "player-a", available_balance=300, in_play_balance=0, role="PLAYER", agent_id="agent-1")
+    ledger.set_member("club-1", "player-b", available_balance=100, in_play_balance=0, role="PLAYER", agent_id="agent-2")
+    ledger.set_member("club-1", "player-c", available_balance=0, in_play_balance=0, role="PLAYER")
 
     assert ledger.send_out("club-1", "agent-1", "player-a", 250)
-    assert ledger.get_member("club-1", "agent-1")["chip_balance"] == 750
-    assert ledger.get_member("club-1", "player-a")["chip_balance"] == 550
+    assert ledger.get_member("club-1", "agent-1")["available_balance"] == 750
+    assert ledger.get_member("club-1", "player-a")["available_balance"] == 550
     assert ledger.send_out("club-1", "agent-1", "player-b", 50) is False
 
     assert ledger.claim_back("club-1", "player-a", "agent-1", 100)
-    assert ledger.get_member("club-1", "player-a")["chip_balance"] == 450
-    assert ledger.get_member("club-1", "agent-1")["chip_balance"] == 850
+    assert ledger.get_member("club-1", "player-a")["available_balance"] == 450
+    assert ledger.get_member("club-1", "agent-1")["available_balance"] == 850
     assert ledger.send_out("club-1", "manager-1", "player-c", 20)
     assert ledger.send_out("club-1", "owner-1", "player-c", 20)
     assert ledger.claim_back("club-1", "player-c", "manager-1", 10)
     assert ledger.claim_back("club-1", "player-c", "owner-1", 10)
 
-    ledger.set_member("club-1", "player-d", chip_balance=1000, in_play_balance=150, role="PLAYER", agent_id="agent-1")
+    ledger.set_member("club-1", "player-d", available_balance=1000, in_play_balance=150, role="PLAYER", agent_id="agent-1")
     assert ledger.claim_back("club-1", "player-d", "agent-1", 100)
-    assert ledger.get_member("club-1", "player-d")["chip_balance"] == 900
+    assert ledger.get_member("club-1", "player-d")["available_balance"] == 900
     assert ledger.get_member("club-1", "player-d")["in_play_balance"] == 150
 
     assert ledger.send_out("club-1", "player-a", "player-b", 1) is False

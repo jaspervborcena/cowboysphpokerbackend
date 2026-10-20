@@ -53,9 +53,41 @@ class FakeHandRepository:
         self.created_clubs: list[tuple[str, str, str, str]] = []
         self.in_play_balances: dict[str, int] = {}
         self.global_wallets: dict[str, dict[str, object]] = {}
+        self.agent_ids: dict[str, str] = {}
+        self.rake_report_calls: list[tuple[str, str | None]] = []
+        self.rake_report: dict[str, object] = {
+            "total_rake_collected": 0,
+            "attributed_rake_total": 0,
+            "unattributed_rake_total": 0,
+            "players": [],
+        }
+        self.rake_hand_records: dict[str, object] = {"records": [], "next_before": None}
+        self.hand_of_the_day_state: dict[str, object] = {
+            "enabled": True,
+            "game_id": "no_limit_texas_holdem",
+            "cycle_id": "00000000-0000-0000-0000-000000000001",
+            "cycle_status": "active",
+            "pool_balance": 500,
+        }
+        self.hand_of_the_day_calls: list[tuple[object, ...]] = []
+        self.club_default_rake_rate = 0.07
 
     def recover_pending_settlements(self) -> int:
         return 0
+
+    def get_club_financial_settings(self, club_id: str) -> dict[str, object]:
+        return {
+            "club_id": club_id,
+            "default_rake_rate": self.club_default_rake_rate,
+        }
+
+    def update_club_rake_default(
+        self, club_id: str, rake_rate: float, performed_by: str
+    ) -> dict[str, object]:
+        if self.roles.get(performed_by) not in {"OWNER", "MANAGER"}:
+            return {"status": "unauthorized_operator"}
+        self.club_default_rake_rate = rake_rate
+        return {"status": "updated", "default_rake_rate": rake_rate}
 
     def ensure_global_wallet(self, user_id: str) -> tuple[dict[str, object], bool]:
         wallet = self.global_wallets.get(user_id)
@@ -135,9 +167,110 @@ class FakeHandRepository:
             "status": "active",
             "role": self.roles.get(user_id, "owner"),
             "username": f"Name {user_id}",
-            "chip_balance": self.balances[user_id],
+            "agent_id": self.agent_ids.get(user_id),
+            "available_balance": self.balances[user_id],
             "in_play_balance": self.in_play_balances.get(user_id, 0),
         }
+
+    def get_hand_of_the_day(
+        self, club_id: str, game_id: str, small_blind: int, big_blind: int
+    ) -> dict[str, object]:
+        self.hand_of_the_day_calls.append(
+            ("get", club_id, game_id, small_blind, big_blind)
+        )
+        return self.hand_of_the_day_state
+
+    def configure_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        enabled: bool,
+        performed_by: str,
+    ) -> dict[str, object]:
+        self.hand_of_the_day_calls.append(
+            ("configure", club_id, game_id, small_blind, big_blind, enabled, performed_by)
+        )
+        return {
+            "status": "configured",
+            "enabled": enabled,
+            "prize_amount": big_blind * 100,
+        }
+
+    def fund_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+    ) -> dict[str, object]:
+        self.hand_of_the_day_calls.append(
+            (
+                "fund",
+                club_id,
+                game_id,
+                small_blind,
+                big_blind,
+                amount,
+                transaction_id,
+                performed_by,
+            )
+        )
+        return {"status": "completed", "amount": amount}
+
+    def claim_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        user_id: str,
+        cycle_id: str,
+    ) -> dict[str, object]:
+        self.hand_of_the_day_calls.append(
+            ("claim", club_id, game_id, small_blind, big_blind, user_id, cycle_id)
+        )
+        return {
+            "status": "completed",
+            "amount": 500,
+            "user_id": user_id,
+            "cycle_id": cycle_id,
+        }
+
+    def contribute_to_bad_beat_jackpot(
+        self, club_id: str, user_id: str, amount: int, transaction_id: str
+    ) -> dict[str, object]:
+        self.wallet_calls.append(
+            ("BBJ_CONTRIBUTION", club_id, user_id, amount, transaction_id)
+        )
+        return {"status": "completed", "amount": amount, "pool_balance": amount}
+
+    def get_club_player_rake_report(
+        self,
+        club_id: str,
+        *,
+        agent_user_id: str | None = None,
+        limit: int = 50,
+        before_total_rake_generated: int | None = None,
+        before_user_id: str | None = None,
+    ) -> dict[str, object]:
+        self.rake_report_calls.append((club_id, agent_user_id))
+        return self.rake_report
+
+    def get_player_rake_hand_records(
+        self,
+        club_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+        before_timestamp: str | None = None,
+        before_hand_id: str | None = None,
+    ) -> dict[str, object]:
+        return self.rake_hand_records
 
     def list_club_members(self, club_id: str) -> list[dict[str, str]]:
         return [
@@ -406,6 +539,84 @@ def test_member_wallet_summary_separates_available_and_in_play_chips(monkeypatch
         "available_balance": 14_600,
         "in_play_balance": 1_200,
     }
+
+
+def test_rake_reports_are_private_and_agents_are_limited_to_downline(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {
+            "club-owner": 0,
+            "club-agent": 0,
+            "player-a": 0,
+            "player-b": 0,
+        },
+        {
+            "club-owner": "OWNER",
+            "club-agent": "AGENT",
+            "player-a": "PLAYER",
+            "player-b": "PLAYER",
+        },
+    )
+    repository.agent_ids.update({"player-a": "club-agent", "player-b": "other-agent"})
+    repository.rake_report = {
+        "scope": "assigned_players",
+        "rake_generated_total": 4,
+        "total_rake_collected": None,
+        "attributed_rake_total": 4,
+        "unattributed_rake_total": None,
+        "next_before_total_rake_generated": None,
+        "next_before_user_id": None,
+        "players": [
+            {
+                "user_id": "player-a",
+                "username": "Player A",
+                "hands_played": 2,
+                "total_gross_awards": 900,
+                "total_net_result": -100,
+                "total_rake_generated": 4,
+            }
+        ],
+    }
+    repository.rake_hand_records = {
+        "records": [{"hand_id": "hand-a", "rake_attributed": 4}],
+        "next_before": None,
+    }
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        player_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:player-a"},
+        )
+        agent_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        assigned_history = client.get(
+            "/clubs/club-1/rake/players/player-a/hands",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        other_history = client.get(
+            "/clubs/club-1/rake/players/player-b/hands",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        owner_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+
+    assert player_summary.status_code == 403
+    assert agent_summary.status_code == 200
+    assert agent_summary.json()["rake_generated_total"] == 4
+    assert "total_rake_collected" not in agent_summary.json()
+    assert repository.rake_report_calls == [
+        ("club-1", "club-agent"),
+        ("club-1", None),
+    ]
+    assert assigned_history.status_code == 200
+    assert assigned_history.json()["records"] == [{"hand_id": "hand-a", "rake_attributed": 4}]
+    assert other_history.status_code == 403
+    assert owner_summary.status_code == 200
+    assert "total_rake_collected" in owner_summary.json()
 
 
 def test_live_nlh_entry_consent_and_straddle_options(monkeypatch) -> None:
@@ -995,9 +1206,6 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
                 "rake_rate": 0.05,
                 "rake_cap": 50,
                 "rake_min_pot": 100,
-                "hand_of_day_enabled": True,
-                "hand_of_day_target": 500,
-                "hand_of_day_prize": 100,
             },
             headers={"Authorization": "Bearer valid:table-admin"},
         )
@@ -1008,9 +1216,6 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
         assert response.json()["rake_rate"] == 0.05
         assert response.json()["rake_cap"] == 50
         assert response.json()["rake_min_pot"] == 100
-        assert response.json()["hand_of_day_enabled"] is True
-        assert response.json()["hand_of_day_target"] == 500
-        assert response.json()["hand_of_day_prize"] == 100
 
         response = client.get(
             "/clubs/demo/tables/table-settings",
@@ -1024,9 +1229,240 @@ def test_table_settings_support_jackpot_configuration(monkeypatch) -> None:
         assert entry["rake_rate"] == 0.05
         assert entry["rake_cap"] == 50
         assert entry["rake_min_pot"] == 100
-        assert entry["hand_of_day_enabled"] is True
-        assert entry["hand_of_day_target"] == 500
-        assert entry["hand_of_day_prize"] == 100
+
+
+def test_hand_of_the_day_api_is_per_game_and_claims_with_cycle_id(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"hotd-manager": 1000, "hotd-player": 100},
+        {"hotd-manager": "MANAGER", "hotd-player": "PLAYER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+    base = "/clubs/demo/hand-of-the-day/no_limit_texas_holdem"
+
+    with TestClient(app) as client:
+        status = client.get(
+            f"{base}?small_blind=1&big_blind=5",
+            headers={"Authorization": "Bearer valid:hotd-player"},
+        )
+        assert status.status_code == 200
+        assert status.json()["pool_balance"] == 500
+
+        configured = client.patch(
+            base,
+            json={"enabled": True, "small_blind": 1, "big_blind": 5},
+            headers={"Authorization": "Bearer valid:hotd-manager"},
+        )
+        assert configured.status_code == 200
+
+        funded = client.post(
+            f"{base}/fund",
+            json={
+                "amount": 500,
+                "transaction_id": "00000000-0000-0000-0000-000000000002",
+                "small_blind": 1,
+                "big_blind": 5,
+            },
+            headers={"Authorization": "Bearer valid:hotd-manager"},
+        )
+        assert funded.status_code == 200
+
+        claim = client.post(
+            f"{base}/claim",
+            json={
+                "cycle_id": "00000000-0000-0000-0000-000000000001",
+                "small_blind": 1,
+                "big_blind": 5,
+            },
+            headers={"Authorization": "Bearer valid:hotd-player"},
+        )
+        assert claim.status_code == 200
+        assert claim.json()["amount"] == 500
+
+        unsupported = client.get(
+            "/clubs/demo/hand-of-the-day/pot_limit_omaha_4",
+            headers={"Authorization": "Bearer valid:hotd-player"},
+        )
+        assert unsupported.status_code == 400
+
+    assert repository.hand_of_the_day_calls == [
+        ("get", "demo", "no_limit_texas_holdem", 1, 5),
+        (
+            "configure",
+            "demo",
+            "no_limit_texas_holdem",
+            1,
+            5,
+            True,
+            "hotd-manager",
+        ),
+        (
+            "fund",
+            "demo",
+            "no_limit_texas_holdem",
+            1,
+            5,
+            500,
+            "00000000-0000-0000-0000-000000000002",
+            "hotd-manager",
+        ),
+        (
+            "claim",
+            "demo",
+            "no_limit_texas_holdem",
+            1,
+            5,
+            "hotd-player",
+            "00000000-0000-0000-0000-000000000001",
+        ),
+    ]
+
+
+def test_club_owner_can_fund_bbj_pool(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {"bbj-owner": 1000, "bbj-player": 100},
+        {"bbj-owner": "OWNER", "bbj-player": "PLAYER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        api_main.get_current_user,
+        lambda: api_main.AuthenticatedUser("bbj-owner"),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/clubs/demo/jackpot/contributions",
+            json={
+                "amount": 300,
+                "transaction_id": "00000000-0000-0000-0000-000000000123",
+            },
+            headers={"Authorization": "******"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["pool_balance"] == 300
+    assert repository.wallet_calls == [
+        (
+            "BBJ_CONTRIBUTION",
+            "demo",
+            "bbj-owner",
+            300,
+            "00000000-0000-0000-0000-000000000123",
+        )
+    ]
+
+
+def test_club_financial_default_can_be_changed_and_table_override_is_preserved(
+    monkeypatch,
+) -> None:
+    repository = FakeHandRepository(
+        {"rake-owner": 1000},
+        {"rake-owner": "OWNER"},
+    )
+    configure_test_dependencies(monkeypatch, repository)
+    game = FirstPartyNLHGame(
+        "club-default-table",
+        1,
+        2,
+        20,
+        1000,
+        origin_club_id="demo",
+    )
+    api_main.tables[("demo", "club-default-table")] = TableRuntime(
+        "demo",
+        game,
+        api_main.connections,
+        repository,
+        0,
+    )
+    inherited_game = FirstPartyNLHGame(
+        "club-inherited-table",
+        1,
+        2,
+        20,
+        1000,
+        origin_club_id="demo",
+    )
+    api_main.tables[("demo", "club-inherited-table")] = TableRuntime(
+        "demo",
+        inherited_game,
+        api_main.connections,
+        repository,
+        0,
+    )
+
+    with TestClient(app) as client:
+        before = client.get(
+            "/clubs/demo/financial-settings",
+            headers={"Authorization": "Bearer valid:rake-owner"},
+        )
+        updated = client.patch(
+            "/clubs/demo/financial-settings",
+            json={"default_rake_rate": 0.06},
+            headers={"Authorization": "Bearer valid:rake-owner"},
+        )
+        table_setting = client.patch(
+            "/clubs/demo/tables/club-default-table/settings",
+            json={"rake_rate": 0.04},
+            headers={"Authorization": "Bearer valid:rake-owner"},
+        )
+
+    assert before.status_code == 200
+    assert before.json()["default_rake_rate"] == 0.07
+    assert updated.status_code == 200
+    assert inherited_game.table_settings.rake_rate == 0.06
+    assert table_setting.status_code == 200
+    assert game.table_settings.rake_rate == 0.04
+    assert game.club_rake_rate_overridden is True
+    api_main.tables.pop(("demo", "club-default-table"), None)
+    api_main.tables.pop(("demo", "club-inherited-table"), None)
+
+
+def test_union_tables_reject_bbj_configuration_until_pool_accounting_exists(
+    monkeypatch,
+) -> None:
+    repository = FakeHandRepository(
+        {"union-admin": 1000},
+        {"union-admin": "PLAYER"},
+    )
+    repository.union_admins[("union-42", "union-admin")] = {
+        "role": "UNION_ADMIN",
+        "status": "active",
+    }
+    repository.union_clubs.add(("union-42", "club-a"))
+    configure_test_dependencies(monkeypatch, repository)
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        api_main.get_current_user,
+        lambda: api_main.AuthenticatedUser("union-admin"),
+    )
+    key = api_main.union_table_key("union-42", "bbj-disabled-table")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/unions/union-42/tables/bbj-disabled-table",
+            json={
+                "origin_club_id": "club-a",
+                "table_name": "BBJ-disabled",
+                "small_blind": 10,
+                "big_blind": 20,
+                "buy_in_min": 20,
+                "buy_in_max": 500,
+            },
+            headers={"Authorization": "Bearer valid:union-admin"},
+        )
+        assert response.status_code == 201
+
+        response = client.patch(
+            "/unions/union-42/tables/bbj-disabled-table/settings",
+            json={"jackpot_enabled": True, "jackpot_fee": 25},
+            headers={"Authorization": "Bearer valid:union-admin"},
+        )
+        assert response.status_code == 400
+        assert tables[key].game.table_settings.jackpot_enabled is False
+        assert tables[key].game.table_settings.jackpot_fee == 0
+
+    tables.pop(key, None)
 
 
 def test_current_membership_returns_authoritative_role(monkeypatch) -> None:

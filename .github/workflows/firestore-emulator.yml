@@ -42,8 +42,11 @@ jobs:
       - name: Install Firebase CLI
         run: npm install --global firebase-tools@15
 
+      - name: Install Firestore rules test dependencies
+        run: npm ci
+
       - name: Run Firestore emulator integration tests
         run: >-
           firebase emulators:exec --only firestore
           --project demo-cowboys-ph-poker
-          "python -m pytest tests/test_firestore_emulator.py tests/test_firestore_demo_seed.py -q"
+          "python -m pytest tests/test_firestore_emulator.py tests/test_firestore_demo_seed.py -q && npm run test:firestore-rules"
