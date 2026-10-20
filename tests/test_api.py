@@ -53,6 +53,15 @@ class FakeHandRepository:
         self.created_clubs: list[tuple[str, str, str, str]] = []
         self.in_play_balances: dict[str, int] = {}
         self.global_wallets: dict[str, dict[str, object]] = {}
+        self.agent_ids: dict[str, str] = {}
+        self.rake_report_calls: list[tuple[str, str | None]] = []
+        self.rake_report: dict[str, object] = {
+            "total_rake_collected": 0,
+            "attributed_rake_total": 0,
+            "unattributed_rake_total": 0,
+            "players": [],
+        }
+        self.rake_hand_records: dict[str, object] = {"records": [], "next_before": None}
 
     def recover_pending_settlements(self) -> int:
         return 0
@@ -135,9 +144,26 @@ class FakeHandRepository:
             "status": "active",
             "role": self.roles.get(user_id, "owner"),
             "username": f"Name {user_id}",
+            "agent_id": self.agent_ids.get(user_id),
             "chip_balance": self.balances[user_id],
             "in_play_balance": self.in_play_balances.get(user_id, 0),
         }
+
+    def get_club_player_rake_report(
+        self, club_id: str, *, agent_user_id: str | None = None
+    ) -> dict[str, object]:
+        self.rake_report_calls.append((club_id, agent_user_id))
+        return self.rake_report
+
+    def get_player_rake_hand_records(
+        self,
+        club_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+        before: str | None = None,
+    ) -> dict[str, object]:
+        return self.rake_hand_records
 
     def list_club_members(self, club_id: str) -> list[dict[str, str]]:
         return [
@@ -406,6 +432,82 @@ def test_member_wallet_summary_separates_available_and_in_play_chips(monkeypatch
         "available_balance": 14_600,
         "in_play_balance": 1_200,
     }
+
+
+def test_rake_reports_are_private_and_agents_are_limited_to_downline(monkeypatch) -> None:
+    repository = FakeHandRepository(
+        {
+            "club-owner": 0,
+            "club-agent": 0,
+            "player-a": 0,
+            "player-b": 0,
+        },
+        {
+            "club-owner": "OWNER",
+            "club-agent": "AGENT",
+            "player-a": "PLAYER",
+            "player-b": "PLAYER",
+        },
+    )
+    repository.agent_ids.update({"player-a": "club-agent", "player-b": "other-agent"})
+    repository.rake_report = {
+        "scope": "assigned_players",
+        "rake_generated_total": 4,
+        "total_rake_collected": None,
+        "attributed_rake_total": 4,
+        "unattributed_rake_total": None,
+        "players": [
+            {
+                "user_id": "player-a",
+                "username": "Player A",
+                "hands_played": 2,
+                "total_gross_awards": 900,
+                "total_net_result": -100,
+                "total_rake_generated": 4,
+            }
+        ],
+    }
+    repository.rake_hand_records = {
+        "records": [{"hand_id": "hand-a", "rake_attributed": 4}],
+        "next_before": None,
+    }
+    configure_test_dependencies(monkeypatch, repository)
+
+    with TestClient(app) as client:
+        player_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:player-a"},
+        )
+        agent_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        assigned_history = client.get(
+            "/clubs/club-1/rake/players/player-a/hands",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        other_history = client.get(
+            "/clubs/club-1/rake/players/player-b/hands",
+            headers={"Authorization": "Bearer valid:club-agent"},
+        )
+        owner_summary = client.get(
+            "/clubs/club-1/rake/players",
+            headers={"Authorization": "Bearer valid:club-owner"},
+        )
+
+    assert player_summary.status_code == 403
+    assert agent_summary.status_code == 200
+    assert agent_summary.json()["rake_generated_total"] == 4
+    assert "total_rake_collected" not in agent_summary.json()
+    assert repository.rake_report_calls == [
+        ("club-1", "club-agent"),
+        ("club-1", None),
+    ]
+    assert assigned_history.status_code == 200
+    assert assigned_history.json()["records"] == [{"hand_id": "hand-a", "rake_attributed": 4}]
+    assert other_history.status_code == 403
+    assert owner_summary.status_code == 200
+    assert "total_rake_collected" in owner_summary.json()
 
 
 def test_live_nlh_entry_consent_and_straddle_options(monkeypatch) -> None:

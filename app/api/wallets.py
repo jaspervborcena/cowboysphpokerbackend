@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from google.api_core.exceptions import GoogleAPICallError
 from pydantic import BaseModel, Field
 
@@ -666,3 +666,123 @@ async def claim_back_club_chips(
         "to_user_id": operator_id,
         "status": status.value,
     }
+
+
+@router.get(
+    "/clubs/{club_id}/rake/players",
+    tags=["Club rake reports"],
+    summary="List player rake and winnings summaries",
+    description="Returns per-player rake and hand-result summaries to club owners/managers; assigned agents see only their active downline. Players cannot view rake reports.",
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("An owner, manager, or assigned agent role is required."),
+        503: error_response("Club rake report storage is unavailable."),
+    },
+)
+async def get_club_player_rake_report(
+    club_id: str,
+    request: Request,
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    if membership.role is ClubRole.PLAYER:
+        raise HTTPException(status_code=403, detail="Players cannot view club rake reports.")
+    agent_user_id = (
+        membership.user.uid if membership.role is ClubRole.AGENT else None
+    )
+    try:
+        report = await asyncio.to_thread(
+            request.app.state.repository.get_club_player_rake_report,
+            club_id,
+            agent_user_id=agent_user_id,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Club rake report is unavailable.") from error
+    summary_fields = (
+        "hands_played",
+        "rake_eligible_hands",
+        "hands_with_award",
+        "positive_net_hands",
+        "total_contestable_contribution",
+        "total_gross_awards",
+        "total_payout_after_fees",
+        "total_net_result",
+        "total_rake_generated",
+    )
+    response: dict[str, Any] = {
+        "club_id": club_id,
+        "scope": report["scope"],
+        "rake_generated_total": report["rake_generated_total"],
+        "players": [
+            {
+                "user_id": player["user_id"],
+                "username": player.get("username", player["user_id"]),
+                **{
+                    field: int(player.get(field, 0))
+                    for field in summary_fields
+                },
+                "last_hand_id": player.get("last_hand_id"),
+                "last_hand_at": player.get("last_hand_at"),
+            }
+            for player in report["players"]
+        ],
+    }
+    if membership.role in {ClubRole.OWNER, ClubRole.MANAGER}:
+        response.update(
+            {
+                "total_rake_collected": report["total_rake_collected"],
+                "attributed_rake_total": report["attributed_rake_total"],
+                "unattributed_rake_total": report["unattributed_rake_total"],
+            }
+        )
+    return response
+
+
+@router.get(
+    "/clubs/{club_id}/rake/players/{user_id}/hands",
+    tags=["Club rake reports"],
+    summary="List a player's rake and hand results",
+    description="Returns per-hand contribution, rake attribution, gross award, payout, and net result. Available to club owners/managers and the player's currently assigned agent; players cannot view these records.",
+    responses={
+        401: error_response("Missing or invalid Firebase ID token."),
+        403: error_response("The actor is not authorized to view this player's rake report."),
+        404: error_response("The club member was not found."),
+        503: error_response("Player rake history is unavailable."),
+    },
+)
+async def get_player_rake_hand_history(
+    club_id: str,
+    user_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    before: str | None = Query(default=None),
+    membership: ClubMembership = Depends(get_active_club_member),
+) -> dict[str, Any]:
+    if membership.role is ClubRole.AGENT:
+        try:
+            member = await asyncio.to_thread(
+                request.app.state.repository.get_club_member,
+                club_id,
+                user_id,
+            )
+        except (FirestoreRequiredError, GoogleAPICallError) as error:
+            raise HTTPException(status_code=503, detail="Player rake history is unavailable.") from error
+        if (
+            member is None
+            or member.get("status") != "active"
+            or member.get("agent_id") != membership.user.uid
+        ):
+            raise HTTPException(status_code=403, detail="The player is not assigned to this agent.")
+    elif membership.role not in {ClubRole.OWNER, ClubRole.MANAGER}:
+        raise HTTPException(status_code=403, detail="Players cannot view rake reports.")
+
+    try:
+        history = await asyncio.to_thread(
+            request.app.state.repository.get_player_rake_hand_records,
+            club_id,
+            user_id,
+            limit=limit,
+            before=before,
+        )
+    except (FirestoreRequiredError, GoogleAPICallError) as error:
+        raise HTTPException(status_code=503, detail="Player rake history is unavailable.") from error
+    return {"club_id": club_id, "user_id": user_id, **history}

@@ -26,6 +26,8 @@ clubs/{club_id}
   transactions/{transaction_id}
   treasury/wallet
   treasury/pools
+  player_rake_stats/{user_id}
+    hands/{hand_id}
   tables/{table_id}
     seats/{seat_index}
     hands/{hand_id}
@@ -249,7 +251,7 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `final_board` | array of strings | Final public community cards, used by replay summary. |
 | `pot_total`, `rake_amount` | integer | Total chips pushed to pots and amount not paid to players. |
 | `settlement_status` | string | `pending` after the durable hand audit is enqueued; `settled` after player/pool ledger updates commit atomically. |
-| `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred and gross chip awards by winner. |
+| `is_showdown`, `winners` | boolean, array | Whether hole-card showdown occurred; `winners[].amount` is the winner's post-fee payout. Gross awards are recorded in `players[].gross_award` and `pot_distributions`. |
 | `pot_distributions` | array | Gross award totals by player for the NLH hand. |
 | `uncalled_returns` | array | Chips returned because no opponent matched a player's contribution. |
 | `deck_state` | object | Remaining, burn, mucked, and reserved cards; restricted audit data. |
@@ -257,11 +259,39 @@ The document ID is the generated `hand_id`. This raw audit is server-only: it in
 | `players` | array of objects | Per-player seat, identity, stacks, net result, and hole cards. |
 | `players[].starting_stack` | integer | Stack at the start of the hand. |
 | `players[].final_stack` | integer | Stack after the hand completes. |
+| `players[].contestable_contribution` | integer | Player's total contribution after uncalled returns; the basis for rake attribution. |
+| `players[].uncalled_return` | integer | Contribution returned because no opponent matched it; excluded from rake attribution. |
+| `players[].gross_award` | integer | Gross pot award before rake and other fees. |
+| `players[].payout_after_fees` | integer | Award credited to the player's table stack after rake and configured drops. |
+| `players[].rake_eligible` | boolean | Whether the player stayed in through preflop. A preflop folder is excluded; folding on the flop, turn, or river does not revoke eligibility. |
+| `players[].rake_attributed` | integer | Contribution-weighted share of the hand's collected local-club rake, excluding BBJ drops. Shares are allocated only among eligible players and sum exactly to `rake_amount`; whole-chip rounding uses largest remainder, with seat order breaking equal-remainder ties. |
 | `players[].net_delta` | integer | First-party settlement result (`final_stack - starting_stack`); this delta is applied to `in_play_balance`, not the available wallet. |
 | `players[].hole_cards` | array of strings | Player's private cards. These must not be exposed through public client reads. |
 | `operations` | array of objects | Ordered first-party engine event audit, including player IDs, amounts, and dealt cards where applicable. |
 
 The repository checks whether the hand document already exists inside the Firestore transaction. If it exists, it skips the hand write, in-play balance deltas, and seat stack updates, preventing a retry from applying the same hand twice. Firestore security rules must deny direct client reads to `hands` documents; clients use only the authenticated replay endpoint.
+
+### Per-player rake and winnings
+
+For each participant in a settled local-club NLH hand, the server calculates `contestable_contribution = total_contribution - uncalled_return`. The player is rake-eligible unless they folded preflop. Thus, a preflop folder receives no rake attribution; a player who folds on the flop, turn, or river remains eligible for the hand. The hand's collected rake is allocated once, at settlement, in proportion to eligible players' contestable contributions. This is not a separate rake pool per street. For example, if three eligible players contributed 500/300/200 chips and the hand collected 100 rake, their attribution is 50/30/20. A fourth player who folded preflop is excluded from the split. Uncalled returns are excluded from contribution weights. The resulting integer shares sum exactly to the collected rake.
+
+Local club hand settlement writes `clubs/{club_id}/player_rake_stats/{user_id}/hands/{hand_id}` for every participant, including zero-rake hands. Each immutable hand record contains the contestable contribution, uncalled return, gross award before fees, payout after fees, attributed rake, net result, table, and timestamp. In the same transaction, `clubs/{club_id}/player_rake_stats/{user_id}` accumulates these summary fields:
+
+| Summary field | Meaning |
+| --- | --- |
+| `hands_played` | Settled local-club hands in which the member participated. |
+| `rake_eligible_hands` | Hands in which the member did not fold preflop and was included in rake attribution. |
+| `hands_with_award` | Hands where the member received a gross pot award. |
+| `positive_net_hands` | Hands where `net_delta` was greater than zero. |
+| `total_contestable_contribution` | Sum of contributions left in contestable pots after uncalled returns. |
+| `total_gross_awards` | Sum of gross pot awards before fees. |
+| `total_payout_after_fees` | Sum of awards added to stacks after fees/drops. |
+| `total_net_result` | Sum of `final_stack - starting_stack`; this includes losses and fees and is not a wallet balance. |
+| `total_rake_generated` | Sum of contribution-weighted `rake_attributed` from rake-eligible hands; excludes BBJ drops and rakeback. |
+
+The unique hand document plus the pending-to-settled hand guard prevents retries from double-counting. Pre-feature pending settlements derive contribution attribution from stored stack/result fields when available. Historical rake already in the club pool but not represented by player stats is reported as `unattributed_rake_total`; it is not fabricated or retroactively assigned.
+
+`GET /clubs/{club_id}/rake/players` returns the club-wide pool total and player summaries to owners/managers; assigned agents receive only their active downline's summaries and their rake-generated total. `GET /clubs/{club_id}/rake/players/{user_id}/hands` returns paginated hand detail to owners/managers and that player's currently assigned agent. Players cannot read these reports. Firestore security rules must deny direct client reads to `player_rake_stats`; access is through the authenticated API. Rakeback and role-share accrual/distribution are not implemented, and these statistics do not change wallet or in-play balances. Union hand rake is excluded until a union allocation policy exists.
 
 ### Union memberships and shared table metadata
 

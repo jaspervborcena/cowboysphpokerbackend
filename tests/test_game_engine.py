@@ -1,4 +1,5 @@
-from logic.first_party_table import FirstPartyNLHGame
+from logic.first_party_table import FirstPartyNLHGame, _attribute_rake_by_contribution
+from game_engine.nlh_state import NLHStreet
 
 
 def make_game() -> FirstPartyNLHGame:
@@ -251,6 +252,86 @@ def test_no_flop_no_drop_disables_preflop_rake() -> None:
 
     assert rake["eligible"] is False
     assert rake["rake_amount"] == 0
+
+
+def test_rake_attribution_is_contribution_weighted_and_conserves_chips() -> None:
+    rake_shares = _attribute_rake_by_contribution(
+        100,
+        {"player-a": 500, "player-b": 300, "player-c": 200},
+        ("player-a", "player-b", "player-c"),
+    )
+
+    assert rake_shares == {"player-a": 50, "player-b": 30, "player-c": 20}
+    assert sum(rake_shares.values()) == 100
+
+
+def test_rake_attribution_uses_seat_order_to_break_rounding_ties() -> None:
+    rake_shares = _attribute_rake_by_contribution(
+        2,
+        {"player-a": 1, "player-b": 1, "player-c": 1},
+        ("player-c", "player-a", "player-b"),
+    )
+
+    assert rake_shares == {"player-a": 1, "player-b": 0, "player-c": 1}
+
+
+def test_completed_hand_records_each_players_contribution_rake_and_result() -> None:
+    game = make_game()
+    game.update_table_settings(
+        rake_rate=0.05,
+        rake_min_pot=0,
+        no_flop_no_drop=False,
+    )
+    assert game.start_new_hand()
+
+    actor = game.current_actor_user_id
+    assert actor is not None
+    assert game.handle_player_action(actor, "FOLD")
+    summary = game.pop_completed_hand()
+
+    assert summary is not None
+    assert sum(player["contestable_contribution"] for player in summary["players"]) == summary["pot_total"]
+    assert sum(player["rake_attributed"] for player in summary["players"]) == summary["rake_amount"]
+    assert sum(player["gross_award"] for player in summary["players"]) == summary["pot_total"]
+    assert sum(player["payout_after_fees"] for player in summary["players"]) == summary["settlement"]["player_payout_total"]
+    for player in summary["players"]:
+        assert player["net_delta"] == player["final_stack"] - player["starting_stack"]
+
+
+def test_preflop_folders_are_excluded_but_turn_folders_keep_rake_attribution() -> None:
+    game = FirstPartyNLHGame("rake-fold-eligibility", 50, 100, 100, 1000, max_seats=3)
+    for seat, player_id in enumerate(("player-a", "player-b", "player-c")):
+        assert game.add_player(seat, player_id, player_id, 500)
+    game.update_table_settings(
+        rake_rate=0.10,
+        rake_min_pot=0,
+        no_flop_no_drop=True,
+    )
+    assert game.start_new_hand()
+
+    while game.is_hand_running:
+        state = game.poker_game
+        actor = game.current_actor_user_id
+        assert actor is not None
+        if state.street is NLHStreet.PREFLOP and actor == "player-a":
+            action = "FOLD"
+        elif state.street is NLHStreet.TURN and actor == "player-b":
+            action = "FOLD"
+        else:
+            action = "CALL" if (game.current_call_amount or 0) > 0 else "CHECK"
+        assert game.handle_player_action(actor, action)
+
+    summary = game.pop_completed_hand()
+    assert summary is not None
+    players = {player["user_id"]: player for player in summary["players"]}
+
+    assert summary["rake_amount"] > 0
+    assert players["player-a"]["rake_eligible"] is False
+    assert players["player-a"]["rake_attributed"] == 0
+    assert players["player-b"]["rake_eligible"] is True
+    assert players["player-b"]["rake_attributed"] > 0
+    assert players["player-c"]["rake_eligible"] is True
+    assert sum(player["rake_attributed"] for player in players.values()) == summary["rake_amount"]
 
 
 def test_pre_action_is_cleared_when_hand_ends_and_next_hand_starts() -> None:

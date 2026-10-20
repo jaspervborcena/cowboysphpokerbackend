@@ -21,6 +21,57 @@ from game_engine import (
 from logic.table_game_base import TableGameBase
 
 
+def _attribute_rake_by_contribution(
+    rake_amount: int,
+    contributions: dict[str, int],
+    seat_order: tuple[str, ...],
+) -> dict[str, int]:
+    if isinstance(rake_amount, bool) or not isinstance(rake_amount, int) or rake_amount < 0:
+        raise ValueError("Rake amount must be a non-negative integer.")
+    if len(set(seat_order)) != len(seat_order) or set(contributions) != set(seat_order):
+        raise ValueError("Seat order must contain each contributing player exactly once.")
+    if any(
+        isinstance(amount, bool) or not isinstance(amount, int) or amount < 0
+        for amount in contributions.values()
+    ):
+        raise ValueError("Player contributions must be non-negative integers.")
+
+    total_contribution = sum(contributions.values())
+    if rake_amount > total_contribution:
+        raise ValueError("Rake cannot exceed the contestable contribution total.")
+    if total_contribution == 0:
+        return {player_id: 0 for player_id in seat_order}
+
+    shares: dict[str, int] = {}
+    remainders: dict[str, int] = {}
+    for player_id, contribution in contributions.items():
+        shares[player_id], remainders[player_id] = divmod(
+            rake_amount * contribution, total_contribution
+        )
+
+    remaining_chips = rake_amount - sum(shares.values())
+    remainder_order = sorted(
+        seat_order,
+        key=lambda player_id: (-remainders[player_id], seat_order.index(player_id)),
+    )
+    for player_id in remainder_order[:remaining_chips]:
+        shares[player_id] += 1
+    return shares
+
+
+def _preflop_folded_player_ids(
+    replay_frames: list[dict[str, Any]],
+) -> set[str]:
+    return {
+        str(last_action["user_id"])
+        for frame in replay_frames
+        if isinstance((last_action := frame.get("last_action")), dict)
+        and last_action.get("action") == "FOLD"
+        and last_action.get("street") == int(NLHStreet.PREFLOP)
+        and last_action.get("user_id") is not None
+    }
+
+
 class FirstPartyNLHGame(TableGameBase):
     """Table-facing adapter for the first-party NLH engine."""
 
@@ -140,6 +191,7 @@ class FirstPartyNLHGame(TableGameBase):
                 "user_id": user_id,
                 "action": action,
                 "amount": action_amount,
+                "street": int(state.street),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -329,6 +381,36 @@ class FirstPartyNLHGame(TableGameBase):
         rake = self.calculate_rake_accounting(
             pot_total, dealt_flop=len(state.community_cards) >= 3
         )
+        uncalled_returns = {
+            award.player_id: award.amount for award in outcome.uncalled_returns
+        }
+        contestable_contributions = {
+            player.player_id: player.total_contribution
+            - uncalled_returns.get(player.player_id, 0)
+            for player in state.players
+        }
+        preflop_folded = _preflop_folded_player_ids(self._replay_frames)
+        rake_eligible = {
+            player.player_id: player.player_id not in preflop_folded
+            for player in state.players
+        }
+        eligible_contributions = {
+            player_id: contribution
+            for player_id, contribution in contestable_contributions.items()
+            if rake_eligible[player_id]
+        }
+        eligible_seat_order = tuple(
+            self.seats[seat].user_id
+            for seat in self._player_order
+            if rake_eligible[self.seats[seat].user_id]
+        )
+        attributed_eligible = _attribute_rake_by_contribution(
+            rake["rake_amount"], eligible_contributions, eligible_seat_order
+        )
+        rake_attributions = {
+            player.player_id: attributed_eligible.get(player.player_id, 0)
+            for player in state.players
+        }
         jackpot = self.calculate_jackpot_accounting(
             max(pot_total - rake["rake_amount"], 0)
         )
@@ -375,6 +457,16 @@ class FirstPartyNLHGame(TableGameBase):
                     "club_id": seat_player.club_id,
                     "starting_stack": engine_player.starting_stack,
                     "final_stack": final_stack,
+                    "contestable_contribution": contestable_contributions[
+                        seat_player.user_id
+                    ],
+                    "uncalled_return": uncalled_returns.get(seat_player.user_id, 0),
+                    "gross_award": gross_award,
+                    "payout_after_fees": adjusted_awards.get(
+                        seat_player.user_id, 0
+                    ),
+                    "rake_eligible": rake_eligible[seat_player.user_id],
+                    "rake_attributed": rake_attributions[seat_player.user_id],
                     "net_delta": final_stack - engine_player.starting_stack,
                     "hole_cards": [card.code for card in engine_player.hole_cards],
                     "mucked": player_mucked[seat_player.user_id],

@@ -63,6 +63,74 @@ class FakeCollectionReference:
             if path[:-1] == self.path
         ]
 
+    def where(
+        self, field: str, operator: str, expected_value: Any
+    ) -> FakeCollectionQuery:
+        return FakeCollectionQuery(self.client, self.path).where(
+            field, operator, expected_value
+        )
+
+    def order_by(
+        self, field: str, direction: str = firestore.Query.ASCENDING
+    ) -> FakeCollectionQuery:
+        return FakeCollectionQuery(self.client, self.path).order_by(field, direction)
+
+    def limit(self, count: int) -> FakeCollectionQuery:
+        return FakeCollectionQuery(self.client, self.path).limit(count)
+
+
+class FakeCollectionQuery:
+    def __init__(
+        self, client: FakeFirestoreClient, path: tuple[str, ...]
+    ) -> None:
+        self.client = client
+        self.path = path
+        self.filters: list[tuple[str, str, Any]] = []
+        self.order_field: str | None = None
+        self.descending = False
+        self.count: int | None = None
+
+    def where(
+        self, field: str, operator: str, expected_value: Any
+    ) -> FakeCollectionQuery:
+        self.filters.append((field, operator, expected_value))
+        return self
+
+    def order_by(
+        self, field: str, direction: str = firestore.Query.ASCENDING
+    ) -> FakeCollectionQuery:
+        self.order_field = field
+        self.descending = direction == firestore.Query.DESCENDING
+        return self
+
+    def limit(self, count: int) -> FakeCollectionQuery:
+        self.count = count
+        return self
+
+    def stream(self) -> list[FakeSnapshot]:
+        documents = [
+            (path, data)
+            for path, data in self.client.documents.items()
+            if path[:-1] == self.path
+        ]
+        for field, operator, expected_value in self.filters:
+            if operator == "<":
+                documents = [
+                    (path, data)
+                    for path, data in documents
+                    if data.get(field) is not None and data[field] < expected_value
+                ]
+            else:
+                raise AssertionError(f"Unsupported query operator: {operator}")
+        if self.order_field is not None:
+            documents.sort(
+                key=lambda item: item[1].get(self.order_field, ""),
+                reverse=self.descending,
+            )
+        if self.count is not None:
+            documents = documents[:self.count]
+        return [FakeSnapshot(data, path[-1]) for path, data in documents]
+
 
 class FakeCollectionGroupQuery:
     def __init__(
@@ -1103,7 +1171,20 @@ def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:
         "rake_amount": 5,
         "jackpot": {"fee_collected": 3},
         "hand_of_the_day": {"prize_amount": 2},
-        "players": [{"seat": 0, "user_id": "player-1", "final_stack": 100}],
+        "timestamp": "2026-10-20T12:00:00+00:00",
+        "players": [{
+            "seat": 0,
+            "user_id": "player-1",
+            "username": "Player One",
+            "starting_stack": 100,
+            "final_stack": 100,
+            "contestable_contribution": 100,
+            "uncalled_return": 0,
+            "gross_award": 0,
+            "payout_after_fees": 0,
+            "rake_attributed": 5,
+            "net_delta": 0,
+        }],
     }
 
     assert repository.persist_hand_history_and_ledgers("club-1", "table-1", summary, {"player-1": 0})
@@ -1113,6 +1194,90 @@ def test_hand_settlement_increments_club_pools_once(monkeypatch) -> None:
         "bad_beat_jackpot_pool": 3,
         "hand_of_the_day_pool": 0,
     }
+    assert client.documents[("clubs", "club-1", "player_rake_stats", "player-1")] == {
+        "user_id": "player-1",
+        "username": "Player One",
+        "hands_played": 1,
+        "rake_eligible_hands": 1,
+        "hands_with_award": 0,
+        "positive_net_hands": 0,
+        "total_contestable_contribution": 100,
+        "total_gross_awards": 0,
+        "total_payout_after_fees": 0,
+        "total_net_result": 0,
+        "total_rake_generated": 5,
+        "last_hand_id": "hand-financial-1",
+        "last_hand_at": "2026-10-20T12:00:00+00:00",
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    assert client.documents[(
+        "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-financial-1"
+    )]["rake_attributed"] == 5
+    assert client.documents[(
+        "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-financial-1"
+    )]["rake_eligible"] is True
+
+
+def test_club_player_rake_report_scopes_agent_to_current_downline() -> None:
+    pool_path = ("clubs", "club-1", "treasury", "pools")
+    assigned_player = ("clubs", "club-1", "members", "player-a")
+    other_player = ("clubs", "club-1", "members", "player-b")
+    assigned_stats = ("clubs", "club-1", "player_rake_stats", "player-a")
+    other_stats = ("clubs", "club-1", "player_rake_stats", "player-b")
+    client = FakeFirestoreClient(
+        {
+            pool_path: {"total_rake_collected": 12},
+            assigned_player: {"status": "active", "agent_id": "agent-1"},
+            other_player: {"status": "active", "agent_id": "agent-2"},
+            assigned_stats: {"user_id": "player-a", "total_rake_generated": 5},
+            other_stats: {"user_id": "player-b", "total_rake_generated": 7},
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    agent_report = repository.get_club_player_rake_report(
+        "club-1", agent_user_id="agent-1"
+    )
+    owner_report = repository.get_club_player_rake_report("club-1")
+
+    assert agent_report["total_rake_collected"] is None
+    assert agent_report["scope"] == "assigned_players"
+    assert agent_report["rake_generated_total"] == 5
+    assert [player["user_id"] for player in agent_report["players"]] == ["player-a"]
+    assert agent_report["unattributed_rake_total"] is None
+    assert owner_report["total_rake_collected"] == 12
+    assert owner_report["scope"] == "club"
+    assert owner_report["attributed_rake_total"] == 12
+    assert len(owner_report["players"]) == 2
+
+
+def test_player_rake_hand_history_uses_timestamp_cursor_and_limit() -> None:
+    client = FakeFirestoreClient(
+        {
+            (
+                "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-1"
+            ): {"hand_id": "hand-1", "timestamp": "2026-10-18T10:00:00Z"},
+            (
+                "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-2"
+            ): {"hand_id": "hand-2", "timestamp": "2026-10-19T10:00:00Z"},
+            (
+                "clubs", "club-1", "player_rake_stats", "player-1", "hands", "hand-3"
+            ): {"hand_id": "hand-3", "timestamp": "2026-10-20T10:00:00Z"},
+        }
+    )
+    repository = FirestoreHandRepository(client)
+
+    first_page = repository.get_player_rake_hand_records("club-1", "player-1", limit=2)
+    second_page = repository.get_player_rake_hand_records(
+        "club-1", "player-1", limit=2, before=first_page["next_before"]
+    )
+
+    assert [record["hand_id"] for record in first_page["records"]] == [
+        "hand-3", "hand-2"
+    ]
+    assert first_page["next_before"] == "2026-10-19T10:00:00Z"
+    assert [record["hand_id"] for record in second_page["records"]] == ["hand-1"]
+    assert second_page["next_before"] is None
 
 
 def test_pending_hand_settlement_recovers_and_applies_once(monkeypatch) -> None:
@@ -1158,6 +1323,70 @@ def test_pending_hand_settlement_recovers_and_applies_once(monkeypatch) -> None:
     assert repository.recover_pending_settlements() == 0
     assert client.documents[member_path]["in_play_balance"] == 94
     assert client.documents[("clubs", "club-1", "treasury", "pools")]["total_rake_collected"] == 4
+
+
+def test_pending_legacy_hand_recovery_excludes_preflop_folder_from_rake(monkeypatch) -> None:
+    monkeypatch.setattr(hand_repository.firestore, "transactional", lambda function: function)
+    hand_path = ("clubs", "club-1", "tables", "table-1", "hands", "legacy-rake-hand")
+    client = FakeFirestoreClient(
+        {
+            ("clubs", "club-1", "members", "folded"): {"in_play_balance": 900},
+            ("clubs", "club-1", "members", "survivor"): {"in_play_balance": 100},
+        }
+    )
+    repository = FirestoreHandRepository(client)
+    summary = {
+        "hand_id": "legacy-rake-hand",
+        "club_id": "club-1",
+        "table_id": "table-1",
+        "timestamp": "2026-10-20T12:00:00+00:00",
+        "rake_amount": 10,
+        "winners": [{"user_id": "survivor", "amount": 990}],
+        "frames": [
+            {"street": 0, "last_action": None},
+            {"street": 5, "last_action": {"user_id": "folded", "action": "FOLD"}},
+        ],
+        "players": [
+            {
+                "seat": 0,
+                "user_id": "folded",
+                "final_stack": 100,
+                "contestable_contribution": 900,
+                "net_delta": -900,
+            },
+            {
+                "seat": 1,
+                "user_id": "survivor",
+                "final_stack": 1890,
+                "contestable_contribution": 100,
+                "net_delta": 890,
+            },
+        ],
+    }
+    hand_ref = (
+        client.collection("clubs")
+        .document("club-1")
+        .collection("tables")
+        .document("table-1")
+        .collection("hands")
+        .document("legacy-rake-hand")
+    )
+
+    assert repository.enqueue_pending_hand(hand_ref, summary)
+    assert repository.recover_pending_settlements() == 1
+
+    folded = client.documents[(
+        "clubs", "club-1", "player_rake_stats", "folded", "hands", "legacy-rake-hand"
+    )]
+    survivor = client.documents[(
+        "clubs", "club-1", "player_rake_stats", "survivor", "hands", "legacy-rake-hand"
+    )]
+    assert folded["rake_eligible"] is False
+    assert folded["rake_attributed"] == 0
+    assert survivor["rake_eligible"] is True
+    assert survivor["rake_attributed"] == 10
+    assert sum(record["rake_attributed"] for record in (folded, survivor)) == 10
+    assert client.documents[hand_path]["settlement_status"] == "settled"
 
 
 def test_union_membership_lookup_and_club_union_discovery() -> None:

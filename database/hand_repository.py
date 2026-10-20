@@ -42,6 +42,147 @@ class WalletTransactionStatus(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
 
+def _player_rake_hand_records(
+    hand_summary: dict[str, Any], rake_amount: int
+) -> list[dict[str, Any]]:
+    players = hand_summary.get("players", [])
+    if not players:
+        if rake_amount:
+            raise ValueError("A hand with rake must include its participating players.")
+        return []
+
+    winners = {
+        str(winner["user_id"]): int(winner.get("amount", 0))
+        for winner in hand_summary.get("winners", [])
+        if winner.get("user_id") is not None
+    }
+    uncalled_returns = {
+        str(returned["user_id"]): int(returned.get("amount", 0))
+        for returned in hand_summary.get("uncalled_returns", [])
+        if returned.get("user_id") is not None
+    }
+    payout_by_player = {
+        str(player["user_id"]): int(
+            player.get("payout_after_fees", winners.get(str(player["user_id"]), 0))
+        )
+        for player in players
+    }
+    frames = hand_summary.get("frames", [])
+    preflop_folded: set[str] = set()
+    for frame_index, frame in enumerate(frames):
+        last_action = frame.get("last_action")
+        if not isinstance(last_action, dict) or last_action.get("action") != "FOLD":
+            continue
+        action_street = last_action.get("street", frame.get("street"))
+        if action_street == 5 and last_action.get("street") is None and frame_index > 0:
+            action_street = frames[frame_index - 1].get("street")
+        if action_street == 0 and last_action.get("user_id") is not None:
+            preflop_folded.add(str(last_action["user_id"]))
+
+    rake_eligibility = {
+        str(player["user_id"]): bool(
+            player.get("rake_eligible", str(player["user_id"]) not in preflop_folded)
+        )
+        for player in players
+    }
+    contestable_contributions: dict[str, int] = {}
+    for player in players:
+        user_id = str(player["user_id"])
+        if "contestable_contribution" in player:
+            contribution = int(player["contestable_contribution"])
+        elif "net_delta" in player:
+            contribution = payout_by_player[user_id] - int(player["net_delta"])
+        elif "starting_stack" in player and "final_stack" in player:
+            contribution = (
+                int(player["starting_stack"])
+                + payout_by_player[user_id]
+                - int(player["final_stack"])
+            )
+        else:
+            contribution = 0
+        if contribution < 0:
+            if rake_amount:
+                raise ValueError("Hand summary has invalid contestable contributions.")
+            contribution = 0
+        contestable_contributions[user_id] = contribution
+
+    all_have_attribution = all("rake_attributed" in player for player in players)
+    if all_have_attribution:
+        attributions = {
+            str(player["user_id"]): int(player["rake_attributed"])
+            for player in players
+        }
+        if sum(attributions.values()) != rake_amount:
+            raise ValueError("Player rake attribution must equal the collected rake.")
+    elif rake_amount:
+        eligible_contributions = {
+            user_id: contribution
+            for user_id, contribution in contestable_contributions.items()
+            if rake_eligibility[user_id]
+        }
+        total_contestable = sum(eligible_contributions.values())
+        if total_contestable <= 0 or rake_amount > total_contestable:
+            raise ValueError("Legacy hand summary cannot support rake attribution.")
+        seat_order = [
+            str(player["user_id"])
+            for player in players
+            if rake_eligibility[str(player["user_id"])]
+        ]
+        attributions: dict[str, int] = {str(player["user_id"]): 0 for player in players}
+        remainders: dict[str, int] = {}
+        for user_id, contribution in eligible_contributions.items():
+            attributions[user_id], remainders[user_id] = divmod(
+                rake_amount * contribution, total_contestable
+            )
+        remaining = rake_amount - sum(attributions.values())
+        remainder_order = sorted(
+            seat_order,
+            key=lambda user_id: (-remainders[user_id], seat_order.index(user_id)),
+        )
+        for user_id in remainder_order[:remaining]:
+            attributions[user_id] += 1
+    else:
+        attributions = {str(player["user_id"]): 0 for player in players}
+
+    pot_distributions = hand_summary.get("pot_distributions", [])
+    legacy_gross_awards = (
+        pot_distributions[0].get("amounts", []) if pot_distributions else []
+    )
+    records = []
+    for index, player in enumerate(players):
+        user_id = str(player["user_id"])
+        payout_after_fees = int(
+            player.get("payout_after_fees", winners.get(user_id, 0))
+        )
+        contestable_contribution = contestable_contributions[user_id]
+        records.append(
+            {
+                "hand_id": str(hand_summary["hand_id"]),
+                "table_id": str(hand_summary["table_id"]),
+                "timestamp": hand_summary.get("timestamp"),
+                "user_id": user_id,
+                "username": str(player.get("username") or user_id),
+                "contestable_contribution": contestable_contribution,
+                "uncalled_return": int(
+                    player.get("uncalled_return", uncalled_returns.get(user_id, 0))
+                ),
+                "gross_award": int(
+                    player.get(
+                        "gross_award",
+                        legacy_gross_awards[index]
+                        if index < len(legacy_gross_awards)
+                        else 0,
+                    )
+                ),
+                "payout_after_fees": payout_after_fees,
+                "rake_eligible": rake_eligibility[user_id],
+                "rake_attributed": attributions[user_id],
+                "net_delta": int(player.get("net_delta", 0)),
+            }
+        )
+    return records
+
+
 class RoleChangeStatus(StrEnum):
     COMPLETED = "completed"
     IDEMPOTENT_REPLAY = "idempotent_replay"
@@ -329,6 +470,21 @@ class NullHandRepository:
 
     def get_hand_history(self, club_id: str, hand_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load hand history.")
+
+    def get_club_player_rake_report(
+        self, club_id: str, *, agent_user_id: str | None = None
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to load club rake reports.")
+
+    def get_player_rake_hand_records(
+        self,
+        club_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+        before: str | None = None,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to load player rake history.")
 
     def get_union_hand_history(self, union_id: str, hand_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load union hand history.")
@@ -2398,6 +2554,20 @@ class FirestoreHandRepository:
             )
             if amount > 0
         }
+        player_rake_records = _player_rake_hand_records(hand_summary, rake_amount)
+        player_rake_refs = {
+            record["user_id"]: self._client.collection("clubs")
+            .document(club_id)
+            .collection("player_rake_stats")
+            .document(record["user_id"])
+            for record in player_rake_records
+        }
+        player_rake_hand_refs = {
+            record["user_id"]: player_rake_refs[record["user_id"]]
+            .collection("hands")
+            .document(record["hand_id"])
+            for record in player_rake_records
+        }
         if not self.enqueue_pending_hand(hand_ref, hand_summary):
             return False
         transaction = self._client.transaction()
@@ -2461,6 +2631,43 @@ class FirestoreHandRepository:
                         "timestamp": firestore.SERVER_TIMESTAMP,
                     },
                 )
+            for record in player_rake_records:
+                user_id = record["user_id"]
+                transaction.set(player_rake_hand_refs[user_id], record)
+                transaction.set(
+                    player_rake_refs[user_id],
+                    {
+                        "user_id": user_id,
+                        "username": record["username"],
+                        "hands_played": firestore.Increment(1),
+                        "rake_eligible_hands": firestore.Increment(
+                            int(record["rake_eligible"])
+                        ),
+                        "hands_with_award": firestore.Increment(
+                            int(record["gross_award"] > 0)
+                        ),
+                        "positive_net_hands": firestore.Increment(
+                            int(record["net_delta"] > 0)
+                        ),
+                        "total_contestable_contribution": firestore.Increment(
+                            record["contestable_contribution"]
+                        ),
+                        "total_gross_awards": firestore.Increment(
+                            record["gross_award"]
+                        ),
+                        "total_payout_after_fees": firestore.Increment(
+                            record["payout_after_fees"]
+                        ),
+                        "total_net_result": firestore.Increment(record["net_delta"]),
+                        "total_rake_generated": firestore.Increment(
+                            record["rake_attributed"]
+                        ),
+                        "last_hand_id": record["hand_id"],
+                        "last_hand_at": record["timestamp"],
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
             transaction.set(
                 hand_ref,
                 {
@@ -2472,6 +2679,85 @@ class FirestoreHandRepository:
             return True
 
         return commit(transaction)
+
+    def get_club_player_rake_report(
+        self, club_id: str, *, agent_user_id: str | None = None
+    ) -> dict[str, Any]:
+        club_ref = self._client.collection("clubs").document(club_id)
+        pool_snapshot = (
+            club_ref.collection("treasury").document("pools").get()
+        )
+        pool_data = pool_snapshot.to_dict() or {}
+        player_stats = []
+        for snapshot in club_ref.collection("player_rake_stats").stream():
+            stats = snapshot.to_dict() or {}
+            player_id = str(stats.get("user_id") or snapshot.id)
+            if agent_user_id is not None:
+                member = self.get_club_member(club_id, player_id)
+                if (
+                    member is None
+                    or member.get("status") != "active"
+                    or member.get("agent_id") != agent_user_id
+                ):
+                    continue
+            stats["user_id"] = player_id
+            player_stats.append(stats)
+
+        player_stats.sort(
+            key=lambda stats: (
+                -int(stats.get("total_rake_generated", 0)),
+                str(stats.get("username", "")).casefold(),
+                stats["user_id"],
+            )
+        )
+        attributed_total = sum(
+            int(stats.get("total_rake_generated", 0)) for stats in player_stats
+        )
+        club_total = int(pool_data.get("total_rake_collected", 0))
+        return {
+            "club_id": club_id,
+            "scope": "assigned_players" if agent_user_id is not None else "club",
+            "rake_generated_total": attributed_total,
+            "total_rake_collected": club_total if agent_user_id is None else None,
+            "attributed_rake_total": attributed_total,
+            "unattributed_rake_total": (
+                max(club_total - attributed_total, 0)
+                if agent_user_id is None
+                else None
+            ),
+            "players": player_stats,
+        }
+
+    def get_player_rake_hand_records(
+        self,
+        club_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+        before: str | None = None,
+    ) -> dict[str, Any]:
+        hand_collection = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("player_rake_stats")
+            .document(user_id)
+            .collection("hands")
+        )
+        query = hand_collection
+        if before is not None:
+            query = query.where("timestamp", "<", before)
+        snapshots = (
+            query.order_by("timestamp", direction=firestore.Query.DESCENDING)
+            .limit(limit + 1)
+            .stream()
+        )
+        records = [snapshot.to_dict() or {} for snapshot in snapshots]
+        has_more = len(records) > limit
+        page = records[:limit]
+        return {
+            "records": page,
+            "next_before": page[-1].get("timestamp") if has_more and page else None,
+        }
 
 
     def reserve_buy_in(
