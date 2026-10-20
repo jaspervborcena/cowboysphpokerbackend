@@ -83,7 +83,7 @@
         "username": "Demo Owner",
         "role": "OWNER",
         "status": "active",
-        "chip_balance": 0,
+        "available_balance": 0,
         "in_play_balance": 0
       }
     },
@@ -95,7 +95,7 @@
         "username": "Demo Agent",
         "role": "AGENT",
         "status": "active",
-        "chip_balance": 2000,
+        "available_balance": 2000,
         "in_play_balance": 0
       }
     },
@@ -107,7 +107,7 @@
         "username": "Demo Player A",
         "role": "PLAYER",
         "status": "active",
-        "chip_balance": 14600,
+        "available_balance": 14600,
         "in_play_balance": 600
       }
     },
@@ -119,7 +119,7 @@
         "username": "Demo Player B",
         "role": "PLAYER",
         "status": "active",
-        "chip_balance": 8800,
+        "available_balance": 8800,
         "in_play_balance": 400
       }
     },
@@ -133,7 +133,7 @@
         "table_id": "demo-club-table",
         "seat_index": 0,
         "amount": 500,
-        "chip_balance_delta": -500,
+        "available_balance_delta": -500,
         "in_play_balance_delta": 500
       }
     },
@@ -147,7 +147,7 @@
         "table_id": "demo-club-table",
         "seat_index": 1,
         "amount": 500,
-        "chip_balance_delta": -500,
+        "available_balance_delta": -500,
         "in_play_balance_delta": 500
       }
     },

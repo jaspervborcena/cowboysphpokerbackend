@@ -1,6 +1,6 @@
 # Jackpot and Promotion Rules Proposal
 
-Status: proposal for review as of 2026-10-20. This document captures a candidate design; only the existing BBJ fee/drop collection baseline is implemented. Qualifying-hand evaluation, pool funding policy, prize calculation, and prize distribution are not implemented.
+Status: BBJ v1 and a 3-hour Hand-of-the-Day high-hand promotion are implemented for supported local club NLH. The remaining sections describe future Single-Hand Jackpot and promotion variants. PLO4/5/6 are not currently playable.
 
 ## Goals
 
@@ -12,9 +12,17 @@ Status: proposal for review as of 2026-10-20. This document captures a candidate
 
 ## Current Implementation
 
-Local tables currently support `jackpot_enabled`, `jackpot_fee`, `jackpot_min_pot`, and a descriptive `jackpot_qualifying_hand` table setting. Settlement collects the configured fixed jackpot fee when enabled and when the post-rake pot meets the configured minimum, then increments the club's `bad_beat_jackpot_pool` in the idempotent hand-settlement transaction.
+New local club NLH tables default to `jackpot_enabled: true` with a 3% BBJ contribution from the contestable pot, in addition to the 7% default rake. The contribution is rounded down to an integer chip and collected after rake, capped by the remaining pot. The legacy `jackpot_fee` remains available as a fixed-chip contribution; if set without an explicit `jackpot_rate`, it replaces the default 3% rate. Owners may make optional contributions from their member `available_balance`. The `jackpot_min_pot` setting applies to the pot remaining after rake. The configured natural-language `jackpot_qualifying_hand` remains descriptive only; it is not evaluated as a rule.
 
-The current backend does **not** evaluate the configured qualifying-hand text, validate a losing/winning hand pair, determine a stake tier, calculate an award from the pool, pay a winner/loser/table share, or reseed a pool. High-hand fields are settings only; there is no period leaderboard or scheduled prize payout. PLO and Short Deck are not implemented game engines and cannot qualify for promotions yet.
+BBJ v1 qualification uses rule version `nlh-bbj-aces-full-v1`: a showdown must include at least four dealt-in players and a contestable pot of at least 20 big blinds. The losing player's normal best-five Hold'em hand must be Aces Full or better, and the highest winning hand must be Four of a Kind or better. Tied highest hands are all winning qualifiers; every lower qualifying hand is a losing qualifier. Best-five evidence records the exact hole and board cards used. The existing first-party Hold'em evaluator is used; no extra hole-card/board-card composition restriction applies.
+
+The club BBJ pool is shared by its local NLH tables. Pool access is a direct percentage of the pool after the current hand's drop: 1% at a 2-chip big blind, 5% at 50, 10% at 100, and 15% at 200 and above, with linear interpolation by big blind between those points. The access rate is capped at 15%; the approved reserve floor is zero. Integer award allocation uses largest remainders for the 50% losing-hand / 25% winning-hand / 25% table portions. Each portion is then divided equally among its recipients, with odd chips assigned by seat order. Table-share recipients are other dealt-in, rake-eligible players, excluding every qualifier. All three portions credit those players' member in-play balances (`in_play_balance`), not their available `available_balance`. If no table-share recipient is eligible, that portion stays in the BBJ pool.
+
+The pool is stored at `clubs/{club_id}/treasury/pools.bad_beat_jackpot_pool` and initialized with each new club. Per-hand contributions, owner-funded contributions, awards, and immutable ledger entries are transactionally recorded. Qualification evidence, the pool calculation, credits, the pool update, and the immutable hand-keyed `BBJ_AWARD` transaction are committed atomically with settlement. Retried hand settlements cannot pay twice. Award records and qualifying card evidence remain in server-only hand/transaction documents; no public BBJ report or player announcement is implemented. Union tables do not collect BBJ drops or pay awards because union-wide pool funding and allocation are undefined. Single-Hand Jackpot and Short Deck remain unimplemented.
+
+### Hand-of-the-Day
+
+The implemented NLH high-hand rules, including blind-level cycle identity, qualification, prize funding, tie sharing, and claims, are documented in [highhandRules.md](highhandRules.md). The prize is 100 big blinds; separate small/big-blind pairs run independent 3-hour cycles and share the club's dedicated Hand-of-the-Day pool.
 
 ## Promotion Types and Pool Separation
 
@@ -22,21 +30,15 @@ Proposed promotion types:
 
 | Promotion | Qualification shape | Funding/prize model |
 | --- | --- | --- |
-| Bad Beat Jackpot (BBJ) | A qualifying losing hand is beaten by a qualifying winning hand at showdown. | Progressive pool, funded by a configured fixed integer-chip BBJ drop on eligible hands. |
-| Jackpot | One qualifying hand is sufficient; no losing hand is required. | Separate progressive pool, funded by its configured fixed integer-chip drop on eligible hands. |
-| High Hand | Best qualifying hand during a defined time period. | Fixed prize schedule per period/stake tier; separately funded, and never drawn from BBJ or Jackpot pools. |
+| Bad Beat Jackpot (BBJ) | A qualifying losing hand is beaten by a qualifying winning hand at showdown. | Progressive pool, funded by an additional 3% contestable-pot contribution by default, optional fixed-chip `jackpot_fee`, and optional owner contributions. |
+| Jackpot | One qualifying hand is sufficient; no losing hand is required. | Not implemented; a separate pool and qualification policy remain to be defined. |
+| High Hand | Best qualifying hand during a defined time period. | Implemented for supported NLH as Hand-of-the-Day; funded from the club treasury into a dedicated shared pool. See [highhandRules.md](highhandRules.md). |
 
 Pools should be separately accounted for per club and promotion in `CLUB_CHIPS`. Decide whether BBJ/Jackpot pools are shared across game variants or segregated by game before launch. A pool balance is an accounting liability/reserve, not a player wallet balance.
 
-### Promotion Drop Funding Recommendation
+### Promotion Drop Funding
 
-The existing `jackpot_fee` is a fixed chip drop that currently adds to `bad_beat_jackpot_pool`. The recommended design is to configure **fixed integer-chip allocations per qualifying hand** for each promotion, rather than splitting the table's collected rake by percentages. For example, a 4-chip total promotion drop could allocate 2 chips to BBJ, 1 to Single Jackpot, and 1 to High Hand funding. The existing table rake remains a separate charge.
-
-The earlier 2-chip example split as 1 / 0.5 / 0.5 cannot be represented by the current integer-chip ledger. Either use integer allocations such as the 4-chip example or explicitly define a smaller chip denomination before using fractional values.
-
-For each promotion, configure its own enablement, minimum pot, and fixed drop. Under this recommendation, promotion drops are additional deductions from the hand pot; they are not a percentage or reallocation of normal rake. A hand must satisfy the applicable table settings before its promotion drop is collected. The sum of rake and promotion drops must not exceed the contestable pot. Record each integer contribution and update the matching promotion pools in the same idempotent settlement transaction.
-
-Percentage-of-rake funding is a rejected alternative for this proposal unless reviewers choose it instead. Do not mix percentage-of-rake funding with fixed drops. If the funding model changes, define a single integer rounding rule and ensure all promotion allocations together never exceed the rake collected.
+The implemented BBJ contribution defaults to 3% of the contestable pot, in addition to the default 7% rake; see [rakeRules.md](rakeRules.md). Optional owner contributions transfer member available club chips into `bad_beat_jackpot_pool`. Hand-of-the-Day is funded separately through owner/manager treasury-to-pool transfers. All pool mutations and ledger records are transactional and idempotent.
 
 ### Interaction with Player Rake Attribution
 
@@ -221,16 +223,13 @@ match /clubs/{clubId}/tables/{tableId}/hands/{handId} {
 
 Firestore `allow` grants from overlapping matches are additive, so verify that no broader rule grants access to these paths. Test both reads and writes through the client SDK in the emulator. Trusted backend Admin SDK access remains server-side and is not governed by client rules.
 
-## Review Decisions Required
+## Remaining Decisions
 
-- Approve the fixed integer-chip drop model: the total promotion drop, its BBJ/Jackpot/High Hand allocation, eligibility thresholds, and confirmation that this is additional to normal rake rather than funded from rake.
-- Are pools scoped per club, per club and game, or shared across game variants?
-- What are the exact Hold'em, PLO4, and PLO5 losing/winning ranks, hole/board usage, pocket-pair restrictions (if any), minimum player counts, and pot thresholds?
-- Does the stake matrix store direct pool-access percentages, or derive them from game/stake multipliers? Approve the 15% maximum and reseed-reserve floor.
-- What are the exact payout splits and fee-deduction rounding? Confirm treatment of multiple qualifying players/tables and how multiple winners/losers divide their portions.
 - What are the High Hand timezone, period boundaries, eligible games, prize funding source, and how equal-ranked hands interact with the one-prize-per-player rule?
+- Define separate pool/access/payout rules for Single-Hand Jackpot, PLO, Short Deck, and any cross-game pool sharing.
+- Define how BBJ drops and awards are funded and allocated for union tables before enabling them there.
 - Approve composite `(timestamp, hand_id)` cursors and historical agent visibility based on assignment-at-hand time.
 - Verify deployed Firestore rules deny direct client reads/writes to private hand and promotion records, including no broader overlapping rule grants.
 - Which promotion events and player-facing notifications are allowed, and what data is private?
 
-Until these decisions are approved and implemented with deterministic tests, only the configured BBJ fee/drop accumulation should be treated as active behavior. This document is a design proposal, not a claim that the listed promotions are live.
+Until those items are approved and implemented, only the BBJ v1 rules above are active; the rest of this document remains a proposal.

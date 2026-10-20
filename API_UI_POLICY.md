@@ -104,7 +104,7 @@ Why these remain authoritative:
 
 - they move chips between balances
 - they enforce role and downline rules
-- they validate available balance; claim-back only debits `chip_balance` and never changes `in_play_balance`
+- they validate and debit `available_balance`; claim-back never changes `in_play_balance`
 - they use transaction boundaries and idempotency rules
 - they create audit history and ledger records
 

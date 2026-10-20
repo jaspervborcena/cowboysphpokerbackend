@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from dataclasses import dataclass
 from typing import Any, Callable
+from uuid import uuid4
 
 from google.cloud import firestore
+from game_engine.jackpot import calculate_bad_beat_award
 
 
 INITIAL_CLUB_TREASURY_FUNDS = 10_000
 INITIAL_GLOBAL_PLAYMONEY_FUNDS = 20_000
 CLUB_CHIP_GIVEAWAY_RESERVE_ID = "club-chip-giveaway-reserve"
 INITIAL_CLUB_CHIP_GIVEAWAY_RESERVE_BALANCE = 1_000_000_000
+HAND_OF_DAY_CYCLE_DURATION = timedelta(hours=3)
+HAND_OF_DAY_POOL_FIELD = "hand_of_the_day_pool"
+HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER = 100
 
 
 class BuyInStatus(StrEnum):
@@ -185,6 +191,134 @@ def _player_rake_hand_records(
     return records
 
 
+def _validated_balance(data: dict[str, Any], field: str, label: str) -> int:
+    value = data.get(field, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"The {label} balance is invalid.")
+    return value
+
+
+def _validate_rate(value: Any, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 <= value <= 0.1
+    ):
+        raise ValueError(f"{label} must be between 0 and 0.1.")
+    return float(value)
+
+
+def _utc_datetime(value: Any, label: str) -> datetime:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"{label} timestamp is invalid.") from error
+    if not isinstance(value, datetime):
+        raise ValueError(f"{label} timestamp is invalid.")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _new_hand_of_day_cycle(
+    game_id: str,
+    small_blind: int,
+    big_blind: int,
+    prize_amount: int,
+    now: datetime,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    return {
+        "game_id": game_id,
+        "small_blind": small_blind,
+        "big_blind": big_blind,
+        "prize_big_blind_multiplier": HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER,
+        "enabled": enabled,
+        "configured_prize_amount": prize_amount,
+        "cycle_id": str(uuid4()),
+        "cycle_status": "active",
+        "cycle_started_at": now,
+        "cycle_ends_at": now + HAND_OF_DAY_CYCLE_DURATION,
+        "reserved_prize_amount": prize_amount,
+        "leader_rank": None,
+        "leaders": [],
+        "claimed_user_ids": [],
+        "payouts": {},
+    }
+
+
+def _hand_of_day_document_id(
+    game_id: str,
+    small_blind: int,
+    big_blind: int,
+) -> str:
+    if (
+        isinstance(small_blind, bool)
+        or not isinstance(small_blind, int)
+        or small_blind <= 0
+    ):
+        raise ValueError("small_blind must be a positive integer.")
+    if (
+        isinstance(big_blind, bool)
+        or not isinstance(big_blind, int)
+        or big_blind <= small_blind
+    ):
+        raise ValueError("big_blind must be an integer greater than small_blind.")
+    return f"{game_id}_{small_blind}_{big_blind}"
+
+
+def _hand_of_day_prize_amount(big_blind: int) -> int:
+    prize_amount = big_blind * HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER
+    if prize_amount > 2**63 - 1:
+        raise ValueError("The Hand-of-the-Day prize exceeds the supported chip limit.")
+    return prize_amount
+
+
+def _advance_empty_hand_of_day_cycles(
+    state: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    cycle_end = state.get("cycle_ends_at")
+    if (
+        state.get("cycle_status") != "active"
+        or state.get("leaders")
+        or not isinstance(cycle_end, datetime)
+    ):
+        return state
+    start = _utc_datetime(cycle_end, "Hand-of-the-Day cycle end")
+    if start <= now:
+        elapsed = now - start
+        periods = elapsed // HAND_OF_DAY_CYCLE_DURATION + 1
+        start += HAND_OF_DAY_CYCLE_DURATION * periods
+    updated = dict(state)
+    updated["cycle_started_at"] = start - HAND_OF_DAY_CYCLE_DURATION
+    updated["cycle_ends_at"] = start
+    updated["cycle_id"] = str(uuid4())
+    updated["leader_rank"] = None
+    updated["leaders"] = []
+    updated["claimed_user_ids"] = []
+    updated["payouts"] = {}
+    return updated
+
+
+def _hand_of_day_payouts(state: dict[str, Any]) -> dict[str, int]:
+    leaders = sorted(
+        state.get("leaders", []),
+        key=lambda entry: (int(entry["seat"]), str(entry["user_id"])),
+    )
+    if not leaders:
+        return {}
+    base, remainder = divmod(
+        int(state["reserved_prize_amount"]),
+        len(leaders),
+    )
+    return {
+        str(entry["user_id"]): base + int(index < remainder)
+        for index, entry in enumerate(leaders)
+    }
+
+
 class RoleChangeStatus(StrEnum):
     COMPLETED = "completed"
     IDEMPOTENT_REPLAY = "idempotent_replay"
@@ -257,7 +391,32 @@ class TableLeaseExpiredError(RuntimeError):
     pass
 
 
-class NullHandRepository:
+class _NullHandRepositoryBase:
+    def get_club_financial_settings(self, club_id: str) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to load club financial settings.")
+
+    def update_club_rake_default(
+        self,
+        club_id: str,
+        rake_rate: float,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to update club rake defaults.")
+
+    def get_table_rake_override(
+        self, club_id: str, table_id: str
+    ) -> float | None:
+        raise FirestoreRequiredError("Firestore must be enabled to load table rake settings.")
+
+    def update_table_rake_override(
+        self,
+        club_id: str,
+        table_id: str,
+        rake_rate: float,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to update table rake settings.")
+
     def recover_pending_settlements(self) -> int:
         return 0
 
@@ -473,6 +632,738 @@ class NullHandRepository:
     def get_hand_history(self, club_id: str, hand_id: str) -> dict[str, Any] | None:
         raise FirestoreRequiredError("Firestore must be enabled to load hand history.")
 
+    def get_hand_of_the_day(
+        self, club_id: str, game_id: str, small_blind: int, big_blind: int
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to load Hand-of-the-Day.")
+
+    def configure_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        enabled: bool,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to configure Hand-of-the-Day.")
+
+    def fund_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to fund Hand-of-the-Day.")
+
+    def contribute_to_bad_beat_jackpot(
+        self,
+        club_id: str,
+        user_id: str,
+        amount: int,
+        transaction_id: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to contribute to the BBJ pool.")
+
+    def claim_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        user_id: str,
+        cycle_id: str,
+    ) -> dict[str, Any]:
+        raise FirestoreRequiredError("Firestore must be enabled to claim Hand-of-the-Day.")
+
+class FirestoreHandOfTheDayOperations:
+    _client: firestore.Client
+    _now_factory: Callable[[], datetime]
+
+    def get_club_financial_settings(self, club_id: str) -> dict[str, Any]:
+        settings_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("settings")
+            .document("financial")
+        )
+        snapshot = settings_ref.get()
+        settings = snapshot.to_dict() or {}
+        rake_rate = settings.get("default_rake_rate", 0.07)
+        _validate_rate(rake_rate, "default_rake_rate")
+        return {
+            "club_id": club_id,
+            "default_rake_rate": float(rake_rate),
+        }
+
+    def update_club_rake_default(
+        self,
+        club_id: str,
+        rake_rate: float,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        _validate_rate(rake_rate, "rake_rate")
+        club_ref = self._client.collection("clubs").document(club_id)
+        settings_ref = club_ref.collection("settings").document("financial")
+        actor_ref = club_ref.collection("members").document(performed_by)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def update(transaction: Any) -> dict[str, Any]:
+            actor_snapshot = actor_ref.get(transaction=transaction)
+            settings_snapshot = settings_ref.get(transaction=transaction)
+            actor = actor_snapshot.to_dict() or {}
+            settings = settings_snapshot.to_dict() or {}
+            if (
+                not actor_snapshot.exists
+                or actor.get("status") != "active"
+                or actor.get("role") not in {"OWNER", "MANAGER"}
+            ):
+                return {"status": "unauthorized_operator"}
+            settings.update(
+                {
+                    "default_rake_rate": float(rake_rate),
+                    "updated_by": performed_by,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            )
+            transaction.set(settings_ref, settings, merge=True)
+            return {
+                "status": "updated",
+                "default_rake_rate": float(rake_rate),
+            }
+
+        return update(transaction)
+
+    def get_table_rake_override(
+        self, club_id: str, table_id: str
+    ) -> float | None:
+        settings_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("tables")
+            .document(table_id)
+            .collection("settings")
+            .document("financial")
+        )
+        snapshot = settings_ref.get()
+        if not snapshot.exists:
+            return None
+        settings = snapshot.to_dict() or {}
+        value = settings.get("rake_rate_override")
+        return _validate_rate(value, "rake_rate_override")
+
+    def update_table_rake_override(
+        self,
+        club_id: str,
+        table_id: str,
+        rake_rate: float,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        rate = _validate_rate(rake_rate, "rake_rate")
+        club_ref = self._client.collection("clubs").document(club_id)
+        actor_ref = club_ref.collection("members").document(performed_by)
+        settings_ref = (
+            club_ref.collection("tables")
+            .document(table_id)
+            .collection("settings")
+            .document("financial")
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def update(transaction: Any) -> dict[str, Any]:
+            actor_snapshot = actor_ref.get(transaction=transaction)
+            actor = actor_snapshot.to_dict() or {}
+            if (
+                not actor_snapshot.exists
+                or actor.get("status") != "active"
+                or actor.get("role") not in {"OWNER", "MANAGER"}
+            ):
+                return {"status": "unauthorized_operator"}
+            transaction.set(
+                settings_ref,
+                {
+                    "rake_rate_override": rate,
+                    "updated_by": performed_by,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            return {"status": "updated", "rake_rate_override": rate}
+
+        return update(transaction)
+
+    def get_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+    ) -> dict[str, Any]:
+        club_ref = self._client.collection("clubs").document(club_id)
+        state_ref = club_ref.collection("hand_of_the_day").document(
+            _hand_of_day_document_id(game_id, small_blind, big_blind)
+        )
+        pool_ref = club_ref.collection("treasury").document("pools")
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def read(transaction: Any) -> dict[str, Any]:
+            state_snapshot = state_ref.get(transaction=transaction)
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            state = state_snapshot.to_dict() or {}
+            pool = pool_snapshot.to_dict() or {}
+            balance = _validated_balance(
+                pool, HAND_OF_DAY_POOL_FIELD, "Hand-of-the-Day pool"
+            )
+            now = self._now_factory()
+            if state.get("cycle_status") == "active":
+                cycle_end = state.get("cycle_ends_at")
+                normalized_end = _utc_datetime(
+                    cycle_end, "Hand-of-the-Day cycle end"
+                )
+                if (
+                    state.get("leaders")
+                    and normalized_end <= now
+                ):
+                    state["cycle_status"] = "claimable"
+                    state["updated_at"] = now
+                    transaction.set(state_ref, state, merge=True)
+                elif not state.get("leaders"):
+                    advanced = _advance_empty_hand_of_day_cycles(state, now)
+                    if advanced != state:
+                        state = advanced
+                        state["updated_at"] = now
+                        transaction.set(state_ref, state, merge=True)
+            end = state.get("cycle_ends_at")
+            normalized_end = (
+                _utc_datetime(end, "Hand-of-the-Day cycle end")
+                if end is not None
+                else None
+            )
+            return {
+                **state,
+                "club_id": club_id,
+                "game_id": game_id,
+                "pool_balance": balance,
+                "seconds_remaining": (
+                    max(0, int((normalized_end - now).total_seconds()))
+                    if normalized_end is not None
+                    and state.get("cycle_status") == "active"
+                    else 0
+                ),
+            }
+
+        return read(transaction)
+
+    def configure_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        enabled: bool,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        state_document_id = _hand_of_day_document_id(
+            game_id, small_blind, big_blind
+        )
+        prize_amount = _hand_of_day_prize_amount(big_blind)
+        club_ref = self._client.collection("clubs").document(club_id)
+        state_ref = club_ref.collection("hand_of_the_day").document(
+            state_document_id
+        )
+        pool_ref = club_ref.collection("treasury").document("pools")
+        actor_ref = club_ref.collection("members").document(performed_by)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def configure(transaction: Any) -> dict[str, Any]:
+            state_snapshot = state_ref.get(transaction=transaction)
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            actor_snapshot = actor_ref.get(transaction=transaction)
+            state = state_snapshot.to_dict() or {}
+            pool = pool_snapshot.to_dict() or {}
+            actor = actor_snapshot.to_dict() or {}
+            if (
+                not actor_snapshot.exists
+                or actor.get("status") != "active"
+                or actor.get("role") not in {"OWNER", "MANAGER"}
+            ):
+                return {"status": "unauthorized_operator"}
+            now = self._now_factory()
+            pool_balance = _validated_balance(
+                pool, HAND_OF_DAY_POOL_FIELD, "Hand-of-the-Day pool"
+            )
+            cycle_status = state.get("cycle_status")
+            if not enabled and cycle_status in {"active", "claimable"}:
+                return {"status": "cycle_in_progress"}
+
+            if enabled and cycle_status in {"active", "claimable"}:
+                state.update(
+                    {
+                        "enabled": True,
+                        "configured_prize_amount": prize_amount,
+                        "game_id": game_id,
+                        "small_blind": small_blind,
+                        "big_blind": big_blind,
+                        "prize_big_blind_multiplier": HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER,
+                        "configured_by": performed_by,
+                        "updated_at": now,
+                    }
+                )
+                transaction.set(state_ref, state, merge=True)
+                return {"status": "configured", **state}
+
+            if not enabled:
+                state.update(
+                    {
+                        "enabled": False,
+                        "configured_prize_amount": prize_amount,
+                        "game_id": game_id,
+                        "small_blind": small_blind,
+                        "big_blind": big_blind,
+                        "prize_big_blind_multiplier": HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER,
+                        "configured_by": performed_by,
+                        "updated_at": now,
+                        "cycle_status": "disabled",
+                    }
+                )
+                transaction.set(state_ref, state, merge=True)
+                return {"status": "configured", **state}
+
+            if cycle_status == "awaiting_funding" and pool_balance < prize_amount:
+                state.update(
+                    {
+                        "enabled": True,
+                        "configured_prize_amount": prize_amount,
+                        "game_id": game_id,
+                        "small_blind": small_blind,
+                        "big_blind": big_blind,
+                        "prize_big_blind_multiplier": HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER,
+                        "configured_by": performed_by,
+                        "updated_at": now,
+                    }
+                )
+                transaction.set(state_ref, state, merge=True)
+                return {"status": "awaiting_funding", **state}
+            if pool_balance < prize_amount:
+                return {
+                    "status": "insufficient_pool",
+                    "required_amount": prize_amount,
+                    "pool_balance": pool_balance,
+                }
+
+            new_state = _new_hand_of_day_cycle(
+                game_id,
+                small_blind,
+                big_blind,
+                prize_amount,
+                now,
+                enabled=True,
+            )
+            new_state["configured_by"] = performed_by
+            new_state["updated_at"] = now
+            transaction.set(
+                pool_ref,
+                {HAND_OF_DAY_POOL_FIELD: firestore.Increment(-prize_amount)},
+                merge=True,
+            )
+            transaction.set(state_ref, new_state)
+            return {"status": "configured", **new_state}
+
+        return configure(transaction)
+
+    def fund_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        amount: int,
+        transaction_id: str,
+        performed_by: str,
+    ) -> dict[str, Any]:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise ValueError("Funding amount must be a positive integer.")
+        state_document_id = _hand_of_day_document_id(
+            game_id, small_blind, big_blind
+        )
+        club_ref = self._client.collection("clubs").document(club_id)
+        treasury_ref = club_ref.collection("treasury").document("wallet")
+        pool_ref = club_ref.collection("treasury").document("pools")
+        state_ref = club_ref.collection("hand_of_the_day").document(
+            state_document_id
+        )
+        actor_ref = club_ref.collection("members").document(performed_by)
+        ledger_ref = club_ref.collection("transactions").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def fund(transaction: Any) -> dict[str, Any]:
+            ledger_snapshot = ledger_ref.get(transaction=transaction)
+            if ledger_snapshot.exists:
+                prior = ledger_snapshot.to_dict() or {}
+                if (
+                    prior.get("type") == "HAND_OF_THE_DAY_FUND"
+                    and prior.get("amount") == amount
+                    and prior.get("game_id") == game_id
+                    and prior.get("small_blind") == small_blind
+                    and prior.get("big_blind") == big_blind
+                    and prior.get("performed_by") == performed_by
+                ):
+                    return {"status": "idempotent_replay", **prior}
+                return {"status": "idempotency_conflict"}
+            treasury_snapshot = treasury_ref.get(transaction=transaction)
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            state_snapshot = state_ref.get(transaction=transaction)
+            actor_snapshot = actor_ref.get(transaction=transaction)
+            treasury = treasury_snapshot.to_dict() or {}
+            pool = pool_snapshot.to_dict() or {}
+            state = state_snapshot.to_dict() or {}
+            actor = actor_snapshot.to_dict() or {}
+            if (
+                not actor_snapshot.exists
+                or actor.get("status") != "active"
+                or actor.get("role") not in {"OWNER", "MANAGER"}
+            ):
+                return {"status": "unauthorized_operator"}
+            treasury_balance = _validated_balance(
+                treasury, "chip_balance", "club treasury"
+            )
+            pool_balance = _validated_balance(
+                pool, HAND_OF_DAY_POOL_FIELD, "Hand-of-the-Day pool"
+            )
+            if treasury_balance < amount:
+                return {"status": "insufficient_treasury"}
+
+            reserve_amount = 0
+            if (
+                state.get("enabled") is True
+                and state.get("cycle_status") == "awaiting_funding"
+            ):
+                configured_amount = state.get("configured_prize_amount", 0)
+                if (
+                    isinstance(configured_amount, bool)
+                    or not isinstance(configured_amount, int)
+                    or configured_amount <= 0
+                ):
+                    raise ValueError("Configured Hand-of-the-Day prize is invalid.")
+                if pool_balance + amount >= configured_amount:
+                    reserve_amount = configured_amount
+                    configured_by = state.get("configured_by")
+                    now = self._now_factory()
+                    state = _new_hand_of_day_cycle(
+                        game_id,
+                        small_blind,
+                        big_blind,
+                        configured_amount,
+                        now,
+                        enabled=True,
+                    )
+                    state["configured_by"] = configured_by
+                    state["updated_at"] = now
+
+            transaction.update(
+                treasury_ref,
+                {"chip_balance": firestore.Increment(-amount)},
+            )
+            transaction.set(
+                pool_ref,
+                {
+                    HAND_OF_DAY_POOL_FIELD: firestore.Increment(
+                        amount - reserve_amount
+                    )
+                },
+                merge=True,
+            )
+            if reserve_amount:
+                transaction.set(state_ref, state)
+            transaction.set(
+                ledger_ref,
+                {
+                    "transaction_id": transaction_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "HAND_OF_THE_DAY_FUND",
+                    "amount": amount,
+                    "game_id": game_id,
+                    "small_blind": small_blind,
+                    "big_blind": big_blind,
+                    "from_wallet_id": f"clubs/{club_id}/treasury/wallet",
+                    "to_wallet_id": f"clubs/{club_id}/treasury/pools/{HAND_OF_DAY_POOL_FIELD}",
+                    "performed_by": performed_by,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return {
+                "status": "completed",
+                "amount": amount,
+                "game_id": game_id,
+                "small_blind": small_blind,
+                "big_blind": big_blind,
+                "reserved_amount": reserve_amount,
+                "pool_balance": pool_balance + amount - reserve_amount,
+            }
+
+        return fund(transaction)
+
+    def contribute_to_bad_beat_jackpot(
+        self,
+        club_id: str,
+        user_id: str,
+        amount: int,
+        transaction_id: str,
+    ) -> dict[str, Any]:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise ValueError("Contribution amount must be a positive integer.")
+        club_ref = self._client.collection("clubs").document(club_id)
+        member_ref = club_ref.collection("members").document(user_id)
+        pool_ref = club_ref.collection("treasury").document("pools")
+        ledger_ref = club_ref.collection("transactions").document(transaction_id)
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def contribute(transaction: Any) -> dict[str, Any]:
+            ledger_snapshot = ledger_ref.get(transaction=transaction)
+            if ledger_snapshot.exists:
+                prior = ledger_snapshot.to_dict() or {}
+                if (
+                    prior.get("type") == "BBJ_OWNER_CONTRIBUTION"
+                    and prior.get("amount") == amount
+                    and prior.get("performed_by") == user_id
+                ):
+                    return {"status": "idempotent_replay", **prior}
+                return {"status": "idempotency_conflict"}
+            member_snapshot = member_ref.get(transaction=transaction)
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            member = member_snapshot.to_dict() or {}
+            pool = pool_snapshot.to_dict() or {}
+            if (
+                not member_snapshot.exists
+                or member.get("status") != "active"
+                or member.get("role") != "OWNER"
+            ):
+                return {"status": "unauthorized_operator"}
+            available = _validated_balance(
+                member, "available_balance", "member available"
+            )
+            pool_balance = _validated_balance(
+                pool, "bad_beat_jackpot_pool", "bad beat jackpot pool"
+            )
+            if available < amount:
+                return {"status": "insufficient_balance"}
+
+            transaction.update(
+                member_ref,
+                {"available_balance": firestore.Increment(-amount)},
+            )
+            transaction.set(
+                pool_ref,
+                {"bad_beat_jackpot_pool": firestore.Increment(amount)},
+                merge=True,
+            )
+            transaction.set(
+                ledger_ref,
+                {
+                    "transaction_id": transaction_id,
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "BBJ_OWNER_CONTRIBUTION",
+                    "amount": amount,
+                    "from_user_id": user_id,
+                    "to_wallet_id": (
+                        f"clubs/{club_id}/treasury/pools/bad_beat_jackpot_pool"
+                    ),
+                    "performed_by": user_id,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return {
+                "status": "completed",
+                "amount": amount,
+                "pool_balance": pool_balance + amount,
+                "transaction_id": transaction_id,
+            }
+
+        return contribute(transaction)
+
+    def claim_hand_of_the_day(
+        self,
+        club_id: str,
+        game_id: str,
+        small_blind: int,
+        big_blind: int,
+        user_id: str,
+        cycle_id: str,
+    ) -> dict[str, Any]:
+        club_ref = self._client.collection("clubs").document(club_id)
+        state_ref = club_ref.collection("hand_of_the_day").document(
+            _hand_of_day_document_id(game_id, small_blind, big_blind)
+        )
+        member_ref = club_ref.collection("members").document(user_id)
+        pool_ref = club_ref.collection("treasury").document("pools")
+        ledger_ref = club_ref.collection("transactions").document(
+            f"{cycle_id}_hotd_{user_id}"
+        )
+        transaction = self._client.transaction()
+
+        @firestore.transactional
+        def claim(transaction: Any) -> dict[str, Any]:
+            state_snapshot = state_ref.get(transaction=transaction)
+            member_snapshot = member_ref.get(transaction=transaction)
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            ledger_snapshot = ledger_ref.get(transaction=transaction)
+            if ledger_snapshot.exists:
+                prior = ledger_snapshot.to_dict() or {}
+                if (
+                    prior.get("to_user_id") == user_id
+                    and prior.get("cycle_id") == cycle_id
+                ):
+                    return {"status": "idempotent_replay", **prior}
+                return {"status": "idempotency_conflict"}
+            if not state_snapshot.exists:
+                return {"status": "not_configured"}
+            if not member_snapshot.exists:
+                return {"status": "member_not_found"}
+            state = state_snapshot.to_dict() or {}
+            member = member_snapshot.to_dict() or {}
+            pool = pool_snapshot.to_dict() or {}
+            if state.get("cycle_id") != cycle_id:
+                return {"status": "stale_cycle"}
+            pool_balance = _validated_balance(
+                pool, HAND_OF_DAY_POOL_FIELD, "Hand-of-the-Day pool"
+            )
+            now = self._now_factory()
+            if state.get("cycle_status") == "active":
+                cycle_end = _utc_datetime(
+                    state.get("cycle_ends_at"),
+                    "Hand-of-the-Day cycle end",
+                )
+                if now < cycle_end:
+                    return {"status": "not_ready", "cycle_ends_at": cycle_end}
+                if not state.get("leaders"):
+                    advanced = _advance_empty_hand_of_day_cycles(state, now)
+                    transaction.set(state_ref, advanced)
+                    return {"status": "no_qualifying_hand", **advanced}
+                state["cycle_status"] = "claimable"
+            if state.get("cycle_status") != "claimable":
+                return {"status": "not_claimable"}
+            payouts = state.get("payouts") or _hand_of_day_payouts(state)
+            amount = payouts.get(user_id)
+            if amount is None:
+                return {"status": "not_winner"}
+            claimed = set(state.get("claimed_user_ids") or [])
+            if user_id in claimed:
+                return {"status": "already_claimed"}
+            if member.get("status") != "active":
+                return {"status": "member_not_active"}
+            _validated_balance(member, "available_balance", "member available")
+
+            transaction.update(
+                member_ref,
+                {"available_balance": firestore.Increment(amount)},
+            )
+            transaction.set(
+                ledger_ref,
+                {
+                    "transaction_id": f"{state.get('cycle_id')}_hotd_{user_id}",
+                    "currency_type": "CLUB_CHIPS",
+                    "type": "HAND_OF_THE_DAY_AWARD",
+                    "amount": amount,
+                    "game_id": game_id,
+                    "small_blind": small_blind,
+                    "big_blind": big_blind,
+                    "prize_big_blind_multiplier": HAND_OF_DAY_PRIZE_BIG_BLIND_MULTIPLIER,
+                    "cycle_id": state["cycle_id"],
+                    "to_user_id": user_id,
+                    "performed_by": "system",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            claimed.add(user_id)
+            state["cycle_status"] = "claimable"
+            state["payouts"] = payouts
+            state["claimed_user_ids"] = sorted(claimed)
+            state["updated_at"] = now
+            remaining_claimants = set(payouts) - claimed
+            next_cycle = None
+            if not remaining_claimants:
+                if state.get("enabled") is True:
+                    prize_amount = state.get("configured_prize_amount", 0)
+                    if pool_balance >= prize_amount:
+                        now = self._now_factory()
+                        next_cycle = _new_hand_of_day_cycle(
+                            game_id,
+                            small_blind,
+                            big_blind,
+                            prize_amount,
+                            now,
+                            enabled=True,
+                        )
+                        next_cycle["configured_by"] = state.get("configured_by")
+                        next_cycle["updated_at"] = now
+                        transaction.set(
+                            pool_ref,
+                            {
+                                HAND_OF_DAY_POOL_FIELD: firestore.Increment(
+                                    -prize_amount
+                                )
+                            },
+                            merge=True,
+                        )
+                    else:
+                        next_cycle = {
+                            **state,
+                            "cycle_status": "awaiting_funding",
+                            "updated_at": now,
+                            "reserved_prize_amount": 0,
+                            "leaders": [],
+                            "leader_rank": None,
+                            "cycle_started_at": None,
+                            "cycle_ends_at": None,
+                            "claimed_user_ids": [],
+                            "payouts": {},
+                        }
+                else:
+                    next_cycle = {
+                        **state,
+                        "cycle_status": "disabled",
+                        "updated_at": now,
+                        "reserved_prize_amount": 0,
+                        "leaders": [],
+                        "leader_rank": None,
+                        "cycle_started_at": None,
+                        "cycle_ends_at": None,
+                        "claimed_user_ids": [],
+                        "payouts": {},
+                    }
+            transaction.set(
+                state_ref,
+                next_cycle if next_cycle is not None else state,
+            )
+            return {
+                "status": "completed",
+                "club_id": club_id,
+                "game_id": game_id,
+                "user_id": user_id,
+                "amount": amount,
+                "cycle_id": state["cycle_id"],
+                "next_cycle_status": (
+                    next_cycle.get("cycle_status")
+                    if next_cycle is not None
+                    else "claimable"
+                ),
+            }
+
+        return claim(transaction)
+
+class NullHandRepository(_NullHandRepositoryBase):
     def get_club_player_rake_report(
         self, club_id: str, *, agent_user_id: str | None = None
     ) -> dict[str, Any]:
@@ -588,7 +1479,7 @@ class NullHandRepository:
         raise FirestoreRequiredError("Firestore must be enabled to reserve a seat.")
 
 
-class FirestoreHandRepository:
+class FirestoreHandRepository(FirestoreHandOfTheDayOperations):
     def __init__(
         self,
         client: firestore.Client,
@@ -1445,6 +2336,9 @@ class FirestoreHandRepository:
         club_ref = self._client.collection("clubs").document(club_id)
         owner_ref = club_ref.collection("members").document(owner_user_id)
         wallet_ref = club_ref.collection("treasury").document("wallet")
+        financial_settings_ref = (
+            club_ref.collection("settings").document("financial")
+        )
         initial_funding_ref = club_ref.collection("transactions").document("initial-funding")
         reserve_ref = self._client.collection("platform_wallets").document(
             CLUB_CHIP_GIVEAWAY_RESERVE_ID
@@ -1485,7 +2379,7 @@ class FirestoreHandRepository:
                     "user_id": owner_user_id,
                     "role": "OWNER",
                     "status": "active",
-                    "chip_balance": 0,
+                    "available_balance": 0,
                     "in_play_balance": 0,
                     "created_at": firestore.SERVER_TIMESTAMP,
                 },
@@ -1505,6 +2399,18 @@ class FirestoreHandRepository:
             transaction.set(
                 wallet_ref,
                 {"chip_balance": INITIAL_CLUB_TREASURY_FUNDS},
+            )
+            transaction.set(
+                club_ref.collection("treasury").document("pools"),
+                {
+                    "total_rake_collected": 0,
+                    "bad_beat_jackpot_pool": 0,
+                    HAND_OF_DAY_POOL_FIELD: 0,
+                },
+            )
+            transaction.set(
+                financial_settings_ref,
+                {"default_rake_rate": 0.07},
             )
             transaction.set(
                 initial_funding_ref,
@@ -1896,14 +2802,14 @@ class FirestoreHandRepository:
             if role == "AGENT" and recipient.get("agent_id") != sender_user_id:
                 return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
 
-            balance = sender.get("chip_balance", 0)
+            balance = sender.get("available_balance", 0)
             if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
                 return WalletTransactionStatus.INVALID_BALANCE
             if balance < amount:
                 return WalletTransactionStatus.INSUFFICIENT_BALANCE
 
-            transaction.update(sender_ref, {"chip_balance": firestore.Increment(-amount)})
-            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            transaction.update(sender_ref, {"available_balance": firestore.Increment(-amount)})
+            transaction.update(recipient_ref, {"available_balance": firestore.Increment(amount)})
             transaction.set(
                 ledger_ref,
                 {
@@ -1964,15 +2870,15 @@ class FirestoreHandRepository:
             if role == "AGENT" and player.get("agent_id") != recipient_user_id:
                 return WalletTransactionStatus.UNAUTHORIZED_DOWNLINE
 
-            balance = player.get("chip_balance", 0)
+            balance = player.get("available_balance", 0)
             in_play = player.get("in_play_balance", 0)
             if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (balance, in_play)):
                 return WalletTransactionStatus.INVALID_BALANCE
             if balance < amount:
                 return WalletTransactionStatus.INSUFFICIENT_BALANCE
 
-            transaction.update(player_ref, {"chip_balance": firestore.Increment(-amount)})
-            transaction.update(recipient_ref, {"chip_balance": firestore.Increment(amount)})
+            transaction.update(player_ref, {"available_balance": firestore.Increment(-amount)})
+            transaction.update(recipient_ref, {"available_balance": firestore.Increment(amount)})
             transaction.set(
                 ledger_ref,
                 {
@@ -2274,7 +3180,7 @@ class FirestoreHandRepository:
                 return BuyInStatus.MEMBER_NOT_FOUND
 
             member = member_snapshot.to_dict() or {}
-            balance = member.get("chip_balance", 0)
+            balance = member.get("available_balance", 0)
             if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
                 return BuyInStatus.INVALID_BALANCE
             if balance < buy_in_amount:
@@ -2326,7 +3232,7 @@ class FirestoreHandRepository:
             transaction.update(
                 member_ref,
                 {
-                    "chip_balance": firestore.Increment(-buy_in_amount),
+                    "available_balance": firestore.Increment(-buy_in_amount),
                     "in_play_balance": firestore.Increment(buy_in_amount),
                 },
             )
@@ -2352,7 +3258,7 @@ class FirestoreHandRepository:
                     "table_id": table_id,
                     "seat_index": seat_index,
                     "amount": buy_in_amount,
-                    "chip_balance_delta": -buy_in_amount,
+                    "available_balance_delta": -buy_in_amount,
                     "in_play_balance_delta": buy_in_amount,
                     "created_at": firestore.SERVER_TIMESTAMP,
                 },
@@ -2535,7 +3441,13 @@ class FirestoreHandRepository:
         member_refs = {
             user_id: self._client.collection("clubs").document(club_id)
             .collection("members").document(user_id)
-            for user_id in chip_deltas
+            for user_id in (
+                set(chip_deltas)
+                | {
+                    str(player["user_id"])
+                    for player in hand_summary.get("players", [])
+                }
+            )
         }
         pool_ref = (
             self._client.collection("clubs")
@@ -2543,16 +3455,35 @@ class FirestoreHandRepository:
             .collection("treasury")
             .document("pools")
         )
+        hand_of_day_ref = None
+        game_id = hand_summary.get("game_id")
+        small_blind = hand_summary.get("small_blind")
+        big_blind = hand_summary.get("big_blind")
+        if (
+            isinstance(game_id, str)
+            and isinstance(small_blind, int)
+            and not isinstance(small_blind, bool)
+            and isinstance(big_blind, int)
+            and not isinstance(big_blind, bool)
+            and small_blind > 0
+            and big_blind > small_blind
+        ):
+            hand_of_day_ref = (
+                self._client.collection("clubs")
+                .document(club_id)
+                .collection("hand_of_the_day")
+                .document(
+                    _hand_of_day_document_id(game_id, small_blind, big_blind)
+                )
+            )
         rake_amount = int(hand_summary.get("rake_amount", 0))
         jackpot_amount = int((hand_summary.get("jackpot") or {}).get("fee_collected", 0))
-        hotd_amount = 0
         transaction_refs = {
             kind: self._client.collection("clubs").document(club_id)
             .collection("transactions").document(f"{hand_summary['hand_id']}_{kind.lower()}")
             for kind, amount in (
                 ("RAKE", rake_amount),
                 ("BBJ_DROP", jackpot_amount),
-                ("HAND_OF_THE_DAY", hotd_amount),
             )
             if amount > 0
         }
@@ -2570,6 +3501,12 @@ class FirestoreHandRepository:
             .document(record["hand_id"])
             for record in player_rake_records
         }
+        bbj_award_ref = (
+            self._client.collection("clubs")
+            .document(club_id)
+            .collection("transactions")
+            .document(f"{hand_summary['hand_id']}_bbj_award")
+        )
         if not self.enqueue_pending_hand(hand_ref, hand_summary):
             return False
         transaction = self._client.transaction()
@@ -2581,10 +3518,135 @@ class FirestoreHandRepository:
                 return False
             if (hand_snapshot.to_dict() or {}).get("settlement_status") != "pending":
                 return False
-            for user_id, delta in chip_deltas.items():
+            pool_snapshot = pool_ref.get(transaction=transaction)
+            pool_data = pool_snapshot.to_dict() or {}
+            hand_of_day_snapshot = (
+                hand_of_day_ref.get(transaction=transaction)
+                if hand_of_day_ref is not None
+                else None
+            )
+            hand_of_day_state = (
+                hand_of_day_snapshot.to_dict() or {}
+                if hand_of_day_snapshot is not None and hand_of_day_snapshot.exists
+                else None
+            )
+            existing_jackpot_pool = pool_data.get("bad_beat_jackpot_pool", 0)
+            if (
+                isinstance(existing_jackpot_pool, bool)
+                or not isinstance(existing_jackpot_pool, int)
+                or existing_jackpot_pool < 0
+            ):
+                raise ValueError("The existing BBJ pool balance is invalid.")
+
+            jackpot_summary = hand_summary.get("jackpot") or {}
+            qualification = jackpot_summary.get("qualification") or {}
+            bbj_award = None
+            if qualification.get("eligible"):
+                bbj_award = calculate_bad_beat_award(
+                    existing_jackpot_pool + jackpot_amount,
+                    int(hand_summary["big_blind"]),
+                    hand_summary["players"],
+                    qualification,
+                )
+
+            updated_hand_of_day_state: dict[str, Any] | None = None
+            if (
+                hand_of_day_state is not None
+                and hand_of_day_state.get("enabled") is True
+                and hand_of_day_state.get("cycle_status") == "active"
+            ):
+                now = self._now_factory()
+                hand_of_day_state = deepcopy(hand_of_day_state)
+                original_state = deepcopy(hand_of_day_state)
+                hand_summary_hotd = hand_summary.get("hand_of_the_day") or {}
+                cycle_start = _utc_datetime(
+                    hand_of_day_state.get("cycle_started_at"),
+                    "Hand-of-the-Day cycle start",
+                )
+                cycle_end = _utc_datetime(
+                    hand_of_day_state.get("cycle_ends_at"),
+                    "Hand-of-the-Day cycle end",
+                )
+                hand_completed_at = _utc_datetime(
+                    hand_summary.get("timestamp"),
+                    "Completed hand",
+                )
+                candidate_in_cycle = (
+                    hand_of_day_state.get("cycle_status") == "active"
+                    and hand_of_day_state.get("cycle_started_at") is not None
+                    and cycle_start <= hand_completed_at < cycle_end
+                    and hand_summary_hotd.get("eligible") is True
+                )
+                if (
+                    cycle_end <= now
+                    and not hand_of_day_state.get("leaders")
+                    and not candidate_in_cycle
+                ):
+                    hand_of_day_state = _advance_empty_hand_of_day_cycles(
+                        hand_of_day_state,
+                        now,
+                    )
+                    cycle_start = _utc_datetime(
+                        hand_of_day_state.get("cycle_started_at"),
+                        "Hand-of-the-Day cycle start",
+                    )
+                    cycle_end = _utc_datetime(
+                        hand_of_day_state.get("cycle_ends_at"),
+                        "Hand-of-the-Day cycle end",
+                    )
+                    candidate_in_cycle = (
+                        cycle_start <= hand_completed_at < cycle_end
+                        and hand_summary_hotd.get("eligible") is True
+                    )
+                if candidate_in_cycle:
+                    incoming_rank = hand_summary_hotd.get("rank_value")
+                    current_rank = hand_of_day_state.get("leader_rank")
+                    incoming_leaders = hand_summary_hotd.get("leaders") or []
+                    if isinstance(incoming_rank, list) and incoming_leaders:
+                        if current_rank is None or incoming_rank > current_rank:
+                            hand_of_day_state["leader_rank"] = incoming_rank
+                            hand_of_day_state["leaders"] = incoming_leaders
+                        elif incoming_rank == current_rank:
+                            leaders_by_id = {
+                                str(entry["user_id"]): entry
+                                for entry in hand_of_day_state.get("leaders", [])
+                            }
+                            for entry in incoming_leaders:
+                                leaders_by_id.setdefault(str(entry["user_id"]), entry)
+                            hand_of_day_state["leaders"] = list(
+                                leaders_by_id.values()
+                            )
+                        for entry in hand_of_day_state.get("leaders", []):
+                            entry.setdefault("hand_id", hand_summary["hand_id"])
+                            entry.setdefault("table_id", table_id)
+                if cycle_end <= now and hand_of_day_state.get("leaders"):
+                    hand_of_day_state["cycle_status"] = "claimable"
+                if hand_of_day_state != original_state:
+                    hand_of_day_state["updated_at"] = now
+                    updated_hand_of_day_state = hand_of_day_state
+
+            member_award_credits = (
+                {
+                    **bbj_award["loser_credits"],
+                    **bbj_award["winner_credits"],
+                    **bbj_award["table_credits"],
+                }
+                if bbj_award is not None
+                else {}
+            )
+            credited_users = {
+                user_id
+                for user_id, amount in member_award_credits.items()
+                if amount > 0
+            }
+            for user_id in set(chip_deltas) | credited_users:
+                in_play_delta = (
+                    chip_deltas.get(user_id, 0)
+                    + member_award_credits.get(user_id, 0)
+                )
                 transaction.set(
                     member_refs[user_id],
-                    {"in_play_balance": firestore.Increment(delta)},
+                    {"in_play_balance": firestore.Increment(in_play_delta)},
                     merge=True,
                 )
             for player in hand_summary["players"]:
@@ -2603,8 +3665,8 @@ class FirestoreHandRepository:
                 )
             pool_updates = {
                 "total_rake_collected": rake_amount,
-                "bad_beat_jackpot_pool": jackpot_amount,
-                "hand_of_the_day_pool": hotd_amount,
+                "bad_beat_jackpot_pool": jackpot_amount
+                - (bbj_award["paid_amount"] if bbj_award is not None else 0),
             }
             if any(pool_updates.values()):
                 transaction.set(
@@ -2612,10 +3674,35 @@ class FirestoreHandRepository:
                     {key: firestore.Increment(amount) for key, amount in pool_updates.items()},
                     merge=True,
                 )
+            if bbj_award is not None:
+                transaction.set(
+                    bbj_award_ref,
+                    {
+                        "transaction_id": f"{hand_summary['hand_id']}_bbj_award",
+                        "currency_type": "CLUB_CHIPS",
+                        "type": "BBJ_AWARD",
+                        "amount": bbj_award["paid_amount"],
+                        "hand_id": hand_summary["hand_id"],
+                        "table_id": table_id,
+                        "promotion": "BAD_BEAT_JACKPOT",
+                        "qualification": qualification,
+                        "award": bbj_award,
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            if updated_hand_of_day_state is not None:
+                if hand_of_day_ref is None:
+                    raise RuntimeError(
+                        "Hand-of-the-Day state was updated without a blind-level reference."
+                    )
+                transaction.set(
+                    hand_of_day_ref,
+                    updated_hand_of_day_state,
+                    merge=True,
+                )
             for kind, amount in (
                 ("RAKE", rake_amount),
                 ("BBJ_DROP", jackpot_amount),
-                ("HAND_OF_THE_DAY", hotd_amount),
             ):
                 if amount <= 0:
                     continue
@@ -2675,6 +3762,7 @@ class FirestoreHandRepository:
                 {
                     "settlement_status": "settled",
                     "settled_at": firestore.SERVER_TIMESTAMP,
+                    "bbj_award": bbj_award,
                 },
                 merge=True,
             )
@@ -2919,7 +4007,7 @@ class FirestoreHandRepository:
                 return BuyInStatus.MEMBER_NOT_FOUND
 
             member = member_snapshot.to_dict() or {}
-            balance = member.get("chip_balance", 0)
+            balance = member.get("available_balance", 0)
             if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
                 return BuyInStatus.INVALID_BALANCE
             if balance < buy_in_amount:
@@ -2970,7 +4058,7 @@ class FirestoreHandRepository:
             transaction.update(
                 member_ref,
                 {
-                    "chip_balance": firestore.Increment(-buy_in_amount),
+                    "available_balance": firestore.Increment(-buy_in_amount),
                     "in_play_balance": firestore.Increment(buy_in_amount),
                 },
             )
@@ -2994,7 +4082,7 @@ class FirestoreHandRepository:
                     "table_id": table_id,
                     "seat_index": seat_index,
                     "amount": buy_in_amount,
-                    "chip_balance_delta": -buy_in_amount,
+                    "available_balance_delta": -buy_in_amount,
                     "in_play_balance_delta": buy_in_amount,
                     "created_at": firestore.SERVER_TIMESTAMP,
                 },

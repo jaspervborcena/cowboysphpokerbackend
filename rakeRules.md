@@ -14,7 +14,7 @@ Status: implemented on `feature/rakeImplementation` as of 2026-10-20. This docum
 
 ## Rake Collection
 
-For a completed hand, the engine uses the contestable pot total and the table settings:
+For a completed hand, the engine uses the contestable pot total and the table settings. New local NLH tables default to a 7% rake rate, zero rake cap, zero minimum pot, and `no_flop_no_drop` enabled.
 
 1. Rake is eligible when the configured rate is greater than zero and the pot meets `rake_min_pot`.
 2. With `no_flop_no_drop` enabled, at least a flop must have been dealt. This setting defaults to enabled.
@@ -35,7 +35,9 @@ else:
         rake_amount = min(rake_amount, rake_cap)
 ```
 
-Normal table rake and promotion drops are separate. The current `jackpot_fee` setting is applied after normal rake, based on the remaining pot, and is added to `bad_beat_jackpot_pool`; it is not included in `rake_attributed` or `total_rake_generated`. The proposed fixed integer drops for separate BBJ, Jackpot, and High Hand pools in [jackpot.md](jackpot.md) are not implemented yet.
+Normal table rake and the BBJ contribution are separate deductions. New local NLH tables default to an additional 3% BBJ contribution calculated from the original contestable pot, rounded down to a whole chip, then capped by the pot remaining after rake. Thus defaults collect 7% rake plus 3% BBJ (10% combined before the rake cap), and the rake cap does not reduce the BBJ contribution. The BBJ contribution is added to the dedicated `bad_beat_jackpot_pool`; it is not included in `rake_attributed` or `total_rake_generated`. The legacy `jackpot_fee` setting is a fixed-chip BBJ contribution and, when set without `jackpot_rate`, replaces the 3% contribution. Club owners may also contribute from their member `available_balance`; both funding sources write auditable club transactions and update the pool atomically. Local-club NLH BBJ v1 qualification and awards are settled atomically with that pool. Single-Hand Jackpot is not implemented. Hand-of-the-Day is a separate high-hand promotion funded by treasury-to-pool contributions; see [highhandRules.md](highhandRules.md).
+
+The club-level default rake rate is configurable at `GET/PATCH /clubs/{club_id}/financial-settings` and stored at `clubs/{club_id}/settings/financial.default_rake_rate`. New tables and existing tables without an override inherit that value. `PATCH /clubs/{club_id}/tables/{table_id}/settings` can persist a table-specific `rake_rate` override, which takes precedence over the club default. Both settings are restricted to 0 through 10%; owner/manager access is required.
 
 ## Player Eligibility
 
@@ -117,12 +119,12 @@ The transaction that settles the hand updates the member's in-play balance, seat
 
 ## Settlement and Balance Boundary
 
-Rake attribution is a report/statistic. It does not pay a player, agent, manager, or owner. It does not alter `chip_balance` or `in_play_balance`. Collected rake is separately added to the club's `treasury/pools.total_rake_collected` and recorded in the club transaction ledger by the hand settlement transaction. Winner rake deductions are allocated over gross awards first; the jackpot fee is then allocated over the remaining awards. These fee deductions are separate from generated-rake attribution.
+Rake attribution is a report/statistic. It does not pay a player, agent, manager, or owner. It does not alter `available_balance` or `in_play_balance`. Collected rake is separately added to the club's `treasury/pools.total_rake_collected` and recorded in the club transaction ledger by the hand settlement transaction. Winner rake deductions are allocated over gross awards first; the jackpot fee is then allocated over the remaining awards. These fee deductions are separate from generated-rake attribution.
 
 ## Not Implemented
 
 - Street-by-street rake buckets. Current rake is collected once per hand and distributed once across eligible players.
-- Promotion-specific fixed integer drops split among BBJ, Single Jackpot, and High Hand pools; current `jackpot_fee` only updates the BBJ pool.
+- Promotion funding and award transfers remain separately recorded; the BBJ pool is funded by the configured 3% contestable-pot contribution and optional owner contributions.
 - Player rakeback balances or payments.
 - Agent, manager, or owner commission/profit shares.
 - A confirmed percentage policy for rakeback or role shares.

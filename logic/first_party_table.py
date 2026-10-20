@@ -17,6 +17,10 @@ from game_engine import (
     start_nlh_hand,
     visible_hole_cards,
 )
+from game_engine.jackpot import (
+    evaluate_bad_beat_qualification,
+    evaluate_hand_of_day,
+)
 from logic.table_game_base import TableGameBase
 
 
@@ -418,10 +422,20 @@ class FirstPartyNLHGame(TableGameBase):
             player.player_id: attributed_eligible.get(player.player_id, 0)
             for player in state.players
         }
-        jackpot = self.calculate_jackpot_accounting(
-            max(pot_total - rake["rake_amount"], 0)
+        jackpot = (
+            self.calculate_jackpot_accounting(
+                pot_total,
+                rake_amount=rake["rake_amount"],
+            )
+            if self.union_id is None
+            else {
+                "eligible": False,
+                "fee_collected": 0,
+                "qualifying_hand": None,
+                "pool_after_hand": self.jackpot_pool,
+                "reason_code": "UNION_BBJ_NOT_SUPPORTED",
+            }
         )
-        hand_of_day = self.calculate_hand_of_day_accounting(pot_total)
         house_take = min(pot_total, rake["rake_amount"] + jackpot["fee_collected"])
         player_payout_total = max(pot_total - house_take, 0)
         winner_order = tuple(
@@ -515,6 +529,44 @@ class FirstPartyNLHGame(TableGameBase):
             for frame_player in self._replay_frames[-1]["players"]:
                 frame_player["stack"] = final_stacks[frame_player["user_id"]]
 
+        is_showdown = any(
+            player.player_id in state.publicly_revealed_player_ids
+            and not player.folded
+            for player in state.players
+        )
+        hand_of_day = evaluate_hand_of_day(
+            [
+                {
+                    "user_id": player.player_id,
+                    "username": self.seats[player.seat_index].username,
+                    "seat": player.seat_index,
+                    "hole_cards": [card.code for card in player.hole_cards],
+                    "folded": player.folded,
+                }
+                for player in state.players
+            ],
+            [card.code for card in state.community_cards],
+            self.game_id,
+            is_showdown,
+        )
+        jackpot["qualification"] = evaluate_bad_beat_qualification(
+            [
+                {
+                    "user_id": player.player_id,
+                    "seat": player.seat_index,
+                    "hole_cards": [card.code for card in player.hole_cards],
+                    "folded": player.folded,
+                    "rake_eligible": rake_eligible[player.player_id],
+                }
+                for player in state.players
+            ],
+            [card.code for card in state.community_cards],
+            pot_total,
+            self.big_blind,
+            is_showdown,
+            self.union_id is None and self.table_settings.jackpot_enabled,
+        )
+
         operation_names = {
             PokerEventKind.PLAYER_FOLDED: "Folding",
             PokerEventKind.PLAYER_CHECKED: "CheckingOrCalling",
@@ -554,6 +606,9 @@ class FirstPartyNLHGame(TableGameBase):
             "hand_id": self._current_hand_id,
             "table_id": self.table_id,
             "table_name": self.table_name,
+            "game_id": self.game_id,
+            "small_blind": self.small_blind,
+            "big_blind": self.big_blind,
             "is_union_table": self.union_id is not None,
             "union_id": self.union_id,
             "origin_club_id": self.origin_club_id,
@@ -578,11 +633,7 @@ class FirstPartyNLHGame(TableGameBase):
                 "player_payout_total": player_payout_total,
                 "adjusted_winners": adjusted_winners,
             },
-            "is_showdown": any(
-                player.player_id in state.publicly_revealed_player_ids
-                and not player.folded
-                for player in state.players
-            ),
+            "is_showdown": is_showdown,
             "winners": adjusted_winners,
             "pot_distributions": ([{
                 "pot_index": 0,

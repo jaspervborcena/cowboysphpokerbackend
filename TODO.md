@@ -26,6 +26,9 @@ Complete these in order before running live tables across multiple backend insta
 - [x] Provision the production `CLUB_CHIPS` giveaway reserve with a 1,000,000,000-chip opening allocation and audit record.
 - [x] Refresh the Firebase architecture diagram statuses for the current single-process runtime, implemented checkpoint primitive, and separate global/club-chip reserves; keep unfinished scaling and recovery components marked as targets.
 - [x] Add reserve-backed accounting metadata (`from_wallet_id`, `to_wallet_id`, `amount`, `currency_type`, and timestamps) to initial funding records; operations with stable transaction IDs are retry-idempotent.
+- [x] Implement versioned local-club NLH BBJ qualification, stake-based pool access, equal-recipient award splits, private audit records, and atomic idempotent pool/member settlement.
+- [x] Implement per-club/game/blind-level 3-hour Hand-of-the-Day cycles, 100×-big-blind prizes, treasury-funded reservations, quads-or-better NLH ranking, tied-winner claims to available balances, and idempotent audit records.
+- [x] Standardize club-member available funds as `available_balance` across API, Firestore writes, ledgers, fixtures, and reports; add a dry-run-first Firestore migration for legacy member and buy-in transaction fields.
 - [x] Replace installed-package game discovery with an explicit first-party registry listing only verified NLH as create-supported.
 - [x] Add optional `game_id` to local and union table creation; default to NLH and reject unsupported IDs.
 - [x] Include `game_id` in table listings, snapshots, create responses, and persisted union table metadata.

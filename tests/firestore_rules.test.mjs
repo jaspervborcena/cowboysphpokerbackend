@@ -27,6 +27,8 @@ test("clients cannot read or write private rake stats or hand audits", async () 
   const privatePaths = [
     "clubs/club-a/player_rake_stats/player-a",
     "clubs/club-a/player_rake_stats/player-a/hands/hand-a",
+    "clubs/club-a/hand_of_the_day/no_limit_texas_holdem",
+    "clubs/club-a/transactions/cycle-a_hotd_player-a",
     "clubs/club-a/tables/table-a/hands/hand-a",
   ];
   const clients = [

@@ -44,31 +44,27 @@ def calculate_hand_settlement_finances(
 
 @dataclass
 class TableSettings:
-    jackpot_enabled: bool = False
+    jackpot_enabled: bool = True
     jackpot_fee: int = 0
+    jackpot_rate: float = 0.03
     jackpot_min_pot: int = 0
     jackpot_qualifying_hand: str | None = None
-    rake_rate: float = 0.0
+    rake_rate: float = 0.07
     rake_cap: int = 0
     rake_min_pot: int = 0
     no_flop_no_drop: bool = True
-    hand_of_day_enabled: bool = False
-    hand_of_day_target: int = 0
-    hand_of_day_prize: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "jackpot_enabled": self.jackpot_enabled,
             "jackpot_fee": self.jackpot_fee,
+            "jackpot_rate": self.jackpot_rate,
             "jackpot_min_pot": self.jackpot_min_pot,
             "jackpot_qualifying_hand": self.jackpot_qualifying_hand,
             "rake_rate": self.rake_rate,
             "rake_cap": self.rake_cap,
             "rake_min_pot": self.rake_min_pot,
             "no_flop_no_drop": self.no_flop_no_drop,
-            "hand_of_day_enabled": self.hand_of_day_enabled,
-            "hand_of_day_target": self.hand_of_day_target,
-            "hand_of_day_prize": self.hand_of_day_prize,
         }
 
 
@@ -120,9 +116,12 @@ class TableGameBase:
         self.origin_club_id = origin_club_id
         self.table_name = table_name or table_id
         self.table_settings = TableSettings()
+        self.club_rake_rate_overridden = False
+        if union_id is not None:
+            self.table_settings.jackpot_enabled = False
+            self.table_settings.jackpot_rate = 0.0
         self.jackpot_pool = 0
         self.rake_pool = 0
-        self.hand_of_day_pool = 0
         self.seats: dict[int, PlayerSeat] = {}
         self.poker_game: Any | None = None
         self.hand_history: list[dict[str, Any]] = []
@@ -179,6 +178,7 @@ class TableGameBase:
         *,
         jackpot_enabled: bool | None = None,
         jackpot_fee: int | None = None,
+        jackpot_rate: float | None = None,
         jackpot_min_pot: int | None = None,
         jackpot_qualifying_hand: str | None = None,
         rake_rate: float | None = None,
@@ -187,9 +187,6 @@ class TableGameBase:
         cap_amount: int | None = None,
         rake_min_pot: int | None = None,
         no_flop_no_drop: bool | None = None,
-        hand_of_day_enabled: bool | None = None,
-        hand_of_day_target: int | None = None,
-        hand_of_day_prize: int | None = None,
     ) -> dict[str, Any]:
         if jackpot_enabled is not None:
             self.table_settings.jackpot_enabled = bool(jackpot_enabled)
@@ -197,6 +194,16 @@ class TableGameBase:
             if isinstance(jackpot_fee, bool) or not isinstance(jackpot_fee, int) or jackpot_fee < 0:
                 raise ValueError("jackpot_fee must be a non-negative integer.")
             self.table_settings.jackpot_fee = jackpot_fee
+            if jackpot_fee > 0 and jackpot_rate is None:
+                self.table_settings.jackpot_rate = 0.0
+        if jackpot_rate is not None:
+            if (
+                isinstance(jackpot_rate, bool)
+                or not isinstance(jackpot_rate, (int, float))
+                or not 0 <= jackpot_rate <= 0.10
+            ):
+                raise ValueError("jackpot_rate must be between 0 and 0.10.")
+            self.table_settings.jackpot_rate = float(jackpot_rate)
         if jackpot_min_pot is not None:
             if isinstance(jackpot_min_pot, bool) or not isinstance(jackpot_min_pot, int) or jackpot_min_pot < 0:
                 raise ValueError("jackpot_min_pot must be a non-negative integer.")
@@ -210,6 +217,8 @@ class TableGameBase:
             if isinstance(rake_rate, bool) or not isinstance(rake_rate, (int, float)) or not 0 <= rake_rate <= 0.10:
                 raise ValueError("rake_rate must be between 0 and 0.10.")
             self.table_settings.rake_rate = float(rake_rate)
+            if self.origin_club_id is not None:
+                self.club_rake_rate_overridden = True
         if percentage is not None:
             if isinstance(percentage, bool) or not isinstance(percentage, (int, float)) or not 0 <= percentage <= 0.10:
                 raise ValueError("percentage must be between 0 and 0.10.")
@@ -230,31 +239,30 @@ class TableGameBase:
             if not isinstance(no_flop_no_drop, bool):
                 raise ValueError("no_flop_no_drop must be a boolean.")
             self.table_settings.no_flop_no_drop = no_flop_no_drop
-        if hand_of_day_enabled is not None:
-            self.table_settings.hand_of_day_enabled = bool(hand_of_day_enabled)
-        if hand_of_day_target is not None:
-            if isinstance(hand_of_day_target, bool) or not isinstance(hand_of_day_target, int) or hand_of_day_target < 0:
-                raise ValueError("hand_of_day_target must be a non-negative integer.")
-            self.table_settings.hand_of_day_target = hand_of_day_target
-        if hand_of_day_prize is not None:
-            if isinstance(hand_of_day_prize, bool) or not isinstance(hand_of_day_prize, int) or hand_of_day_prize < 0:
-                raise ValueError("hand_of_day_prize must be a non-negative integer.")
-            self.table_settings.hand_of_day_prize = hand_of_day_prize
         return self.table_settings.as_dict()
 
-    def calculate_jackpot_accounting(self, pot_total: int) -> dict[str, Any]:
+    def calculate_jackpot_accounting(
+        self, pot_total: int, *, rake_amount: int = 0
+    ) -> dict[str, Any]:
         settings = self.table_settings
+        remaining_pot = max(pot_total - rake_amount, 0)
         eligible = (
             settings.jackpot_enabled
-            and settings.jackpot_fee > 0
-            and pot_total >= settings.jackpot_min_pot
+            and (settings.jackpot_fee > 0 or settings.jackpot_rate > 0)
+            and remaining_pot >= settings.jackpot_min_pot
         )
-        fee_collected = min(settings.jackpot_fee, max(pot_total, 0)) if eligible else 0
+        percentage_fee = int(math.floor(pot_total * settings.jackpot_rate))
+        fee_collected = (
+            min(settings.jackpot_fee + percentage_fee, remaining_pot)
+            if eligible
+            else 0
+        )
         if eligible:
             self.jackpot_pool += fee_collected
         return {
             "eligible": eligible,
             "fee_collected": fee_collected,
+            "effective_rate": settings.jackpot_rate,
             "qualifying_hand": settings.jackpot_qualifying_hand if eligible else None,
             "pool_after_hand": self.jackpot_pool,
         }
@@ -279,20 +287,6 @@ class TableGameBase:
             "rake_amount": rake_amount,
             "effective_rate": settings.rake_rate,
             "pool_after_hand": self.rake_pool,
-        }
-
-    def calculate_hand_of_day_accounting(self, pot_total: int) -> dict[str, Any]:
-        settings = self.table_settings
-        eligible = (
-            settings.hand_of_day_enabled
-            and settings.hand_of_day_target > 0
-            and pot_total >= settings.hand_of_day_target
-        )
-        return {
-            "eligible": eligible,
-            "target_pot": settings.hand_of_day_target,
-            "prize_amount": settings.hand_of_day_prize if eligible else 0,
-            "pool_after_hand": self.hand_of_day_pool,
         }
 
     def pop_completed_hand(self) -> dict[str, Any] | None:

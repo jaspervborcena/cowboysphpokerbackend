@@ -215,7 +215,7 @@ async def get_my_club_wallet_summary(
     membership: ClubMembership = Depends(get_active_club_member),
 ) -> dict[str, Any]:
     profile = membership.profile
-    available = profile.get("chip_balance", 0)
+    available = profile.get("available_balance", 0)
     in_play = profile.get("in_play_balance", 0)
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value < 0

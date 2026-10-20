@@ -8,6 +8,11 @@ from game_engine.nlh_state import NLHStreet
 
 def make_game() -> FirstPartyNLHGame:
     game = FirstPartyNLHGame("table-1", 50, 100, 100, 1000)
+    game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
+        rake_rate=0,
+    )
     assert game.add_player(0, "player-a", "Alice", 500)
     assert game.add_player(1, "player-b", "Bob", 500)
     return game
@@ -15,6 +20,11 @@ def make_game() -> FirstPartyNLHGame:
 
 def test_first_party_table_preserves_snapshot_privacy_and_settlement_contract() -> None:
     game = FirstPartyNLHGame("owned-table", 50, 100, 100, 1000)
+    game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
+        rake_rate=0,
+    )
     assert game.add_player(0, "player-a", "Alice", 500)
     assert game.add_player(1, "player-b", "Bob", 500)
 
@@ -48,6 +58,11 @@ def test_first_party_showdown_records_a_replay_safe_completed_board() -> None:
     from app.api.hand_history import filter_replay_for_user
 
     game = FirstPartyNLHGame("showdown-table", 10, 20, 100, 1000)
+    game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
+        rake_rate=0,
+    )
     assert game.add_player(0, "player-a", "Alice", 500)
     assert game.add_player(1, "player-b", "Bob", 500)
     assert game.start_new_hand()
@@ -108,6 +123,11 @@ def test_first_party_table_passes_big_blind_consent_and_straddle() -> None:
 
 def test_first_party_audit_records_uncalled_return_separately_from_awards() -> None:
     game = FirstPartyNLHGame("uncalled-table", 50, 100, 100, 1000)
+    game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
+        rake_rate=0,
+    )
     assert game.add_player(0, "raiser", "Raiser", 500)
     assert game.add_player(1, "caller", "Caller", 500)
     assert game.start_new_hand()
@@ -226,26 +246,33 @@ def test_jackpot_fee_is_accounted_for_when_enabled_and_eligible() -> None:
     assert summary["jackpot"]["qualifying_hand"] == "quads-or-better"
 
 
-def test_rake_and_hand_of_day_are_calculated_from_table_settings() -> None:
+def test_rake_is_calculated_from_table_settings() -> None:
     game = make_game()
     game.update_table_settings(
         rake_rate=0.05,
         rake_cap=50,
         rake_min_pot=100,
-        hand_of_day_enabled=True,
-        hand_of_day_target=500,
-        hand_of_day_prize=100,
     )
 
     rake = game.calculate_rake_accounting(1000)
-    hotd = game.calculate_hand_of_day_accounting(1000)
 
     assert rake["eligible"] is True
     assert rake["rake_amount"] == 50
     assert rake["pool_after_hand"] == 50
-    assert hotd["eligible"] is True
-    assert hotd["prize_amount"] == 100
-    assert hotd["target_pot"] == 500
+
+
+def test_new_local_table_defaults_to_seven_percent_rake_and_three_percent_bbj() -> None:
+    game = FirstPartyNLHGame("default-table", 50, 100, 100, 1000)
+
+    assert game.table_settings.rake_rate == 0.07
+    assert game.table_settings.jackpot_enabled is True
+    assert game.table_settings.jackpot_rate == 0.03
+    rake = game.calculate_rake_accounting(1000)
+    jackpot = game.calculate_jackpot_accounting(
+        1000, rake_amount=rake["rake_amount"]
+    )
+    assert rake["rake_amount"] == 70
+    assert jackpot["fee_collected"] == 30
 
 
 def test_no_flop_no_drop_disables_preflop_rake() -> None:
@@ -317,6 +344,8 @@ def test_preflop_folders_are_excluded_but_turn_folders_keep_rake_attribution() -
     for seat, player_id in enumerate(("player-a", "player-b", "player-c")):
         assert game.add_player(seat, player_id, player_id, 500)
     game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
         rake_rate=0.10,
         rake_min_pot=0,
         no_flop_no_drop=True,
@@ -420,16 +449,15 @@ def test_rake_and_jackpot_drops_never_exceed_the_completed_pot() -> None:
     assert sum(player["net_delta"] for player in summary["players"]) == -summary["pot_total"]
 
 
-def test_hand_summary_reserves_hand_of_day_prize_before_player_payouts() -> None:
+def test_hand_of_day_record_evaluation_does_not_change_pot_settlement() -> None:
     game = make_game()
     game.update_table_settings(
+        jackpot_enabled=False,
+        jackpot_rate=0,
         rake_rate=0.10,
         rake_cap=50,
         rake_min_pot=0,
         no_flop_no_drop=False,
-        hand_of_day_enabled=True,
-        hand_of_day_target=10,
-        hand_of_day_prize=100,
     )
     assert game.start_new_hand()
 
@@ -439,6 +467,7 @@ def test_hand_summary_reserves_hand_of_day_prize_before_player_payouts() -> None
     summary = game.pop_completed_hand()
 
     assert summary is not None
-    assert summary["hand_of_the_day"]["eligible"] is True
+    assert summary["hand_of_the_day"]["eligible"] is False
+    assert summary["hand_of_the_day"]["reason_code"] == "NOT_SHOWDOWN"
     assert summary["settlement"]["house_take"] == 10
     assert summary["settlement"]["player_payout_total"] == summary["pot_total"] - 10

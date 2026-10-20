@@ -1,4 +1,12 @@
 from game_engine.hand_evaluator import Card, HandCategory, HandRank, evaluate_hand
+from game_engine.jackpot import (
+	BBJ_GAME_ID,
+	BBJ_RULE_VERSION,
+	HAND_OF_DAY_RULE_VERSION,
+	calculate_bad_beat_award,
+	evaluate_bad_beat_qualification,
+	evaluate_hand_of_day,
+)
 from game_engine.checkpoint import (
 	NLH_CHECKPOINT_VERSION,
 	deserialize_nlh_hand_state,
@@ -33,10 +41,13 @@ from game_engine.contracts import (
 
 __all__ = [
 	"Card",
+	"BBJ_GAME_ID",
+	"BBJ_RULE_VERSION",
 	"Deck",
 	"DeckExhausted",
 	"HandCategory",
 	"HandRank",
+	"HAND_OF_DAY_RULE_VERSION",
 	"HandOutcome",
 	"EngineTransition",
 	"Pot",
@@ -62,6 +73,9 @@ __all__ = [
 	"deal_river",
 	"deal_turn",
 	"evaluate_hand",
+	"evaluate_hand_of_day",
+	"calculate_bad_beat_award",
+	"evaluate_bad_beat_qualification",
 	"deserialize_nlh_hand_state",
 	"initialize_nlh_hand",
 	"legal_nlh_actions",
